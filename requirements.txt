@@ -1,0 +1,10 @@
+torch>=2.0.0
+torchvision
+timm
+transformers
+pydicom
+numpy
+pandas
+opencv-python
+albumentations
+scikit-learn

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
-import config
+from . import config
 
 class SlotHead(nn.Module):
     def __init__(self, dim, n_slot, n_out, hidden=256, p=0.2):

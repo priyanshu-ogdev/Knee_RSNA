@@ -67,14 +67,24 @@ def step_index(DATA, out_dir):
 
 def step_cache(index_out, out_dir):
     header("STAGE 2: MEMMAP CACHE BUILD (CPU MULTICORE STRESS TEST)")
-    cfg = config.get_cfg('v2')
-    cache_dir = os.path.join(out_dir, 'cache')
+    
+    try:
+        cache_base = runner.pick_scratch()
+    except Exception:
+        cache_base = out_dir
+        
+    cache_dir = os.path.join(cache_base, 'cache')
     os.makedirs(cache_dir, exist_ok=True)
     
     cpu_cores = max(2, os.cpu_count() or 2)
     print(f"Detected {cpu_cores} CPU cores. Launching workers for maximum physical throughput...")
     
     train_studies = index_out['ann'][index_out['ann']['split'] == 'train']['StudyInstanceUID'].unique()
+    
+    import shutil
+    free_gb = shutil.disk_usage(cache_base).free / 1e9
+    cfg = runner.fit_cache_cfg(len(train_studies), free_gb, preset='v2')
+    print(f"Fitted cache config to fit in {free_gb:.1f} GB free space: img_size={cfg.img_size}, stack_depth={cfg.stack_depth}")
     
     t0 = time.time()
     cache, stats = runner.run_cache(
@@ -94,11 +104,10 @@ def step_cache(index_out, out_dir):
     print(f"\n[STATS] Cache Stats:\n{stats}")
     
     cache.flush()
-    return cache_dir
+    return cache_dir, cfg
 
-def step_dataloader(DATA, cache_dir):
+def step_dataloader(DATA, cache_dir, cfg):
     header("STAGE 3: PYTORCH DATALOADER THROUGHPUT (EPOCH SIMULATION)")
-    cfg = config.get_cfg('v2')
     train_csv = os.path.join(DATA, 'train.csv')
     
     if not os.path.exists(train_csv):
@@ -147,11 +156,12 @@ def main():
     if not index_out:
         return
         
-    cache_dir = safe("Stage 2 - Cache Build", step_cache, index_out, OUT)
-    if not cache_dir:
+    res = safe("Stage 2 - Cache Build", step_cache, index_out, OUT)
+    if not res:
         return
+    cache_dir, cfg = res
         
-    safe("Stage 3 - DataLoader", step_dataloader, DATA, cache_dir)
+    safe("Stage 3 - DataLoader", step_dataloader, DATA, cache_dir, cfg)
     
     print("\n" + "=" * 100)
     print(f"ALL TESTS COMPLETED in {(time.time() - t_start) / 60:.2f} minutes")

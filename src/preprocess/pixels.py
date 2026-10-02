@@ -143,8 +143,10 @@ def normalise(vol, valid, cfg):
     v = vol[valid]
     sub = v if cfg.name == 'public' else v[:, ::2, ::2]
     lo, hi = np.percentile(sub, [cfg.norm_lo, cfg.norm_hi])
-    out = np.clip((vol - lo) / max(float(hi - lo), 1e-6), 0.0, 1.0)
-    return out
+    vol -= lo
+    vol /= max(float(hi - lo), 1e-6)
+    np.clip(vol, 0.0, 1.0, out=vol)
+    return vol
 
 
 def resize_stack(vol, size, mode):
@@ -161,7 +163,9 @@ def resize_stack(vol, size, mode):
 
 
 def to_uint8(x):
-    return np.clip(np.rint(x * 255.0), 0, 255).astype(np.uint8)
+    x *= 255.0
+    np.rint(x, out=x)
+    return x.astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- one series -> stack

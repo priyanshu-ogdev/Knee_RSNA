@@ -53,14 +53,26 @@ class Model(nn.Module):
         B, S, W = imgs.shape[:3]
         if wmask is None:
             wmask = torch.ones(B, S, W, device=imgs.device)
+            
+        valid = (wmask > 0.5) & (mask.unsqueeze(-1) > 0.5)
+        flat_valid = valid.view(-1)
+        
         x = imgs.reshape(B * S * W, *imgs.shape[3:]).float().div_(255.0)
         x = (x - self.mean) / self.std
-        out = self.backbone(pixel_values=x).last_hidden_state
-
-        # Pooling: Concatenate [CLS] and Mean of patch tokens
-        cls_token = out[:, 0]
-        patch_tokens = out[:, 1:].mean(1)
-        feat = torch.cat([cls_token, patch_tokens], dim=1).reshape(B, S, W, -1)
+        
+        valid_idx = torch.where(flat_valid)[0]
+        dim = self.backbone.config.hidden_size
+        feat = torch.zeros(B * S * W, dim * 2, device=x.device, dtype=x.dtype)
+        
+        if len(valid_idx) > 0:
+            x_valid = x[valid_idx]
+            out_valid = self.backbone(pixel_values=x_valid).last_hidden_state
+            cls_token = out_valid[:, 0]
+            patch_tokens = out_valid[:, 1:].mean(1)
+            feat_valid = torch.cat([cls_token, patch_tokens], dim=1)
+            feat[valid_idx] = feat_valid
+            
+        feat = feat.view(B, S, W, -1)
         slot_feat = self.wpool(feat, wmask)
         slot_mask = mask * (wmask.sum(-1) > 0).to(mask.dtype)
         return self.head(slot_feat, slot_mask)

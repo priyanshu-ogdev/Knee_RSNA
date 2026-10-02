@@ -63,7 +63,9 @@ def predict_chunk(models, cache, a, b, cfg, device, n_use=None, batch=4):
         wm = torch.from_numpy(np.stack([s[2] for s in smp])).float().to(device)
         ps = []
         for m in models:
-            with torch.autocast('cuda', enabled=device.type == 'cuda'):
+            use_bf16 = torch.cuda.is_bf16_supported() if device.type == 'cuda' else False
+            ctx = torch.autocast('cuda', dtype=torch.bfloat16 if use_bf16 else torch.float16, enabled=device.type == 'cuda')
+            with ctx:
                 ps.append(torch.sigmoid(m(imgs, slot, wm).float()).cpu().numpy())
         out.append(np.mean(ps, axis=0))
     return np.concatenate(out)

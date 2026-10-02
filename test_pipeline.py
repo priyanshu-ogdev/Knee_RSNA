@@ -14,7 +14,7 @@ elif os.path.abspath('.') not in sys.path:
     sys.path.insert(0, os.path.abspath('.'))
 
 from src import config
-from src.preprocess import runner
+from src.preprocess import runner, index
 from src.dataset import RSNADataset
 from torch.utils.data import DataLoader
 
@@ -35,7 +35,7 @@ def safe(name, fn, *a, **k):
 def find_data_root():
     """Find the Kaggle competition folder locally or dynamically on Kaggle."""
     try:
-        return runner.discover_root()
+        return index.discover_root()
     except FileNotFoundError:
         print("[WARNING] Could not find competition dataset via discover_root(). Using fallback paths.")
         cands = ['/kaggle/input/rsna-knee-abnormality-detection', 'd:/Knee_RSNA_Data']

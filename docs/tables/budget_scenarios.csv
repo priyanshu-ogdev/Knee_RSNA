@@ -1,0 +1,10 @@
+selection,depth,192,256,320
+1 series/plane (fluid preferred),16,7.8,13.9,21.7
+1 series/plane (fluid preferred),24,11.7,20.8,32.5
+1 series/plane (fluid preferred),32,15.6,27.7,43.3
+all fluid-sensitive series,16,8.3,14.7,23.0
+all fluid-sensitive series,24,12.4,22.0,34.4
+all fluid-sensitive series,32,16.5,29.4,45.9
+all series,16,14.4,25.6,39.9
+all series,24,21.6,38.3,59.9
+all series,32,28.7,51.1,79.9

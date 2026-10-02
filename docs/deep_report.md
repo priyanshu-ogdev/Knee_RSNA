@@ -1,0 +1,215 @@
+# RSNA Knee -- DEEP audit
+data: `/kaggle/input/competitions/rsna-knee-abnormality-detection`
+
+## Findings
+- **WARN** [integrity] window center varies >10% inside a series: 12646 series (51.89%)
+- **WARN** [duplicates] 57 identical-image groups span different studies -> possible duplicate exams; group them in CV
+- **WARN** [flags] Fluid_Sensitive and Fat_Suppression are IDENTICAL in train -> effectively one flag; do not treat as two independent features (they may differ in the hidden test set, so do not hard-wire a dependency on them)
+- **INFO** [integrity] centrals: sat. pixels >1%: 2 series (0.01%)
+- **INFO** [intensity] per-series scale differs ~22x (p99 5..95 pct) -> normalise per series with robust percentiles (e.g. p1/p99), never global
+- **INFO** [intensity] negative pixel values exist (signed data / filter ringing) -> clip at 0 after percentile scaling
+- **INFO** [intensity] 72% of series have a non-zero background -> pad with edge/median value, not literal 0
+- **INFO** [cohort] 238 studies (5.4%) come from scanners that strip TR/TE/field/ScanOptions -> routing must use the CSV flags + image content, not headers; check model performance on this cohort separately
+
+## Stats
+```json
+{
+ "integrity_full": {
+  "series": 24371,
+  "slices": 819078,
+  "checks": {
+   "fatal scan errors": 0,
+   "unreadable/invalid slice files": 0,
+   "mixed image sizes in series": 0,
+   "mixed orientation in series": 0,
+   "mixed slice thickness": 0,
+   "mixed pixel spacing": 0,
+   "mixed transfer syntax": 0,
+   "duplicate SOPInstanceUID": 0,
+   "duplicate slice positions": 0,
+   "gap in slice spacing": 0,
+   "irregular spacing (CV>0.05)": 0,
+   "missing InstanceNumber": 0,
+   "InstanceNumber order != spatial order": 0,
+   "no usable geometry": 0,
+   "truncated pixel data (file < rows*cols*bytes)": 0,
+   "RescaleSlope varies inside a series": 0,
+   "RescaleIntercept varies inside a series": 0,
+   "window center varies >10% inside a series": 12646,
+   "central slice failed to decode": 0,
+   "centrals: sat. pixels >1%": 2,
+   "centrals: constant image (p99==p1)": 0
+  }
+ },
+ "geometry": {
+  "fov_h_med": 160.00000476836993,
+  "fov_h_p1": 130.00000000000128,
+  "fov_h_p99": 204.9999950408901,
+  "nonsquare_frac": 0.07258627056747774,
+  "aspect_p1": 0.84375,
+  "aspect_p99": 2.0,
+  "orient_codes": {
+   "Axial": {
+    "LI": 0,
+    "LP": 5898,
+    "PI": 0
+   },
+   "Coronal": {
+    "LI": 8609,
+    "LP": 0,
+    "PI": 0
+   },
+   "Sagittal": {
+    "LI": 0,
+    "LP": 0,
+    "PI": 9864
+   }
+  }
+ },
+ "intensity": {
+  "p99_dynamic_range_5_95": 22.486725663716815,
+  "fg_touches_border": 0.09593369168273767,
+  "border_bright_frac": 0.7240572811948628
+ },
+ "duplicates": {
+  "cross_study_hash_groups": 57,
+  "series_in_groups": 246,
+  "within_study_groups": 118
+ },
+ "flags": {
+  "fluid_equals_fatsup": 1.0,
+  "pd_t2_stir_flagged_nonfluid": 0.2613821138211382,
+  "flag1_without_any_fs_evidence": 0.02026999302449633,
+  "desc_unusable_frac": 0.17734192277707111
+ },
+ "poor_cohort": {
+  "series": 1206,
+  "studies": 238,
+  "studies_entirely_poor": 238
+ },
+ "recipes": {
+  "n_distinct_recipes": 159,
+  "studies_with_multi_fluid_same_plane": {
+   "Axial": 0.06761969593828,
+   "Coronal": 0.08100748808713411,
+   "Sagittal": 0.11595189471295667
+  },
+  "multi_fluid_pairs": 1166,
+  "no_fluid_by_plane": {
+   "Axial": 0.0,
+   "Coronal": 0.03607896528250511,
+   "Sagittal": 0.05831631495348309
+  }
+ },
+ "studies": {
+  "n": 4407,
+  "site_proxies": 21
+ },
+ "reports_probe": {
+  "mention_by_lang": {
+   "ACL": {
+    "cyrillic": 0.99,
+    "de": 0.28,
+    "en": 0.88,
+    "es": 0.14,
+    "fr": 1.0,
+    "greek": 0.91,
+    "hr/bs/sr": 0.98,
+    "nl": 0.93,
+    "tr": 1.0,
+    "unknown": 0.0
+   },
+   "Meniscus": {
+    "cyrillic": 0.99,
+    "de": 0.98,
+    "en": 0.99,
+    "es": 0.75,
+    "fr": 0.0,
+    "greek": 0.99,
+    "hr/bs/sr": 1.0,
+    "nl": 0.94,
+    "tr": 0.99,
+    "unknown": 0.11
+   },
+   "Collateral lig.": {
+    "cyrillic": 0.97,
+    "de": 0.48,
+    "en": 0.62,
+    "es": 0.54,
+    "fr": 0.0,
+    "greek": 0.46,
+    "hr/bs/sr": 0.96,
+    "nl": 0.12,
+    "tr": 0.65,
+    "unknown": 0.0
+   },
+   "Effusion": {
+    "cyrillic": 0.95,
+    "de": 0.68,
+    "en": 0.93,
+    "es": 0.67,
+    "fr": 0.99,
+    "greek": 0.0,
+    "hr/bs/sr": 0.88,
+    "nl": 0.0,
+    "tr": 0.95,
+    "unknown": 0.39
+   },
+   "Baker": {
+    "cyrillic": 0.0,
+    "de": 0.29,
+    "en": 0.62,
+    "es": 0.1,
+    "fr": 0.54,
+    "greek": 0.33,
+    "hr/bs/sr": 0.9,
+    "nl": 0.38,
+    "tr": 0.23,
+    "unknown": 0.0
+   },
+   "Fracture": {
+    "cyrillic": 0.0,
+    "de": 0.2,
+    "en": 0.36,
+    "es": 0.09,
+    "fr": 0.41,
+    "greek": 0.08,
+    "hr/bs/sr": 0.05,
+    "nl": 0.14,
+    "tr": 0.02,
+    "unknown": 0.11
+   },
+   "Contusion/edema": {
+    "cyrillic": 0.09,
+    "de": 0.79,
+    "en": 0.62,
+    "es": 0.44,
+    "fr": 0.17,
+    "greek": 0.16,
+    "hr/bs/sr": 0.34,
+    "nl": 0.68,
+    "tr": 0.52,
+    "unknown": 0.07
+   },
+   "n": {
+    "cyrillic": 220,
+    "de": 261,
+    "en": 1717,
+    "es": 657,
+    "fr": 78,
+    "greek": 321,
+    "hr/bs/sr": 406,
+    "nl": 151,
+    "tr": 568,
+    "unknown": 28
+   }
+  }
+ },
+ "budget_full": {
+  "fov_median": 160.00000476836993,
+  "native_pixel_spacing_median": 0.3125,
+  "decode_ms_median": 11.993169784545898,
+  "all_slices_decode_hours": 0.6821764944990476
+ }
+}
+```

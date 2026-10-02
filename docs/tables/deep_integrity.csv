@@ -1,0 +1,22 @@
+check,n_series,pct
+fatal scan errors,0,0.0
+unreadable/invalid slice files,0,0.0
+mixed image sizes in series,0,0.0
+mixed orientation in series,0,0.0
+mixed slice thickness,0,0.0
+mixed pixel spacing,0,0.0
+mixed transfer syntax,0,0.0
+duplicate SOPInstanceUID,0,0.0
+duplicate slice positions,0,0.0
+gap in slice spacing,0,0.0
+irregular spacing (CV>0.05),0,0.0
+missing InstanceNumber,0,0.0
+InstanceNumber order != spatial order,0,0.0
+no usable geometry,0,0.0
+truncated pixel data (file < rows*cols*bytes),0,0.0
+RescaleSlope varies inside a series,0,0.0
+RescaleIntercept varies inside a series,0,0.0
+window center varies >10% inside a series,12646,51.89
+central slice failed to decode,0,0.0
+centrals: sat. pixels >1%,2,0.008
+centrals: constant image (p99==p1),0,0.0

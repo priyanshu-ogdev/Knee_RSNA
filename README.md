@@ -30,10 +30,18 @@ The current baseline implements a highly customized vision transformer architect
 │   ├── dataset.py      # DICOM loading, physical mm cropping, and laterality flipping
 │   ├── model.py        # DINOv2 instantiation and SlotHead architecture
 │   └── train.py        # Custom weighted BCE training loop and AMP scaling
-├── tmp/                # (Ignored) Raw notebooks, EDA, and local metadata
+├── docs/
+│   ├── data_analysis_report.md  # Comprehensive EDA findings (Intensity, Geometry, Flags)
+│   ├── architecture.md          # Detailed pipeline & model architecture design
+│   └── deep_report.md           # Original EDA report from Kaggle
 ├── requirements.txt    # Project dependencies
 └── README.md
 `
+
+## Documentation & Data Analysis
+For a detailed review of the imaging constraints, data integrity issues, and dataset preprocessing rules, see:
+- [Data Analysis Report](docs/data_analysis_report.md)
+- [Architecture & Pipeline Design](docs/architecture.md)
 
 ## Getting Started
 

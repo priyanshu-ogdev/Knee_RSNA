@@ -1,1 +1,1 @@
-"""RSNA Knee Abnormality Detection Source Package"""
+"""RSNA Knee Abnormality Detection source package (v2 preprocessing layer)."""

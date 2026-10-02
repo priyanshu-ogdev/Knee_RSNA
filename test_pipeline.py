@@ -8,7 +8,10 @@ import multiprocessing as mp
 from pathlib import Path
 
 # Add the repo root to sys.path so we can import src
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+if '__file__' in globals():
+    sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+elif os.path.abspath('.') not in sys.path:
+    sys.path.insert(0, os.path.abspath('.'))
 
 from src import config
 from src.preprocess import runner

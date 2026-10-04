@@ -65,7 +65,7 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     os.makedirs(cache_dir, exist_ok=True)
     
     # Proper Idempotency: Check for the exact completion marker, not just a partially created dir
-    marker = os.path.join(cache_dir, "train.meta")
+    marker = os.path.join(cache_dir, "train.meta.json")
     if os.path.exists(marker):
         print(f"[INFO] Verified cache completion marker at {marker}. Skipping cache build.")
         return final_labels_csv, cache_dir

@@ -176,6 +176,9 @@ def run_inference(
     n_use: int | None = None,
     device: torch.device | None = None,
     temperatures: list[float] | None = None,
+    use_tta: bool = True,  # Upgrade: Enable Test-Time Augmentation
+    n_tta: int = 4,
+    batch: int = 8,        # Upgrade: 2x T4 GPUs = batch 8 (4 per 16GB GPU)
 ) -> tuple[pd.DataFrame, dict]:
     """Build the cache and run predictions in a pipelined fashion."""
     cfg = cfg or config.get_cfg("v2")
@@ -204,8 +207,12 @@ def run_inference(
                 if device.type == "cuda" and torch.cuda.device_count() > 1:
                     models[i] = torch.nn.DataParallel(m)
             state["moved"] = True
-        preds[a:b] = predict_chunk(models, cache, a, b, cfg, device, n_use,
-                                   temperatures=temperatures)
+        if use_tta:
+            preds[a:b] = predict_chunk_tta(models, cache, a, b, cfg, device, n_use, 
+                                           batch=batch, temperatures=temperatures, n_tta=n_tta)
+        else:
+            preds[a:b] = predict_chunk(models, cache, a, b, cfg, device, n_use, 
+                                       batch=batch, temperatures=temperatures)
 
     cache, stats = pcache.build_cache(
         prefix, studies, slot_rows, records, sides, cfg,
@@ -219,11 +226,11 @@ def run_inference(
     preds[empty] = fill
     preds = np.where(np.isfinite(preds), preds, fill)
 
-    # UPGRADE 5: Rank-percentile normalization (from 0.946/0.957 baselines).
-    # AUC is rank-based: converting probabilities to within-test percentiles removes
-    # calibration errors and is strictly AUC-neutral but reduces submission risk.
-    ranked = pd.DataFrame(preds, columns=config.TARGETS).rank(pct=True)
-    sub = ranked
+    # WARNING: Rank-percentile normalization (pd.DataFrame.rank(pct=True)) was removed.
+    # While AUC is rank-neutral, ranking flattens probabilities into uniform distributions [0, 1].
+    # On small test sets, this artificially creates massive False Positives for rare pathologies (like Fracture).
+    # We output the raw, natively calibrated Sigmoid probabilities.
+    sub = pd.DataFrame(preds, columns=config.TARGETS)
     sub.insert(0, "StudyInstanceUID", studies)
     sub.to_csv(out_csv, index=False)
 

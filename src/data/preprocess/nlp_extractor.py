@@ -5,6 +5,13 @@ import pandas as pd
 import torch
 import time
 
+# SOTA Fix: Load .env so the HuggingFace token (HF_TOKEN) is available for downloading the gated Nemotron model.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 try:
     from vllm import LLM, SamplingParams
 except ImportError:

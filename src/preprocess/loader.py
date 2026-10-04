@@ -35,6 +35,9 @@ def label_arrays(df, studies_index):
 
     Missing label (NaN) -> target 0 and weight 0 (masked), fixing the NaN-loss bug (98.7% of studies are unlabeled).
     An optional '<target>_weight' column scales labelled entries (e.g. report-extractor confidence)."""
+    valid_mask = df['StudyInstanceUID'].isin(studies_index)
+    if not valid_mask.all():
+        df = df[valid_mask].reset_index(drop=True)
     Y = np.zeros((len(df), len(config.TARGETS)), np.float32)
     Wt = np.zeros_like(Y)
     for j, t in enumerate(config.TARGETS):

@@ -1,10 +1,28 @@
-torch>=2.0.0
+# PyTorch Core
+torch
 torchvision
-timm
+torchaudio
+
+# Model & Architecture
 transformers
-pydicom
-numpy
+accelerate
+
+# Data & ML Math
 pandas
-opencv-python
-albumentations
+numpy
+scipy
 scikit-learn
+
+# Vision & Ultra-Fast DICOM C++ Parser
+opencv-python-headless
+dicomsdl
+
+# Pseudo-Labeling Extraction
+google-genai
+tenacity
+
+# Utilities
+tqdm
+
+kagglehub
+python-dotenv

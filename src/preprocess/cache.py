@@ -107,6 +107,12 @@ def _cost(study, slot_rows, records):
     return c
 
 
+# FIX A: Initialize globals for ProcessPoolExecutor under "spawn" context
+def _init_worker(studies, slot_rows, records, sides, cfg, prefix):
+    global _G
+    _G.update(studies=studies, slot_rows=slot_rows, records=records, sides=sides, cfg=cfg, cache=StudyCache(prefix, 'r+'))
+
+
 def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, resume=True, order='lpt',
                 chunk=64, on_ready=None, progress=True):
     """Build (or resume) the cache. Returns the open StudyCache (mode r+) and a stats dict.
@@ -128,7 +134,13 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
     try:
         ex = ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context('fork'))
     except Exception:
-        ex = ThreadPoolExecutor(max_workers=workers)
+        # FIX A: Use spawn instead of GIL-blocked ThreadPoolExecutor
+        ex = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(list(studies), slot_rows, records, sides, cfg, prefix)
+        )
     t0 = time.time()
     stats = dict(studies=len(studies), built=0, resumed=len(studies) - len(todo), decode_errors=0, padded=0, ps_missing=0,
                  empty_studies=0)

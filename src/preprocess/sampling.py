@@ -28,9 +28,14 @@ def window_starts(depth, group, stride, n_use=None, train=False, rng=None):
         return starts
     if train:
         rng = rng or np.random.default_rng()
+        # UPGRADE 3: Z-axis jitter (through-plane translation augmentation).
+        # Shifts the entire window grid by a random offset before binning.
+        # Forces the model to learn anatomy rather than memorizing slice positions.
+        z_jitter = int(rng.integers(0, max(1, stride // 2 + 1)))
+        jittered = np.clip(starts + z_jitter, 0, depth - group)
         edges = np.linspace(0, W, n_use + 1)
         pick = [int(rng.integers(int(np.floor(edges[i])), max(int(np.floor(edges[i])) + 1, int(np.ceil(edges[i + 1]))))) for i in range(n_use)]
-        return starts[np.clip(pick, 0, W - 1)]
+        return jittered[np.clip(pick, 0, W - 1)]
     return starts[np.unique(np.rint(np.linspace(0, W - 1, n_use)).astype(int))]
 
 
@@ -65,6 +70,6 @@ def augment_slot(win, rng, rot_deg=8.0, scale=0.08, shift=0.05, intensity=0.1):
     out = np.empty_like(win)
     for i in range(n):
         for j in range(g):
-            x = cv2.warpAffine(win[i, j], M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            x = cv2.warpAffine(win[i, j], M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
             out[i, j] = cv2.LUT(x, lut) if lut is not None else x
     return out

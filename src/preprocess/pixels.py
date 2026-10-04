@@ -203,7 +203,10 @@ def build_stack(rec, cfg):
     if plan is not None:
         info['padded'] = plan[0] < 0 or plan[1] < 0 or plan[0] + plan[2] > shape[0] or plan[1] + plan[3] > shape[1]
     def _bg(raw, slope, icpt):
-        return _border_median(raw.astype(np.float32) * slope + icpt)
+        # FIX B: Medians commute with monotonic linear transformations.
+        # Extract border from RAW integer array, compute median, THEN apply slope/icpt.
+        # Saves converting the entire 800,000+ pixel image to float32.
+        return float(_border_median(raw)) * slope + icpt
 
     D = len(groups)
     crops = {}

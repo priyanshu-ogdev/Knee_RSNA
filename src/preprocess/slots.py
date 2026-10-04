@@ -64,7 +64,12 @@ def annotate(df, fs_priority='hdr', csv_fallback=True):
     fs_hdr = desc.str.contains(_FATSAT_RX) | opts_fs
     informative = (desc.str.strip() != '') | (df['ScanOptions'].fillna('').astype(str).str.strip() != '')
 
-    csv_fs = df['Fat_Suppression'].map(to_flag) if 'Fat_Suppression' in df.columns else pd.Series(np.nan, index=df.index)
+    csv_fs = pd.Series(np.nan, index=df.index)
+    if 'Fat_Suppression' in df.columns:
+        csv_fs = df['Fat_Suppression'].map(to_flag)
+    elif 'Fluid_Sensitive' in df.columns:
+        # FIX: Test set might drop Fat_Suppression; use Fluid_Sensitive as identical proxy (per EDA)
+        csv_fs = df['Fluid_Sensitive'].map(to_flag)
     if fs_priority == 'csv':
         fs = np.where(csv_fs.notna(), csv_fs == 1.0, fs_hdr)
         src = np.where(csv_fs.notna(), 'csv', 'hdr')

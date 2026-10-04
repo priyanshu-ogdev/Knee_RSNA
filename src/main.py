@@ -94,7 +94,7 @@ OUTPUT SCHEMA:
     retry=retry_if_exception_type(Exception)
 )
 def _call_gemini_with_retry(client, report: str, model_name: str):
-    if hasattr(client, 'models'): # Gemini SDK
+    if "gemini" in model_name.lower(): # Gemini SDK
         return client.models.generate_content(
             model='gemini-3.1-pro',
             contents=build_prompt(report),

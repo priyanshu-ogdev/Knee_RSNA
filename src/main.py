@@ -62,10 +62,13 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     index_out = runner.get_index(data_root, idx_dir, splits=('train',), force=False)
     
     cache_dir = os.path.join(work_dir, 'cache_v2')
-    if os.path.exists(cache_dir) and len(os.listdir(cache_dir)) > 0:
-        print(f"[INFO] Cache already exists at {cache_dir}. Skipping cache build.")
-        return final_labels_csv, cache_dir
     os.makedirs(cache_dir, exist_ok=True)
+    
+    # Proper Idempotency: Check for the exact completion marker, not just a partially created dir
+    marker = os.path.join(cache_dir, "train.meta")
+    if os.path.exists(marker):
+        print(f"[INFO] Verified cache completion marker at {marker}. Skipping cache build.")
+        return final_labels_csv, cache_dir
     
     print("Building Memmap Cache (this takes time but drastically speeds up training)...")
     train_studies = sorted(index_out['ann'][index_out['ann']['split'] == 'train']['StudyInstanceUID'].unique())
@@ -133,10 +136,14 @@ def main():
     
     print("Pipeline Output Directory:", WORK_DIR)
     
-    pseudo_csv = os.path.join(WORK_DIR, "pseudo_labels.csv")
-    
-    # 1. NLP Extraction
-    run_nlp_extraction(DATA_ROOT, pseudo_csv)
+    # 1. Check for Pre-computed Labels (NLP Extractor is now decoupled)
+    pseudo_csv = os.path.join(DATA_ROOT, "pseudo_labels.csv")
+    if not os.path.exists(pseudo_csv):
+        print(f"[WARNING] Pre-computed {pseudo_csv} not found in DATA_ROOT.")
+        print("[WARNING] Training will proceed with ONLY 58 Gold labels (High Risk of Overfitting!).")
+        print("[INFO] Did you forget to run 'python src/data/preprocess/nlp_extractor.py' first?")
+    else:
+        print(f"[SUCCESS] Found pre-computed pseudo-labels at {pseudo_csv}")
     
     # 2. Preparation (Cache + Merge)
     labels_csv, cache_dir = run_preparation(DATA_ROOT, WORK_DIR, pseudo_csv)

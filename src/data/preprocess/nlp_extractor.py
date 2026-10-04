@@ -164,6 +164,9 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
             results.append(res)
             
     df_out = pd.DataFrame(results)
+    
+    # SOTA Fix: Ensure output directory exists before saving to prevent FileNotFoundError crash after 1-hour run
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     df_out.to_csv(out_csv, index=False)
     
     print(f"[SUCCESS] Processed {len(results)} reports in {time.time() - start_time:.2f} seconds.")

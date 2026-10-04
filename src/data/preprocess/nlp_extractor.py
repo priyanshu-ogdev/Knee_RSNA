@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import pandas as pd
 import torch
 import time
@@ -61,13 +62,16 @@ OUTPUT SCHEMA:
 
 def parse_json_response(raw_text: str, uid: str) -> dict:
     """Safely extracts JSON from the LLM output and formats it for labels.py"""
-    raw_text = raw_text.strip()
-    if raw_text.startswith("```json"): raw_text = raw_text[7:]
-    if raw_text.startswith("```"): raw_text = raw_text[3:]
-    if raw_text.endswith("```"): raw_text = raw_text[:-3]
+    # SOTA Fix: Extract JSON block via regex to bypass conversational filler
+    match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+    if not match:
+        print(f"[ERROR] No JSON block found in output for {uid}")
+        return None
+        
+    clean_json = match.group(0)
     
     try:
-        data = json.loads(raw_text.strip())
+        data = json.loads(clean_json)
         out = {"StudyInstanceUID": uid}
         for t in TARGETS:
             if t in data and "state" in data[t]:
@@ -115,8 +119,15 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     print(f"[INFO] Processing {len(to_extract)} reports in massive parallel batches...")
     start_time = time.time()
     
-    # Build prompt array
-    prompts = [build_prompt(row['Report']) for _, row in to_extract.iterrows()]
+    # SOTA Fix: Apply the exact Chat Template required by the Instruct model
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    
+    # Format prompts as messages
+    messages_list = [[{"role": "user", "content": build_prompt(row['Report'])}] for _, row in to_extract.iterrows()]
+    
+    # Apply chat template
+    prompts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages_list]
     uids = to_extract['StudyInstanceUID'].tolist()
     
     # vLLM handles the mass parallelization internally. It will chew through 4349 prompts optimally.
@@ -135,6 +146,9 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     print(f"[SUCCESS] Saved to {out_csv}. You can now upload this to Kaggle.")
 
 if __name__ == "__main__":
-    DATA = os.environ.get("KAGGLEHUB_CACHE", "../data")
+    import sys
+    # Dynamically resolve project root relative to this script
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    DATA = os.environ.get("KAGGLEHUB_CACHE", os.path.join(PROJECT_ROOT, "data"))
     OUT = os.path.join(DATA, "pseudo_labels.csv")
     run_offline_extraction(DATA, OUT)

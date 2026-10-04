@@ -30,10 +30,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from google import genai
 from google.genai import types
 
-import src.config as config
-from src.labels import build_labels
-from src.preprocess import runner
-from src.train import run_training
+import src.core.config as config
+from src.data.labels import build_labels
+from src.data.preprocess import runner
+from src.training.train import run_training
 
 
 # ==============================================================================
@@ -227,7 +227,7 @@ def run_all_folds(labels_csv: str, cache_dir: str, work_dir: str):
     print("=" * 80)
     
     # First generate splits
-    from src.preprocess import splits
+    from src.data.preprocess import splits
     folds_csv = os.path.join(work_dir, "folds.csv")
     if not os.path.exists(folds_csv):
         print("Generating 5-fold stratification splits...")

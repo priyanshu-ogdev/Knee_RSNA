@@ -65,7 +65,7 @@ def predict_chunk_tta(
     AUC improvement: averaging reduces logit variance without adding bias.
     Expected gain: +0.002 to +0.005 AUC (standard for 4-pass TTA on MRI).
     """
-    from .preprocess import sampling
+    # Fixed: Removed broken relative import. loader is already in global scope.
     from concurrent.futures import ThreadPoolExecutor
 
     all_preds = []

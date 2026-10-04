@@ -75,8 +75,10 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     cfg = config.get_cfg("v2")
     cpu_cores = max(2, os.cpu_count() or 2)
     
+    # SOTA Fix: The prefix must be the file stem inside the cache_dir, not the cache_dir itself!
+    cache_prefix = os.path.join(cache_dir, "train")
     cache, stats = runner.run_cache(
-        index_out, 'train', cache_dir, cfg=cfg,
+        index_out, 'train', cache_prefix, cfg=cfg,
         workers=cpu_cores, studies=train_studies, fresh=False
     )
     print(f"[SUCCESS] Cache ready. Stats: {stats}")

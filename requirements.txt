@@ -1,28 +1,31 @@
-# PyTorch Core
-torch
+# ==============================================================================
+# RSNA KNEE 3D VISION PIPELINE - ENVIRONMENT REQUIREMENTS
+# ==============================================================================
+
+# 1. Core Deep Learning Stack
+torch>=2.4.0
 torchvision
 torchaudio
 
-# Model & Architecture
+# 2. DINOv2 / ConvNeXt Model Support
 transformers
 accelerate
+timm
 
-# Data & ML Math
-pandas
+# 3. DGX Offline NLP Extraction (Nemotron-70B / vLLM)
+vllm
+bitsandbytes
+flash-attn
+
+# 4. Ultra-Fast C++ Data Ingestion & Memory Mapping
+dicomsdl
+opencv-python-headless
 numpy
+pandas
 scipy
 scikit-learn
 
-# Vision & Ultra-Fast DICOM C++ Parser
-opencv-python-headless
-dicomsdl
-
-# Pseudo-Labeling Extraction
-google-genai
-tenacity
-
-# Utilities
-tqdm
-
+# 5. Orchestration & Caching
 kagglehub
 python-dotenv
+tqdm

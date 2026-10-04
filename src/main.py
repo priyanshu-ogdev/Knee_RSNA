@@ -63,27 +63,28 @@ TARGETS:
 
 RULES:
 1. Output MUST be valid JSON matching the exact output schema.
-2. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
-3. "present" = explicitly torn/injured. "absent" = explicitly normal. "not_stated" = omitted.
-4. Watch out for negations (e.g. "no evidence of ACL tear" -> ACL=absent).
+2. "exact_quote": You MUST literally copy/paste the exact sentence from the report that proves the condition. If the condition is not mentioned at all, write "None".
+3. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
+4. "present" = explicitly torn/injured. "absent" = explicitly normal. "not_stated" = omitted or "None" quote.
+5. Do not guess. You must ground the state in the exact quote.
 
 REPORT:
 {report}
 
 OUTPUT SCHEMA:
 {{
-  "ACL": {{"state": "..."}},
-  "MCL": {{"state": "..."}},
-  "Medial Meniscus": {{"state": "..."}},
-  "Lateral Meniscus": {{"state": "..."}},
-  "Medial OA": {{"state": "..."}},
-  "Lateral OA": {{"state": "..."}},
-  "PF OA": {{"state": "..."}},
-  "Effusion": {{"state": "..."}},
-  "Synovitis": {{"state": "..."}},
-  "Baker's": {{"state": "..."}},
-  "Contusion": {{"state": "..."}},
-  "Fracture": {{"state": "..."}}
+  "ACL": {{"exact_quote": "...", "state": "..."}},
+  "MCL": {{"exact_quote": "...", "state": "..."}},
+  "Medial Meniscus": {{"exact_quote": "...", "state": "..."}},
+  "Lateral Meniscus": {{"exact_quote": "...", "state": "..."}},
+  "Medial OA": {{"exact_quote": "...", "state": "..."}},
+  "Lateral OA": {{"exact_quote": "...", "state": "..."}},
+  "PF OA": {{"exact_quote": "...", "state": "..."}},
+  "Effusion": {{"exact_quote": "...", "state": "..."}},
+  "Synovitis": {{"exact_quote": "...", "state": "..."}},
+  "Baker's": {{"exact_quote": "...", "state": "..."}},
+  "Contusion": {{"exact_quote": "...", "state": "..."}},
+  "Fracture": {{"exact_quote": "...", "state": "..."}}
 }}
 """
 
@@ -92,22 +93,31 @@ OUTPUT SCHEMA:
     stop=stop_after_attempt(5),
     retry=retry_if_exception_type(Exception)
 )
-def _call_gemini_with_retry(client, report: str):
-    return client.models.generate_content(
-        model='gemini-3.1-pro',
-        contents=build_prompt(report),
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
+def _call_gemini_with_retry(client, report: str, model_name: str):
+    if hasattr(client, 'models'): # Gemini SDK
+        return client.models.generate_content(
+            model='gemini-3.1-pro',
+            contents=build_prompt(report),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0,
+            ),
+        ).text
+    else: # OpenAI SDK (vLLM local server for Nemotron/Gemma)
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": build_prompt(report)}],
             temperature=0.0,
-        ),
-    )
+            response_format={"type": "json_object"}
+        )
+        return resp.choices[0].message.content
 
-def extract_study(client, row):
+def extract_study(client, row, model_name: str = 'nemotron'):
     try:
-        response = _call_gemini_with_retry(client, row['Report'])
+        raw_text = _call_gemini_with_retry(client, row['Report'], model_name)
         
         # Strip potential markdown formatting (e.g. ```json ... ```)
-        raw_text = response.text.strip()
+        raw_text = raw_text.strip()
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -141,18 +151,28 @@ def extract_study(client, row):
 
 def run_nlp_extraction(data_root: str, out_csv: str):
     print("=" * 80)
-    print("PHASE 1: NLP PSEUDO-LABEL EXTRACTION")
+    print("PHASE 1: NLP PSEUDO-LABEL EXTRACTION (CoT + LOCAL INFERENCE)")
     print("=" * 80)
     
     if os.path.exists(out_csv):
         print(f"[INFO] {out_csv} already exists. Skipping API extraction.")
         return out_csv
         
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is required for Phase 1.")
-        
-    client = genai.Client(api_key=api_key)
+    # Check if user is pointing to a local vLLM server (e.g. Nemotron-70B on the DGX)
+    local_api = os.environ.get("LOCAL_VLLM_API_URL")
+    if local_api:
+        print(f"[INFO] Using local vLLM inference server: {local_api}")
+        import openai
+        client = openai.OpenAI(api_key="EMPTY", base_url=local_api)
+        model_name = os.environ.get("LOCAL_VLLM_MODEL", "nemotron")
+    else:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("Set LOCAL_VLLM_API_URL or GEMINI_API_KEY to run Phase 1.")
+        print("[INFO] Using Gemini API fallback.")
+        client = genai.Client(api_key=api_key)
+        model_name = 'gemini-3.1-pro'
+
     train_df = pd.read_csv(os.path.join(data_root, 'train.csv'))
     
     # We only need to extract reports that DON'T have gold labels.
@@ -167,7 +187,7 @@ def run_nlp_extraction(data_root: str, out_csv: str):
     # Gemini API free tier allows 15 RPM. Pro account limits vary but pacing is required.
     # We use 10 workers + exponential backoff + pacing to safely process 4,300+ requests.
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(extract_study, client, row): i for i, row in to_extract.iterrows()}
+        futures = {executor.submit(extract_study, client, row, model_name): i for i, row in to_extract.iterrows()}
         for i, f in enumerate(concurrent.futures.as_completed(futures)):
             res = f.result()
             if res:

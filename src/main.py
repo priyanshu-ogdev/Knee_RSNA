@@ -7,6 +7,10 @@ Executes the entire SOTA pipeline in one shot:
 3. Builds the optimized memory-mapped cache for ultra-fast I/O.
 4. Trains a 5-fold DINOv2-based model.
 """
+import os
+# Force kagglehub to download directly into our root data/ directory instead of C:\Users\...
+os.environ['KAGGLEHUB_CACHE'] = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data'))
+
 import kagglehub
 from dotenv import load_dotenv
 

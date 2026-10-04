@@ -62,14 +62,23 @@ OUTPUT SCHEMA:
 
 def parse_json_response(raw_text: str, uid: str) -> dict:
     """Safely extracts JSON from the LLM output and formats it for labels.py"""
-    # SOTA Fix: Extract JSON block via regex to bypass conversational filler
-    match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-    if not match:
+    # SOTA Fix: Prioritize strict markdown extraction to avoid regex greediness on trailing conversational {}
+    clean_json = None
+    md_match = re.search(r'```json\s*(.*?)\s*```', raw_text, re.DOTALL)
+    if md_match:
+        clean_json = md_match.group(1)
+    else:
+        # Fallback to brace matching, but strictly find the first { and the last } 
+        # (Still vulnerable if trailing conversation has }, but much safer than failing immediately)
+        start = raw_text.find('{')
+        end = raw_text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            clean_json = raw_text[start:end+1]
+            
+    if not clean_json:
         print(f"[ERROR] No JSON block found in output for {uid}")
         return None
         
-    clean_json = match.group(0)
-    
     try:
         data = json.loads(clean_json)
         out = {"StudyInstanceUID": uid}
@@ -101,15 +110,23 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     gold_mask = train_df[TARGETS].notna().any(axis=1)
     to_extract = train_df[~gold_mask & train_df['Report'].notna()].copy()
     
+    if len(to_extract) == 0:
+        print("[INFO] No reports left to extract. Exiting.")
+        return
+        
     print(f"[INFO] Initializing vLLM Engine for {model_id}...")
     # Speedup Upgrade: vLLM naturally implements FlashAttention-2, PagedAttention, and Continuous Batching.
     # We load in 8-bit (bitsandbytes) to fit the 70B model into ~70GB of the DGX's 128GB Unified Memory.
+    # SOTA Fix: Dynamically scale Tensor Parallelism to prevent OOM on partitioned DGX nodes (e.g. 4x 32GB GPUs)
+    tensor_parallel = torch.cuda.device_count()
+    
     llm = LLM(
         model=model_id,
         quantization="bitsandbytes", 
         load_format="bitsandbytes",
         enforce_eager=False,
         max_model_len=4096,
+        tensor_parallel_size=tensor_parallel,
         gpu_memory_utilization=0.9 # Dedicate 90% of available VRAM to KV cache for massive batching
     )
     

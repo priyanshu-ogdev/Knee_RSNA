@@ -3,7 +3,7 @@ RSNA 2026: End-to-End Master Training & Build Pipeline
 ------------------------------------------------------
 Executes all phases seamlessly in a unified workflow:
   PHASE 0: Environment & Hardware Configuration + Dataset Verification
-  PHASE 1: NLP Pseudo-Label Extraction & Shield Validation
+  PHASE 1: NLP Pseudo-Label Auto-Detection & Completion (vLLM / Clinical Rules)
   PHASE 2: Dataset Merging, Stratification & Cache Build (Download-Aware)
   PHASE 3: 5-Fold Deep Learning Training (DINOv2 + CrossSlotTransformer)
   PHASE 4: Out-Of-Fold Evaluation & Checkpoint Verification
@@ -130,52 +130,55 @@ def resolve_data_root(cli_data_root: str | None = None) -> str:
 
 
 # ==============================================================================
-# PHASE 1: NLP PSEUDO-LABEL EXTRACTION & SHIELD VALIDATION
+# PHASE 1: NLP PSEUDO-LABEL AUTO-DETECTION & COMPLETION
 # ==============================================================================
-def run_nlp_phase(data_root: str, work_dir: str, skip_nlp: bool = False) -> str | None:
+def run_nlp_phase(
+    data_root: str,
+    work_dir: str,
+    skip_nlp: bool = False,
+    engine: str = "auto",
+    model_id: str | None = None,
+    force: bool = False,
+) -> str | None:
     print("\n" + "=" * 80)
-    print("PHASE 1: NLP PSEUDO-LABEL EXTRACTION & VALIDATION")
+    print("PHASE 1: NLP PSEUDO-LABEL AUTO-DETECTION & COMPLETION")
     print("=" * 80)
+
+    if skip_nlp:
+        print("[INFO] --skip_nlp specified. Skipping extraction and proceeding with 58 Gold labels only.")
+        return None
 
     # Candidate locations for pre-computed pseudo-labels
     candidates = [
-        os.path.join(data_root, "pseudo_labels.csv"),
         os.path.join(work_dir, "pseudo_labels.csv"),
+        os.path.join(data_root, "pseudo_labels.csv"),
         os.path.join(PROJECT_ROOT, "data", "pseudo_labels.csv"),
         os.path.join(data_root, "extra_labels.csv"),
     ]
-
+    out_csv = os.path.join(work_dir, "pseudo_labels.csv")
     for cand in candidates:
         if os.path.exists(cand):
-            try:
-                df = pd.read_csv(cand)
-                if "StudyInstanceUID" in df.columns and len(df) > 100:
-                    print(f"[SUCCESS] Found valid pre-computed pseudo-labels ({len(df)} studies) at: {cand}")
-                    return cand
-            except Exception as e:
-                print(f"[WARNING] Could not read candidate {cand}: {e}")
+            out_csv = cand
+            break
 
-    if skip_nlp:
-        print("[INFO] --skip_nlp specified. Proceeding with 58 Gold labels only.")
-        return None
-
-    out_csv = os.path.join(work_dir, "pseudo_labels.csv")
-    print("[INFO] Pre-computed pseudo-labels not found. Checking vLLM for offline extraction...")
     try:
-        from src.data.preprocess.nlp_extractor import run_offline_extraction
-        print("[INFO] Starting vLLM offline report extraction with hardened clinical shield...")
-        run_offline_extraction(data_root, out_csv)
-        if os.path.exists(out_csv):
-            print(f"[SUCCESS] Extracted pseudo-labels saved to: {out_csv}")
-            return out_csv
-    except ImportError:
-        print("[INFO] vLLM is not installed in this environment.")
-        print("[INFO] Training will proceed using 100% immutable Gold standard labels.")
+        from src.data.preprocess.nlp_extractor import auto_complete_extraction
+        pseudo_csv, stats = auto_complete_extraction(
+            data_root=data_root,
+            out_csv=out_csv,
+            model_id=model_id,
+            engine=engine,
+            force=force,
+        )
+        return pseudo_csv
     except Exception as e:
-        print(f"[WARNING] Offline extraction could not run: {e}")
+        print(f"[WARNING] NLP auto-completion encountered an issue: {e}")
+        traceback.print_exc()
+        if os.path.exists(out_csv):
+            print(f"[FALLBACK] Proceeding with existing pseudo-labels at: {out_csv}")
+            return out_csv
         print("[INFO] Proceeding with Gold standard labels.")
-
-    return None
+        return None
 
 
 # ==============================================================================
@@ -230,7 +233,7 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None) -> tu
         else:
             print(f"  * 5-Fold Splits : Found existing {folds_csv}")
 
-        print("\n  * Ready for Full Execution:")
+        print("\n  * Staging Complete. Ready for Full Training:")
         print("    1. Let the dataset download complete.")
         print("    2. Re-run:  python src/main.py")
         print("    The pipeline will immediately detect all downloaded series, build the memmap cache,")
@@ -438,15 +441,22 @@ def run_inference_phase(
 # MAIN ENTRY POINT
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="RSNA Knee Abnormality Detection: Master Training Pipeline")
+    parser = argparse.ArgumentParser(description="RSNA Knee Abnormality Detection: Unified Master Pipeline")
     parser.add_argument("--data_root", type=str, default=None, help="Path to competition dataset root")
     parser.add_argument("--work_dir", type=str, default=None, help="Working output directory")
+    
+    # NLP Options
+    parser.add_argument("--nlp_engine", type=str, default="auto", choices=["auto", "vllm", "rules"], help="NLP extraction engine: 'auto' (detects vLLM/CUDA, else rules), 'vllm', or 'rules'")
+    parser.add_argument("--nlp_model", type=str, default="nvidia/Llama-3.1-Nemotron-70B-Instruct-HF", help="vLLM model ID for report extraction")
+    parser.add_argument("--force_nlp", action="store_true", help="Force re-extraction of pseudo-labels from scratch")
+    parser.add_argument("--skip_nlp", action="store_true", help="Skip NLP extraction entirely and train with Gold labels only")
+
+    # Training Options
     parser.add_argument("--epochs", type=int, default=config.EPOCHS, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE, help="Batch size per step")
     parser.add_argument("--grad_accum", type=int, default=config.GRAD_ACCUM, help="Gradient accumulation steps")
     parser.add_argument("--folds", type=str, default="0,1,2,3,4", help="Comma-separated list of folds to train (e.g. '0,1,2,3,4')")
     parser.add_argument("--variant", type=str, default="dinov2-base", help="Backbone variant ('dinov2-base' or 'dinov2-small')")
-    parser.add_argument("--skip_nlp", action="store_true", help="Skip NLP extraction and use Gold labels only")
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
     parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
     args = parser.parse_args()
@@ -483,8 +493,15 @@ def main():
     verify_hardware_and_environment()
     data_root = resolve_data_root(args.data_root)
 
-    # Phase 1: NLP Pseudo-Label Extraction
-    pseudo_csv = run_nlp_phase(data_root, work_dir, skip_nlp=args.skip_nlp)
+    # Phase 1: NLP Pseudo-Label Auto-Detection & Completion
+    pseudo_csv = run_nlp_phase(
+        data_root=data_root,
+        work_dir=work_dir,
+        skip_nlp=args.skip_nlp,
+        engine=args.nlp_engine,
+        model_id=args.nlp_model,
+        force=args.force_nlp,
+    )
 
     # Phase 2: Dataset Merge & Cache Build
     labels_csv, cache_prefix, folds_csv = run_preparation(data_root, work_dir, pseudo_csv)

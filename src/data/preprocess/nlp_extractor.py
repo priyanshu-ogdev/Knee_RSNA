@@ -478,6 +478,289 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     
     print(f"[SUCCESS] Processed {len(results)} reports in {time.time() - start_time:.2f} seconds.")
     print(f"[SUCCESS] Saved to {out_csv}. Ready for Phase 2 training pipeline.")
+    return out_csv
+
+
+
+# =============================================================================
+# CLINICAL SHIELD HEURISTIC ENGINE (Vectorized / CPU Fallback)
+# =============================================================================
+CLINICAL_RULES = {
+    "ACL": {
+        "pos": [r"\bacl\b.*?\b(tear|ruptur|sprain|torn)", r"\banterior cruciate\b.*?\b(tear|ruptur|sprain|torn)", r"\brotura.*?\blca\b", r"\brupp?tur.*?\b(vkb|vorderes kreuzband)", r"\bscheur.*?\bvkb\b"],
+        "neg": [r"\bacl\b.*?\b(intact|normal|unremarkable|conservad|intakt|ongestoord|zonder scheur)", r"\banterior cruciate\b.*?\b(intact|normal|unremarkable)", r"\bkeine ruptur.*?\b(vkb|kreuzband)", r"\bsin rotura.*?\blca\b"],
+        "crosstalk_exclude": [r"\bposterior cruciate\b", r"\bpcl\b", r"\bhkb\b", r"\blcp\b", r"\bachterste kruisband\b"]
+    },
+    "MCL": {
+        "pos": [r"\bmcl\b.*?\b(tear|sprain|ruptur|torn|distension)", r"\bmedial collateral\b.*?\b(tear|sprain|ruptur|torn)", r"\brotura.*?\blcm\b", r"\binnenband.*?\b(ruptur|riss|scheur)"],
+        "neg": [r"\bmcl\b.*?\b(intact|normal|unremarkable|conservad|intakt)", r"\bmedial collateral\b.*?\b(intact|normal|unremarkable)", r"\bsin rotura.*?\blcm\b"],
+        "crosstalk_exclude": [r"\blateral collateral\b", r"\blcl\b", r"\bmpfl\b", r"\bpatellofemoral ligament\b"]
+    },
+    "Medial Meniscus": {
+        "pos": [r"\bmedial meniscus\b.*?\b(tear|ruptur|scheur|torn|riss)", r"\brotura.*?\bmenisco med", r"\brotura.*?\bmenisco int", r"\briss.*?\b(innenmeniskus|medialen meniskus)", r"\bscheur.*?\bmediale meniscus"],
+        "neg": [r"\bmedial meniscus\b.*?\b(intact|normal|unremarkable|unauff)", r"\bsin rotura.*?\bmenisco med", r"\bkein(e)? (meniskus)?riss.*?\binnenmeniskus", r"\bgeen scheur.*?\bmediale meniscus"],
+        "crosstalk_exclude": [r"\blateral meniscus\b", r"\baussenmeniskus\b", r"\blaterale meniscus\b"]
+    },
+    "Lateral Meniscus": {
+        "pos": [r"\blateral meniscus\b.*?\b(tear|ruptur|scheur|torn|riss)", r"\brotura.*?\bmenisco lat", r"\brotura.*?\bmenisco ext", r"\briss.*?\b(aussenmeniskus|außenmeniskus|lateralen meniskus)", r"\bscheur.*?\blaterale meniscus"],
+        "neg": [r"\blateral meniscus\b.*?\b(intact|normal|unremarkable|unauff)", r"\bsin rotura.*?\bmenisco lat", r"\bkein(e)? (meniskus)?riss.*?\baussenmeniskus", r"\bgeen scheur.*?\blaterale meniscus"],
+        "crosstalk_exclude": [r"\bmedial meniscus\b", r"\binnenmeniskus\b", r"\bmediale meniscus\b"]
+    },
+    "Medial OA": {
+        "pos": [r"\bmedial.*?\b(osteoarthr|arthros|cartilage defect|cartilage loss|chondromalacia|joint space narrowing)", r"\bartejo med.*?\barthros", r"\bmedialen kompartiment.*?\b(arthrose|knorpelschaden)"],
+        "neg": [r"\bmedial.*?\b(no osteoarthritis|no arthrosis|cartilage intact|normal joint space)"],
+        "crosstalk_exclude": [r"\blateral compartment\b", r"\bpatellofemoral\b"]
+    },
+    "Lateral OA": {
+        "pos": [r"\blateral.*?\b(osteoarthr|arthros|cartilage defect|cartilage loss|chondromalacia|joint space narrowing)", r"\bartejo lat.*?\barthros", r"\blateralen kompartiment.*?\b(arthrose|knorpelschaden)"],
+        "neg": [r"\blateral.*?\b(no osteoarthritis|no arthrosis|cartilage intact|normal joint space)"],
+        "crosstalk_exclude": [r"\bmedial compartment\b", r"\bpatellofemoral\b"]
+    },
+    "PF OA": {
+        "pos": [r"\b(patellofemoral|trochle|patella).*?\b(osteoarthr|arthros|chondromalacia|cartilage loss|cartilage defect|facet arthrosis)", r"\bfemoro-patelar.*?\barthros", r"\bretropatellar.*?\b(arthrose|knorpelschaden)"],
+        "neg": [r"\b(patellofemoral|trochle|patella).*?\b(normal|intact|no arthrosis)"],
+        "crosstalk_exclude": []
+    },
+    "Effusion": {
+        "pos": [r"\b(joint )?effusion\b", r"\bhydrops\b", r"\bderrame articular\b", r"\berguss\b", r"\bgelenkerguss\b", r"\bfluid in (the )?(joint|suprapatellar)", r"\bvloeistof.*?\bgewricht\b"],
+        "neg": [r"\b(no|without|sin|geen|kein).*?\b(effusion|hydrops|derrame|erguss)"],
+        "crosstalk_exclude": []
+    },
+    "Synovitis": {
+        "pos": [r"\bsynovit(is|e)\b", r"\bsynovial (thickening|proliferation|hypertrophy|enhancement)", r"\bsinovitis\b", r"\bsynovialitis\b"],
+        "neg": [r"\b(no|without|sin|geen|kein).*?\bsynovit"],
+        "crosstalk_exclude": []
+    },
+    "Baker's": {
+        "pos": [r"\bbaker(')?s? cyst\b", r"\bpopliteal cyst\b", r"\bquiste de baker\b", r"\bpopliteacyste\b", r"\bbaker(-)?zyste\b", r"\bkyste de baker\b"],
+        "neg": [r"\b(no|without|sin|geen|kein).*?\b(baker|popliteal cyst|baker-zyste)"],
+        "crosstalk_exclude": []
+    },
+    "Contusion": {
+        "pos": [r"\bbone (marrow )?(contusion|bruise|edema)\b", r"\bknochenmark(s)?(oedem|ödem)\b", r"\bedema oseo\b", r"\bedema subcondral\b", r"\bosteochondral contusion\b", r"\bbotkneuzing\b", r"\bbotoedeem\b"],
+        "neg": [r"\b(no|without|sin|geen|kein).*?\b(contusion|bone bruise|knochenmarködem|edema oseo)"],
+        "crosstalk_exclude": []
+    },
+    "Fracture": {
+        "pos": [r"\bfractur(e|a|atie)\b", r"\bfraktur\b", r"\bcortical (break|disruption|step)\b", r"\bavulsion\b"],
+        "neg": [r"\b(no|without|sin|geen|kein).*?\b(fracture|fraktur|fractura|avulsion)"],
+        "crosstalk_exclude": []
+    }
+}
+
+HEDGING_PHRASES = [
+    "cannot exclude", "cannot rule out", "suspected", "questionable", "possible", "borderline", 
+    "no descartable", "sospecha", "dudoso", "niet uit te sluiten", "verdacht", "mogelijk", 
+    "nicht auszuschliessen", "nicht auszuschließen", "fraglich", "verdacht auf"
+]
+
+def extract_by_rules(report: str, uid: str) -> dict:
+    """Fast, deterministic Clinical Shield Heuristic Extractor applying identical multi-lingual clinical logic."""
+    rep_low = str(report).lower()
+    out = {"StudyInstanceUID": str(uid).strip()}
+    
+    for t in TARGETS:
+        rule = CLINICAL_RULES[t]
+        pos_found = False
+        neg_found = False
+        
+        for pat in rule["neg"]:
+            if re.search(pat, rep_low, flags=re.IGNORECASE):
+                neg_found = True
+                break
+                
+        for pat in rule["pos"]:
+            m = re.search(pat, rep_low, flags=re.IGNORECASE)
+            if m:
+                start = max(0, m.start() - 40)
+                end = min(len(rep_low), m.end() + 40)
+                snippet = rep_low[start:end]
+                
+                if any(h in snippet for h in HEDGING_PHRASES):
+                    continue
+                if any(re.search(x, snippet, flags=re.IGNORECASE) for x in rule["crosstalk_exclude"]):
+                    continue
+                if any(neg in snippet for neg in ["no ", "sin ", "geen ", "kein ", "without ", "not seen"]):
+                    neg_found = True
+                    continue
+                    
+                pos_found = True
+                break
+                
+        if pos_found and not neg_found:
+            out[t], out[f"{t}_weight"] = 1.0, 0.5
+        elif neg_found:
+            out[t], out[f"{t}_weight"] = 0.0, 0.5
+        else:
+            if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
+                out[t], out[f"{t}_weight"] = 0.0, 0.0
+            else:
+                out[t], out[f"{t}_weight"] = 0.0, 0.1
+                
+    return out
+
+
+def auto_complete_extraction(
+    data_root: str,
+    out_csv: str,
+    model_id: str | None = None,
+    engine: str = "auto",
+    force: bool = False,
+    chunk_size: int = 500,
+) -> tuple[str, dict]:
+    """Unified Auto-Detection & Completion Engine for NLP Pseudo-Labels.
+    
+    1. Scans train.csv to identify all non-gold studies requiring extraction.
+    2. Inspects out_csv to determine already completed studies.
+    3. If 100% complete (4,349 studies), immediately returns out_csv.
+    4. If incomplete or missing, auto-selects engine (vLLM if available/requested, else Clinical Shield rules)
+       and resumes extraction from the exact missing UIDs without repeating work.
+    5. Saves checkpoints atomically to prevent file corruption.
+    
+    Returns:
+        (out_csv_path, stats_dict)
+    """
+    print("=" * 80)
+    print("PHASE 1: NLP PSEUDO-LABEL AUTO-DETECTION & COMPLETION")
+    print("=" * 80)
+    
+    train_path = os.path.join(data_root, 'train.csv')
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"train.csv not found at {train_path}")
+        
+    train_df = pd.read_csv(train_path)
+    train_df['StudyInstanceUID'] = train_df['StudyInstanceUID'].astype(str).str.strip()
+    gold_mask = train_df[TARGETS].notna().any(axis=1)
+    
+    report_col = 'Report' if 'Report' in train_df.columns else ('report' if 'report' in train_df.columns else None)
+    if report_col is None:
+        raise KeyError("Could not find 'Report' or 'report' column in train.csv")
+        
+    needed_df = train_df[~gold_mask & train_df[report_col].notna() & (train_df[report_col].astype(str).str.strip() != '')].copy()
+    total_needed = len(needed_df)
+    needed_uids = set(needed_df['StudyInstanceUID'])
+    
+    print(f"[STATUS] Dataset Studies: {len(train_df)} total | Gold Labeled: {int(gold_mask.sum())} | Requiring NLP Extraction: {total_needed}")
+    
+    # 1. Check existing out_csv
+    existing_results = []
+    done_uids = set()
+    if os.path.exists(out_csv) and not force:
+        try:
+            existing_df = pd.read_csv(out_csv)
+            existing_df['StudyInstanceUID'] = existing_df['StudyInstanceUID'].astype(str).str.strip()
+            # Validate expected target columns
+            if all(t in existing_df.columns for t in TARGETS):
+                done_uids = set(existing_df['StudyInstanceUID']) & needed_uids
+                existing_results = existing_df.to_dict('records')
+                print(f"[AUTO-DETECT] Existing checkpoint found: {len(done_uids)} / {total_needed} studies already extracted.")
+        except Exception as e:
+            print(f"[WARNING] Could not parse existing {out_csv} ({e}). Starting fresh.")
+            existing_results = []
+            done_uids = set()
+            
+    # 2. Check for completion
+    if len(done_uids) >= total_needed:
+        print(f"[SUCCESS] Pseudo-labels are 100% COMPLETE ({len(done_uids)} / {total_needed} studies verified).")
+        print(f"[SUCCESS] File ready at: {out_csv}")
+        return out_csv, {"status": "complete", "total": len(done_uids), "new": 0, "engine": "cached"}
+        
+    remaining_df = needed_df[~needed_df['StudyInstanceUID'].isin(done_uids)].copy()
+    print(f"[AUTO-DETECT] Remaining to extract: {len(remaining_df)} studies ({len(done_uids)/max(1, total_needed)*100:.1f}% previously done).")
+    
+    # 3. Engine Selection
+    selected_engine = engine.lower()
+    if selected_engine == "auto":
+        if LLM is not None and torch.cuda.is_available():
+            selected_engine = "vllm"
+        else:
+            selected_engine = "rules"
+            
+    print(f"[CONFIG] NLP Extraction Engine Selected: '{selected_engine.upper()}'")
+    
+    # 4. Execution
+    start_time = time.time()
+    out_dir = os.path.dirname(out_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        
+    results = existing_results
+    
+    if selected_engine == "vllm":
+        if LLM is None:
+            print("[WARNING] vLLM not available in this environment. Falling back to Clinical Shield Rules engine.")
+            selected_engine = "rules"
+        else:
+            print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
+            # Run vLLM chunk processing
+            model_to_use = model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
+            gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
+            enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
+            use_quant = os.environ.get("VLLM_QUANTIZATION", "bitsandbytes")
+            
+            llm_kwargs = {}
+            if use_quant.lower() in ["bitsandbytes", "bnb"]:
+                llm_kwargs = {"quantization": "bitsandbytes", "load_format": "bitsandbytes"}
+            elif use_quant.lower() in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
+                llm_kwargs = {"quantization": "fp8"}
+            elif use_quant.lower() not in ["none", "null", "false", "fp16", "bf16"]:
+                llm_kwargs = {"quantization": use_quant}
+                
+            llm = LLM(
+                model=model_to_use,
+                enforce_eager=enforce_eager,
+                max_model_len=4096,
+                tensor_parallel_size=1,
+                gpu_memory_utilization=gpu_util,
+                **llm_kwargs
+            )
+            sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
+            
+            for i in range(0, len(remaining_df), chunk_size):
+                chunk = remaining_df.iloc[i:i+chunk_size]
+                raw_reports = [str(r)[:12000] for r in chunk[report_col]]
+                messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
+                uids_chunk = chunk['StudyInstanceUID'].tolist()
+                
+                print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
+                outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
+                
+                for output, uid, report_str in zip(outputs, uids_chunk, raw_reports):
+                    text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                    res = parse_json_response(text, uid, original_report=report_str)
+                    if res:
+                        results.append(res)
+                        
+                # Atomic checkpoint write
+                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                tmp_csv = f"{out_csv}.tmp"
+                df_out.to_csv(tmp_csv, index=False)
+                os.replace(tmp_csv, out_csv)
+                print(f"[CHECKPOINT] Saved {len(df_out)} studies to {out_csv}")
+                
+    if selected_engine == "rules":
+        print(f"[INFO] Running Clinical Shield Heuristic Extractor on {len(remaining_df)} reports...")
+        n_processed = 0
+        for i, (_, row) in enumerate(remaining_df.iterrows()):
+            uid = str(row['StudyInstanceUID']).strip()
+            rep = str(row[report_col])
+            res = extract_by_rules(rep, uid)
+            results.append(res)
+            n_processed += 1
+            
+            if n_processed % 500 == 0 or n_processed == len(remaining_df):
+                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                tmp_csv = f"{out_csv}.tmp"
+                df_out.to_csv(tmp_csv, index=False)
+                os.replace(tmp_csv, out_csv)
+                pct = (len(df_out) / total_needed) * 100
+                print(f"[CHECKPOINT] Extracted {len(df_out)} / {total_needed} ({pct:.1f}%) -> {out_csv}")
+                
+    final_df = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+    elapsed = time.time() - start_time
+    print(f"[SUCCESS] NLP extraction completed in {elapsed:.1f}s. Total valid studies in {out_csv}: {len(final_df)}.")
+    return out_csv, {"status": "complete", "total": len(final_df), "new": len(remaining_df), "engine": selected_engine}
+
 
 if __name__ == "__main__":
     import kagglehub

@@ -15,11 +15,13 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
     """root: competition folder. extra_csv: same schema as train.csv (targets may be soft probabilities in [0,1]),
     optionally with '<target>_weight' columns (extractor confidence). -> DataFrame (and CSV if out_csv)."""
     tr = pd.read_csv(os.path.join(root, 'train.csv'))
-    out = pd.DataFrame({'StudyInstanceUID': tr['StudyInstanceUID']})
+    out = pd.DataFrame({'StudyInstanceUID': tr['StudyInstanceUID'].astype(str).str.strip()})
     gold = {t: (tr[t].astype(float) if t in tr.columns else pd.Series(np.nan, index=tr.index)) for t in config.TARGETS}
     ex = None
     if extra_csv and os.path.exists(extra_csv):
-        ex = pd.read_csv(extra_csv).drop_duplicates('StudyInstanceUID').set_index('StudyInstanceUID').reindex(out['StudyInstanceUID'])
+        ex_raw = pd.read_csv(extra_csv)
+        ex_raw['StudyInstanceUID'] = ex_raw['StudyInstanceUID'].astype(str).str.strip()
+        ex = ex_raw.drop_duplicates('StudyInstanceUID').set_index('StudyInstanceUID').reindex(out['StudyInstanceUID'])
     out['source'] = 'none'
     any_gold = pd.concat(gold, axis=1).notna().any(axis=1).values
     out.loc[any_gold, 'source'] = 'gold'

@@ -691,64 +691,71 @@ def auto_complete_extraction(
             print("[WARNING] vLLM not available in this environment. Falling back to Clinical Shield Rules engine.")
             selected_engine = "rules"
         else:
-            print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
-            # Run vLLM chunk processing
-            model_to_use = model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
-            gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
-            enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
-            use_quant = os.environ.get("VLLM_QUANTIZATION", "bitsandbytes")
-            
-            llm_kwargs = {}
-            if use_quant.lower() in ["bitsandbytes", "bnb"]:
-                llm_kwargs = {"quantization": "bitsandbytes", "load_format": "bitsandbytes"}
-            elif use_quant.lower() in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
-                llm_kwargs = {"quantization": "fp8"}
-            elif use_quant.lower() not in ["none", "null", "false", "fp16", "bf16"]:
-                llm_kwargs = {"quantization": use_quant}
+            try:
+                print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
+                # Run vLLM chunk processing
+                model_to_use = model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
+                gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
+                enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
+                use_quant = os.environ.get("VLLM_QUANTIZATION", "none").lower()
                 
-            llm = LLM(
-                model=model_to_use,
-                enforce_eager=enforce_eager,
-                max_model_len=4096,
-                tensor_parallel_size=1,
-                gpu_memory_utilization=gpu_util,
-                **llm_kwargs
-            )
-            sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
-            
-            for i in range(0, len(remaining_df), chunk_size):
-                chunk = remaining_df.iloc[i:i+chunk_size]
-                raw_reports = [str(r)[:12000] for r in chunk[report_col]]
-                messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
-                uids_chunk = chunk['StudyInstanceUID'].tolist()
+                llm_kwargs = {}
+                if use_quant in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
+                    llm_kwargs = {"quantization": "fp8"}
+                elif use_quant in ["bitsandbytes", "bnb"]:
+                    print("[INFO] Note: bitsandbytes quantization is not supported in vLLM v1 engine. Running unquantized native precision.")
+                elif use_quant not in ["none", "null", "false", "fp16", "bf16"]:
+                    llm_kwargs = {"quantization": use_quant}
+                    
+                llm = LLM(
+                    model=model_to_use,
+                    enforce_eager=enforce_eager,
+                    max_model_len=4096,
+                    tensor_parallel_size=1,
+                    gpu_memory_utilization=gpu_util,
+                    **llm_kwargs
+                )
+                sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
                 
-                print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
-                outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
-                
-                for output, uid, report_str in zip(outputs, uids_chunk, raw_reports):
-                    text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
-                    res = parse_json_response(text, uid, original_report=report_str)
-                    if res:
-                        results.append(res)
-                        
-                # Atomic checkpoint write
-                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
-                tmp_csv = f"{out_csv}.tmp"
-                df_out.to_csv(tmp_csv, index=False)
-                os.replace(tmp_csv, out_csv)
-                print(f"[CHECKPOINT] Saved {len(df_out)} studies to {out_csv}")
+                for i in range(0, len(remaining_df), chunk_size):
+                    chunk = remaining_df.iloc[i:i+chunk_size]
+                    raw_reports = [str(r)[:12000] for r in chunk[report_col]]
+                    messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
+                    uids_chunk = chunk['StudyInstanceUID'].tolist()
+                    
+                    print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
+                    outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
+                    
+                    for output, uid, report_str in zip(outputs, uids_chunk, raw_reports):
+                        text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                        res = parse_json_response(text, uid, original_report=report_str)
+                        if res:
+                            results.append(res)
+                            
+                    # Atomic checkpoint write
+                    df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                    tmp_csv = f"{out_csv}.tmp"
+                    df_out.to_csv(tmp_csv, index=False)
+                    os.replace(tmp_csv, out_csv)
+                    print(f"[CHECKPOINT] Saved {len(df_out)} studies to {out_csv}")
+            except Exception as vllm_err:
+                print(f"[WARNING] vLLM execution encountered an issue: {vllm_err}")
+                print("[FALLBACK] Automatically switching to Clinical Shield Rules engine to guarantee complete extraction...")
+                selected_engine = "rules"
                 
     if selected_engine == "rules":
-        print(f"[INFO] Running Clinical Shield Heuristic Extractor on {len(remaining_df)} reports...")
+        completed_uids = {r['StudyInstanceUID'] for r in results if isinstance(r, dict) and 'StudyInstanceUID' in r}
+        rules_df = needed_df[~needed_df['StudyInstanceUID'].isin(completed_uids)].copy()
+        print(f"[INFO] Running Clinical Shield Heuristic Extractor on {len(rules_df)} reports...")
         n_processed = 0
-        for i, (_, row) in enumerate(remaining_df.iterrows()):
+        for i, (_, row) in enumerate(rules_df.iterrows()):
             uid = str(row['StudyInstanceUID']).strip()
             rep = str(row[report_col])
             res = extract_by_rules(rep, uid)
             results.append(res)
             n_processed += 1
             
-            if n_processed % 500 == 0 or n_processed == len(remaining_df):
+            if n_processed % 500 == 0 or n_processed == len(rules_df):
                 df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
                 tmp_csv = f"{out_csv}.tmp"
                 df_out.to_csv(tmp_csv, index=False)

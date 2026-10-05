@@ -306,7 +306,7 @@ def run_training(
         loss_name,
         **({"gamma_neg": _gamma_neg, "gamma_pos": asl_gamma_pos, "clip": asl_clip}
            if loss_name == "asl" else {}),
-    )
+    ).to(device)
 
     # ── Data ─────────────────────────────────────────────────────────────────
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)

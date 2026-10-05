@@ -157,7 +157,7 @@ def run_nlp_phase(
     ]
     out_csv = os.path.join(work_dir, "pseudo_labels.csv")
     for cand in candidates:
-        if os.path.exists(cand):
+        if os.path.exists(cand) and os.path.getsize(cand) > 1000:
             out_csv = cand
             break
 
@@ -174,24 +174,37 @@ def run_nlp_phase(
     except Exception as e:
         print(f"[WARNING] NLP auto-completion encountered an issue: {e}")
         traceback.print_exc()
-        if os.path.exists(out_csv):
+        if os.path.exists(out_csv) and os.path.getsize(out_csv) > 1000:
             print(f"[FALLBACK] Proceeding with existing pseudo-labels at: {out_csv}")
             return out_csv
-        print("[INFO] Proceeding with Gold standard labels.")
-        return None
+        try:
+            print("[CRITICAL FALLBACK] Running emergency Clinical Shield Rules extraction to guarantee 100% study coverage...")
+            from src.data.preprocess.nlp_extractor import auto_complete_extraction
+            pseudo_csv, stats = auto_complete_extraction(
+                data_root=data_root,
+                out_csv=out_csv,
+                model_id=model_id,
+                engine="rules",
+                force=True,
+            )
+            return pseudo_csv
+        except Exception as err2:
+            print(f"[ERROR] Emergency rules extraction failed: {err2}")
+            print("[INFO] Proceeding with Gold standard labels.")
+            return None
 
 
 # ==============================================================================
 # PHASE 2: DATASET MERGING, STRATIFICATION & CACHE BUILD
 # ==============================================================================
-def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None) -> tuple[str, str | None, str]:
+def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None, force: bool = False) -> tuple[str, str | None, str]:
     print("\n" + "=" * 80)
     print("PHASE 2: DATASET MERGE, STRATIFICATION & CACHE BUILD")
     print("=" * 80)
 
     final_labels_csv = os.path.join(work_dir, "train_labels_v2.csv")
-    print(f"Merging Gold labels (weight 1.0) and pseudo-labels -> {final_labels_csv}...")
-    labels_df = build_labels(data_root, extra_csv=pseudo_csv, extra_weight=1.0, out_csv=final_labels_csv)
+    print(f"Merging Gold labels (weight 1.0) and pseudo-labels (weight 0.5) -> {final_labels_csv}...")
+    labels_df = build_labels(data_root, extra_csv=pseudo_csv, extra_weight=0.5, out_csv=final_labels_csv)
     n_gold = (labels_df["source"] == "gold").sum()
     n_extra = (labels_df["source"] == "extra").sum()
     print(f"[SUCCESS] Labels assembled: {len(labels_df)} total ({n_gold} Gold immutable, {n_extra} Extra pseudo-labels)")
@@ -504,7 +517,7 @@ def main():
     )
 
     # Phase 2: Dataset Merge & Cache Build
-    labels_csv, cache_prefix, folds_csv = run_preparation(data_root, work_dir, pseudo_csv)
+    labels_csv, cache_prefix, folds_csv = run_preparation(data_root, work_dir, pseudo_csv, force=args.force_nlp)
 
     # Check if cache is built (if download is in progress, cache_prefix is None)
     if cache_prefix is None or not os.path.exists(f"{cache_prefix}.meta.json"):

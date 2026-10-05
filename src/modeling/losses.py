@@ -85,9 +85,11 @@ class AsymmetricLoss(nn.Module):
 
         # Asymmetric focusing — down-weight easy examples per class
         # gamma_neg: scalar or [C] tensor (broadcasts correctly either way)
-        g_neg = (self.gamma_neg_vec
-                 if self.gamma_neg_vec is not None
-                 else logits.new_full((1,), self._gamma_neg_scalar))
+        # SOTA Bugfix: ensure g_neg always matches targets.device and targets.dtype
+        if self.gamma_neg_vec is not None:
+            g_neg = self.gamma_neg_vec.to(device=targets.device, dtype=targets.dtype)
+        else:
+            g_neg = logits.new_full((1,), self._gamma_neg_scalar, device=targets.device, dtype=targets.dtype)
         pt    = xs_pos * targets + xs_neg * (1.0 - targets)   # [B, C]
         gamma = self.gamma_pos * targets + g_neg * (1.0 - targets)  # [B, C]
         loss  = loss * ((1.0 - pt) ** gamma)

@@ -193,12 +193,20 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
         
     if LLM is None:
         raise ImportError("vLLM is not installed. Please install vLLM: pip install vllm")
-    print(f"[INFO] Initializing vLLM Engine for {model_id}...")
     
-    # SOTA Fix: vLLM does NOT support Tensor Parallelism with bitsandbytes quantization!
-    # Running tensor_parallel_size > 1 with bitsandbytes raises ValueError immediately.
-    # bitsandbytes INT8 requires ~70GB VRAM, fitting comfortably into a single 80GB/96GB/144GB GPU.
-    # If the user sets VLLM_QUANTIZATION="none" or uses unquantized/FP8, TP can scale to all GPUs.
+    # DGX Spark GB10 Hardware Telemetry
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"[HARDWARE] Detected System: {gpu_name} ({vram_gb:.1f} GB Coherent Unified Memory)")
+    
+    print(f"[INFO] Initializing vLLM Engine for {model_id} on DGX Spark GB10...")
+    
+    # SOTA Fix for DGX Spark GB10 (Single Unit Grace Blackwell, 128GB Unified Memory):
+    # 1. Single unit = tensor_parallel_size=1
+    # 2. bitsandbytes INT8 requires ~70GB, leaving plenty of room on 128GB
+    # 3. Memory utilization defaults to 0.80 (102.4 GB) to ensure 25.6 GB CPU RAM is reserved
+    #    for the ARM Grace CPU, Linux OS kernel, and Kagglehub I/O buffers without triggering OOM killer.
     use_quant = os.environ.get("VLLM_QUANTIZATION", "bitsandbytes")
     if use_quant.lower() in ["bitsandbytes", "bnb"]:
         tp_size = 1
@@ -206,15 +214,26 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
             "quantization": "bitsandbytes",
             "load_format": "bitsandbytes",
         }
-    else:
-        tp_size = max(1, torch.cuda.device_count())
+    elif use_quant.lower() in ["none", "null", "false", "fp16", "bf16"]:
+        tp_size = 1
         llm_kwargs = {}
+    elif use_quant.lower() in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
+        tp_size = 1
+        llm_kwargs = {
+            "quantization": "fp8",
+        }
+    else:
+        tp_size = 1
+        llm_kwargs = {
+            "quantization": use_quant,
+        }
     
-    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.85"))
+    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
+    enforce_eager_flag = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
     
     llm = LLM(
         model=model_id,
-        enforce_eager=False,
+        enforce_eager=enforce_eager_flag,
         max_model_len=4096,
         tensor_parallel_size=tp_size,
         gpu_memory_utilization=gpu_util,

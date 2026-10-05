@@ -131,6 +131,16 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     gold_mask = train_df[TARGETS].notna().any(axis=1)
     to_extract = train_df[~gold_mask & train_df['Report'].notna()].copy()
     
+    # SOTA Fix: Seamlessly resume from previous crashes by filtering out already processed UIDs
+    existing_results = []
+    if os.path.exists(out_csv):
+        import pandas as pd
+        existing_df = pd.read_csv(out_csv)
+        existing_results = existing_df.to_dict('records')
+        processed_uids = set(existing_df['StudyInstanceUID'])
+        to_extract = to_extract[~to_extract['StudyInstanceUID'].isin(processed_uids)]
+        print(f"[INFO] Resuming... Found {len(processed_uids)} already extracted reports.")
+    
     if len(to_extract) == 0:
         print("[INFO] No reports left to extract. Exiting.")
         return
@@ -148,34 +158,39 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
         enforce_eager=False,
         max_model_len=4096,
         tensor_parallel_size=tensor_parallel,
-        gpu_memory_utilization=0.9 # Dedicate 90% of available VRAM to KV cache for massive batching
+        # SOTA Fix: Lower GPU utilization to 0.85 to prevent instant CUDA OOM if background processes exist
+        gpu_memory_utilization=0.85 
     )
     
-    # Deterministic generation
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=1024)
+    # SOTA Fix: Increase max_tokens to 2048 to support the verbose Chain of Thought reasoning without truncating JSON
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
     
     print(f"[INFO] Processing {len(to_extract)} reports in massive parallel batches...")
     start_time = time.time()
     
-    # Format prompts as messages
-    messages_list = [[{"role": "user", "content": build_prompt(row['Report'])}] for _, row in to_extract.iterrows()]
-    uids = to_extract['StudyInstanceUID'].tolist()
+    results = existing_results
+    CHUNK_SIZE = 500
     
-    # SOTA Fix: Directly use llm.chat to prevent the double-BOS token generation bug caused by manual apply_chat_template
-    # This also massively speeds up initialization by skipping the local HuggingFace tokenizer initialization.
-    outputs = llm.chat(messages_list, sampling_params, use_tqdm=True)
-    
-    results = []
-    for output, uid in zip(outputs, uids):
-        res = parse_json_response(output.outputs[0].text, uid)
-        if res:
-            results.append(res)
-            
-    df_out = pd.DataFrame(results)
-    
-    # SOTA Fix: Ensure output directory exists before saving to prevent FileNotFoundError crash after 1-hour run
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    df_out.to_csv(out_csv, index=False)
+    # SOTA Fix: Chunk the processing. vLLM is synchronous; if we pass all 4349 items, a crash at item 4000 
+    # loses everything. Chunking allows us to safely checkpoint the CSV every 500 reports.
+    for i in range(0, len(to_extract), CHUNK_SIZE):
+        chunk_df = to_extract.iloc[i:i+CHUNK_SIZE]
+        messages_chunk = [[{"role": "user", "content": build_prompt(row['Report'])}] for _, row in chunk_df.iterrows()]
+        uids_chunk = chunk_df['StudyInstanceUID'].tolist()
+        
+        print(f"\n[INFO] Processing chunk {i//CHUNK_SIZE + 1} / {(len(to_extract)//CHUNK_SIZE) + 1}...")
+        outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
+        
+        for output, uid in zip(outputs, uids_chunk):
+            res = parse_json_response(output.outputs[0].text, uid)
+            if res:
+                results.append(res)
+                
+        # Checkpoint to disk
+        df_out = pd.DataFrame(results)
+        os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+        df_out.to_csv(out_csv, index=False)
+        print(f"[INFO] Checkpoint saved. Total extracted: {len(results)}")
     
     print(f"[SUCCESS] Processed {len(results)} reports in {time.time() - start_time:.2f} seconds.")
     print(f"[SUCCESS] Saved to {out_csv}. You can now upload this to Kaggle.")

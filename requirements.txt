@@ -1,34 +1,23 @@
-# ==============================================================================
-# RSNA KNEE 3D VISION PIPELINE - ENVIRONMENT REQUIREMENTS
-# ==============================================================================
-
-# 1. Core Deep Learning Stack
-torch>=2.4.0
-torchvision
-torchaudio
-
-# 2. DINOv2 / ConvNeXt Model Support
-transformers
-accelerate
-timm
-
-# 3. DGX Offline NLP Extraction (Nemotron-70B / vLLM)
-vllm
-bitsandbytes
-flash-attn
-
-# 4. Ultra-Fast C++ Data Ingestion & Memory Mapping
-dicomsdl
-opencv-python-headless
-numpy
-pandas
-scipy
-scikit-learn
-
-# 5. Orchestration & Caching
-kagglehub
-python-dotenv
-tqdm
-
-pydicom
+# ==============================================================================
+# RSNA KNEE 3D VISION PIPELINE - ENVIRONMENT REQUIREMENTS
+# ==============================================================================
+# 1. Core Deep Learning Stack
+# 2. DINOv2 / ConvNeXt Model Support
+transformers
+accelerate
+timm
+# 3. DGX Offline NLP Extraction (Nemotron-70B / vLLM)
+bitsandbytes
+# 4. Ultra-Fast C++ Data Ingestion & Memory Mapping
+dicomsdl
+opencv-python-headless
+numpy
+pandas
+scipy
+scikit-learn
+# 5. Orchestration & Caching
+kagglehub
+python-dotenv
+tqdm
+pydicom
 tenacity

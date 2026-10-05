@@ -41,14 +41,16 @@ TARGETS:
 - Contusion (Bone bruise/contusion)
 - Fracture (Bone fracture)
 
-RULES:
+CLINICAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
 1. Output MUST be valid JSON matching the exact output schema.
-2. "reasoning": Think step-by-step. Explain your finding based on the quote.
+2. "reasoning": Think step-by-step. Analyze findings and quote carefully before determining state.
 3. "exact_quote": You MUST literally copy/paste the exact sentence from the report that proves the condition. If the condition is not mentioned at all, write "None".
 4. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
 5. "present": Ligaments/Menisci = explicitly torn/injured. OA/Effusion/Synovitis/Bakers/Contusion/Fracture = explicitly present/seen.
-6. "absent" = explicitly normal/intact.
-7. "not_stated" = omitted, hedged (e.g. "suspected"), or "None" quote.
+6. "absent": Explicitly normal, intact, or unremarkable. Intact surgical graft without recurrent tear = "absent".
+7. "not_stated": Omitted, hedged (e.g. "cannot exclude", "suspected", "questionable", "possible", "borderline"), or "None" quote.
+8. CRITICAL - CROSS-TALK PREVENTION: PCL (Posterior Cruciate) and LCL (Lateral Collateral) are NOT targets! Never assign PCL findings to ACL, nor LCL findings to MCL.
+9. CRITICAL - CONSISTENCY: If exact_quote is "None", state MUST be "not_stated". Never mark "present" with "None" quote.
 
 REPORT:
 {report}
@@ -70,8 +72,11 @@ OUTPUT SCHEMA:
 }}
 """
 
-def parse_json_response(raw_text: str, uid: str) -> dict:
-    """Safely extracts JSON from the LLM output and formats it for labels.py"""
+def clean_txt(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', str(s).lower())
+
+def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> dict:
+    """Safely extracts JSON from the LLM output with a Dual-Layer Clinical Hallucination Shield."""
     if not raw_text or not isinstance(raw_text, str):
         print(f"[ERROR] Empty raw_text for {uid}")
         return None
@@ -121,9 +126,8 @@ def parse_json_response(raw_text: str, uid: str) -> dict:
             
         for t in TARGETS:
             val = normalized_data.get(t, {})
-            # SOTA Fix: Robust semantic parsing of 'state'
-            # Handles booleans, integers, and qualified strings like 'present (mild)', 'absent (normal)'
             raw_state = val.get("state") if isinstance(val, dict) else None
+            exact_quote = str(val.get("exact_quote", "")).strip() if isinstance(val, dict) else ""
             
             is_present = False
             is_absent = False
@@ -142,6 +146,38 @@ def parse_json_response(raw_text: str, uid: str) -> dict:
                 elif any(x in s_low for x in ["present", "torn", "tear", "fracture", "positive"]):
                     is_present = True
             
+            # =========================================================================
+            # DUAL-LAYER CLINICAL HALLUCINATION SHIELD
+            # =========================================================================
+            q_low = exact_quote.lower().strip()
+            if is_present:
+                # Shield 1: Discard ungrounded "present" with empty or "None" quote
+                if q_low in ["none", "null", "n/a", "", "not mentioned", "not stated", "none."]:
+                    is_present = False
+                    
+                # Shield 2: Invert contradictory quotes describing a normal/intact structure
+                elif any(x in q_low for x in ["intact", "normal", "unremarkable", "no tear", "no fracture", "without tear", "no acute tear"]):
+                    is_present = False
+                    is_absent = True
+                    
+                # Shield 3: Demote hedged / uncertain phrases to not_stated
+                elif any(x in q_low for x in ["cannot exclude", "cannot rule out", "suspected", "questionable", "possible tear", "differential"]):
+                    is_present = False
+                    
+                # Shield 4: Grounding verification against original report
+                elif original_report:
+                    clean_q = clean_txt(exact_quote)
+                    clean_rep = clean_txt(original_report)
+                    if len(clean_q) > 10 and clean_q not in clean_rep:
+                        # Check word overlap if direct character substring fails
+                        q_words = set(re.findall(r'\b[a-z]{4,}\b', q_low))
+                        rep_words = set(re.findall(r'\b[a-z]{4,}\b', original_report.lower()))
+                        overlap = len(q_words & rep_words) / max(1, len(q_words))
+                        if overlap < 0.5:
+                            # Fabricated quote hallucination
+                            is_present = False
+            
+            # Map verified findings to labels & confidence weights
             if is_present:
                 out[t], out[f"{t}_weight"] = 1.0, 0.5
             elif is_absent:
@@ -251,15 +287,16 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     
     for i in range(0, len(to_extract), CHUNK_SIZE):
         chunk_df = to_extract.iloc[i:i+CHUNK_SIZE]
-        messages_chunk = [[{"role": "user", "content": build_prompt(str(row['Report'])[:12000])}] for _, row in chunk_df.iterrows()]
+        raw_reports = [str(r)[:12000] for r in chunk_df['Report']]
+        messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
         uids_chunk = chunk_df['StudyInstanceUID'].tolist()
         
         print(f"\n[INFO] Processing chunk {i//CHUNK_SIZE + 1} / {((len(to_extract)-1)//CHUNK_SIZE) + 1} ({len(chunk_df)} reports)...")
         outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
         
-        for output, uid in zip(outputs, uids_chunk):
+        for output, uid, report_str in zip(outputs, uids_chunk, raw_reports):
             text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
-            res = parse_json_response(text, uid)
+            res = parse_json_response(text, uid, original_report=report_str)
             if res:
                 results.append(res)
                 

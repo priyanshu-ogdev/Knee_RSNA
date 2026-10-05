@@ -456,3 +456,16 @@ def build_convnext_model(
 
 
 
+
+
+def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") -> nn.Module:
+    """Load a trained model checkpoint (fold*_ema.pt, fold*_best.pt, or fold*_swa.pt).
+    Reconstructs the model architecture with the exact saved configuration and loads weights.
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    variant = ckpt.get("variant", "dinov2-base")
+    use_cross_slot = ckpt.get("use_cross_slot", True)
+    model = build_model(variant=variant, use_cross_slot=use_cross_slot).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    return model

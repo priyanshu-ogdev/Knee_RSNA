@@ -23,6 +23,7 @@ import torch
 import src.core.config as config
 
 from src.modeling.ensemble import rank_ensemble_n
+from src.modeling.model import load_checkpoint
 from src.data.preprocess import index as pix
 from src.data.preprocess import slots as pslots
 from src.data.preprocess import pipeline, cache as pcache, loader
@@ -93,9 +94,16 @@ def predict_chunk_tta(
             with ThreadPoolExecutor(max_workers=len(rows)) as ex:
                 smp = list(ex.map(_make, rows))
 
-            imgs = torch.from_numpy(np.stack([s[0] for s in smp])).to(device, non_blocking=True)
-            slot = torch.from_numpy(np.stack([s[1] for s in smp])).float().to(device, non_blocking=True)
-            wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float().to(device, non_blocking=True)
+            imgs = torch.from_numpy(np.stack([s[0] for s in smp]))
+            slot = torch.from_numpy(np.stack([s[1] for s in smp])).float()
+            wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float()
+            if device.type == "cuda":
+                imgs = imgs.pin_memory()
+                slot = slot.pin_memory()
+                wm = wm.pin_memory()
+            imgs = imgs.to(device, non_blocking=True)
+            slot = slot.to(device, non_blocking=True)
+            wm   = wm.to(device, non_blocking=True)
 
             ps = []
             for m, t_val in zip(models, T):
@@ -142,9 +150,16 @@ def predict_chunk(
         with ThreadPoolExecutor(max_workers=len(rows)) as ex:
             smp = list(ex.map(lambda i: loader.make_sample(cache, i, cfg, train=False, n_use=n_use), rows))
 
-        imgs = torch.from_numpy(np.stack([s[0] for s in smp])).to(device, non_blocking=True)
-        slot = torch.from_numpy(np.stack([s[1] for s in smp])).float().to(device, non_blocking=True)
-        wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float().to(device, non_blocking=True)
+        imgs = torch.from_numpy(np.stack([s[0] for s in smp]))
+        slot = torch.from_numpy(np.stack([s[1] for s in smp])).float()
+        wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float()
+        if device.type == "cuda":
+            imgs = imgs.pin_memory()
+            slot = slot.pin_memory()
+            wm = wm.pin_memory()
+        imgs = imgs.to(device, non_blocking=True)
+        slot = slot.to(device, non_blocking=True)
+        wm   = wm.to(device, non_blocking=True)
 
         ps = []
         for m, t_val in zip(models, T):
@@ -183,6 +198,8 @@ def run_inference(
     """Build the cache and run predictions in a pipelined fashion."""
     cfg = cfg or config.get_cfg("v2")
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Auto-load checkpoint files if paths were passed instead of module instances
+    models = [load_checkpoint(m, device) if isinstance(m, str) else m for m in models]
 
     ann, tab, sides, records = prepare_test_tables(root, cfg, workers)
     studies = list(tab.index)

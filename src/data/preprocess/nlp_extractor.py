@@ -154,19 +154,13 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     print(f"[INFO] Processing {len(to_extract)} reports in massive parallel batches...")
     start_time = time.time()
     
-    # SOTA Fix: Apply the exact Chat Template required by the Instruct model
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    
     # Format prompts as messages
     messages_list = [[{"role": "user", "content": build_prompt(row['Report'])}] for _, row in to_extract.iterrows()]
-    
-    # Apply chat template
-    prompts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages_list]
     uids = to_extract['StudyInstanceUID'].tolist()
     
-    # vLLM handles the mass parallelization internally. It will chew through 4349 prompts optimally.
-    outputs = llm.generate(prompts, sampling_params)
+    # SOTA Fix: Directly use llm.chat to prevent the double-BOS token generation bug caused by manual apply_chat_template
+    # This also massively speeds up initialization by skipping the local HuggingFace tokenizer initialization.
+    outputs = llm.chat(messages_list, sampling_params, use_tqdm=True)
     
     results = []
     for output, uid in zip(outputs, uids):

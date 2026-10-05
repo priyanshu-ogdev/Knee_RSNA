@@ -97,7 +97,12 @@ def annotate(df, fs_priority='hdr', csv_fallback=True):
     df['fluid'] = fluid.astype(bool)
 
     acq = df['MRAcquisitionType'].fillna('').astype(str).str.upper() if 'MRAcquisitionType' in df.columns else ''
-    ns = pd.to_numeric(df['n_slices'] if 'n_slices' in df.columns else df['n_files'], errors='coerce').fillna(0)
+    if 'n_slices' in df.columns:
+        ns = pd.to_numeric(df['n_slices'], errors='coerce').fillna(0)
+    elif 'n_files' in df.columns:
+        ns = pd.to_numeric(df['n_files'], errors='coerce').fillna(0)
+    else:
+        ns = pd.Series(0, index=df.index)
     th = pd.to_numeric(df.get('SliceThickness', np.nan), errors='coerce')
     df['is3d'] = (acq == '3D') | ((ns > 120) & (th < 1.5))
     return df
@@ -152,8 +157,14 @@ def assign_all(index_df, prefer_2d=True, fs_priority='hdr', csv_fallback=True):
     df = index_df.copy()
     df['plane'] = plane_of(df)
     df = annotate(df, fs_priority, csv_fallback)
-    ns = pd.to_numeric(df['n_slices'] if 'n_slices' in df.columns else df['n_files'], errors='coerce').fillna(0)
-    usable = df['plane'].isin(['Sagittal', 'Coronal', 'Axial']) & (ns > 0)
+    has_count = ('n_slices' in df.columns) or ('n_files' in df.columns)
+    if 'n_slices' in df.columns:
+        ns = pd.to_numeric(df['n_slices'], errors='coerce').fillna(0)
+    elif 'n_files' in df.columns:
+        ns = pd.to_numeric(df['n_files'], errors='coerce').fillna(0)
+    else:
+        ns = pd.Series(1, index=df.index)
+    usable = df['plane'].isin(['Sagittal', 'Coronal', 'Axial']) & ((ns > 0) if has_count else True)
     work = df.assign(_n=ns, _k=(df['is3d'].astype(int) if prefer_2d else 0))[usable]
     work = work.sort_values(['StudyInstanceUID', '_k', '_n', 'SeriesInstanceUID'], ascending=[True, True, False, True])
     studies = pd.Index(df['StudyInstanceUID'].unique(), name='StudyInstanceUID')

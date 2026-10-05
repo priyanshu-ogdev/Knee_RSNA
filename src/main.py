@@ -142,10 +142,14 @@ def main():
     print("=" * 80)
     print("PHASE 0: DATASET DOWNLOAD")
     print("=" * 80)
-    print("Checking/Downloading RSNA dataset via Kagglehub...")
-    # Kagglehub automatically skips downloading if the dataset is already cached locally.
-    DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
-    print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
+    local_data = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
+    if os.path.exists(os.path.join(local_data, 'train.csv')):
+        DATA_ROOT = local_data
+        print(f"[SUCCESS] Dataset already present locally at: {DATA_ROOT}")
+    else:
+        print("Checking/Downloading RSNA dataset via Kagglehub...")
+        DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
+        print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
     WORK_DIR = os.environ.get('RSNA_OUT_DIR', os.path.join(PROJECT_ROOT, 'pipeline_out'))
     
     os.makedirs(WORK_DIR, exist_ok=True)

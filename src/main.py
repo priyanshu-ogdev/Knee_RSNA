@@ -53,9 +53,10 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     # Merge gold + pseudo labels
     final_labels_csv = os.path.join(work_dir, "train_labels_v2.csv")
     print("Merging gold and pseudo labels...")
-    if not os.path.exists(pseudo_csv):
-        raise FileNotFoundError(f"[FATAL] Pseudo-labels not found at {pseudo_csv}. You MUST run nlp_extractor.py first!")
-    build_labels(data_root, extra_csv=pseudo_csv, extra_weight=1.0, out_csv=final_labels_csv)
+    extra_csv = pseudo_csv if (pseudo_csv and os.path.exists(pseudo_csv)) else None
+    if extra_csv is None:
+        print("[INFO] No pseudo-labels found. Building training labels from Gold standard labels only.")
+    build_labels(data_root, extra_csv=extra_csv, extra_weight=1.0, out_csv=final_labels_csv)
     
     # Build cache
     print("Building Index...")

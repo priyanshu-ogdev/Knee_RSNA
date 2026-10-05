@@ -49,10 +49,16 @@ def group_folds(study_meta, n_splits=5, seed=2026, min_group=10, dup_pairs=None,
         sm['fold'] = fold
         return sm[['StudyInstanceUID', 'group', 'fold'] + [c for c in ('lang', 'model', 'vendor', 'gold') if c in sm.columns]]
     if scheme == 'group':
-        from sklearn.model_selection import StratifiedGroupKFold
-        y = sm['vendor'].fillna('?').astype('category').cat.codes.values
-        for k, (_, va) in enumerate(StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed).split(sm, y, sm['group'])):
-            fold[va] = k
+        if sm['group'].nunique() < n_splits:
+            from sklearn.model_selection import KFold
+            kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+            for k, (_, va) in enumerate(kf.split(sm)):
+                fold[va] = k
+        else:
+            from sklearn.model_selection import StratifiedGroupKFold
+            y = sm['vendor'].fillna('?').astype('category').cat.codes.values
+            for k, (_, va) in enumerate(StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed).split(sm, y, sm['group'])):
+                fold[va] = k
     elif scheme == 'site':
         from sklearn.model_selection import StratifiedKFold
         uid = sm['StudyInstanceUID'].values
@@ -62,6 +68,11 @@ def group_folds(study_meta, n_splits=5, seed=2026, min_group=10, dup_pairs=None,
         unit = np.array([partner.get(u, u) for u in uid])
         first = ~pd.Series(unit).duplicated().values                 # one representative row per unit
         rep = sm[first].reset_index(drop=True)
+        counts = rep['group'].value_counts()
+        too_small = counts[counts < n_splits].index
+        if len(too_small) > 0 and len(counts) > 0:
+            majority_grp = counts.index[0]
+            rep['group'] = rep['group'].replace({g: majority_grp for g in too_small})
         y = rep['group'].astype('category').cat.codes.values
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
         ufold = {}
@@ -82,11 +93,11 @@ def make_study_meta(index_df, train_csv=None, labels_df=None):
     df = index_df[index_df['split'] == 'train'] if 'split' in index_df.columns else index_df
     mode = lambda s: s.dropna().mode().iloc[0] if s.notna().any() else np.nan
     g = df.groupby('StudyInstanceUID')
-    sm = pd.DataFrame({
-        'vendor': g['Manufacturer'].agg(lambda s: mode(s.map(vendor_of))) if 'Manufacturer' in df else '?',
-        'model': g['ManufacturerModelName'].agg(mode) if 'ManufacturerModelName' in df else '?',
-        'poor': g['RepetitionTime'].agg(lambda s: s.isna().all()) if 'RepetitionTime' in df else False,
-    }).reset_index()
+    studies = pd.Index(df['StudyInstanceUID'].unique(), name='StudyInstanceUID')
+    vendor = g['Manufacturer'].agg(lambda s: mode(s.map(vendor_of))) if 'Manufacturer' in df else pd.Series('?', index=studies)
+    model = g['ManufacturerModelName'].agg(mode) if 'ManufacturerModelName' in df else pd.Series('?', index=studies)
+    poor = g['RepetitionTime'].agg(lambda s: s.isna().all()) if 'RepetitionTime' in df else pd.Series(False, index=studies)
+    sm = pd.DataFrame({'vendor': vendor, 'model': model, 'poor': poor}, index=studies).reset_index()
     sm['lang'] = '?'
     if train_csv is not None and 'Report' in train_csv.columns:
         lang = train_csv.set_index('StudyInstanceUID')['Report'].map(guess_lang)

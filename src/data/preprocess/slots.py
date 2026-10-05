@@ -127,7 +127,13 @@ def assign_slots(g, prefer_2d=True, slots=None):
     """
     slots = slots or config.SLOTS
     chosen, alts, used = {}, {}, set()
-    gg = g.assign(_n=pd.to_numeric(g['n_slices'], errors='coerce').fillna(0))
+    if 'n_slices' in g.columns:
+        ns = pd.to_numeric(g['n_slices'], errors='coerce').fillna(0)
+    elif 'n_files' in g.columns:
+        ns = pd.to_numeric(g['n_files'], errors='coerce').fillna(0)
+    else:
+        ns = pd.Series(0, index=g.index)
+    gg = g.assign(_n=ns)
     for name, plane, fluid, fs in slots:
         sel = (gg['plane'] == plane) & (gg['fatsat'] == fs)
         if fluid is not None:

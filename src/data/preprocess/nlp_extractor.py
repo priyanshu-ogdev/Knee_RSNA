@@ -491,8 +491,12 @@ if __name__ == "__main__":
     if 'HF_HOME' not in os.environ:
         os.environ['HF_HOME'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'hf_cache'))
     
+    knee_env = os.environ.get('KNEE_DATA')
     local_data = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
-    if os.path.exists(os.path.join(local_data, 'train.csv')):
+    if knee_env and os.path.exists(os.path.join(knee_env, 'train.csv')):
+        DATA_ROOT = os.path.abspath(knee_env)
+        print(f"[SUCCESS] Dataset located via KNEE_DATA at: {DATA_ROOT}")
+    elif os.path.exists(os.path.join(local_data, 'train.csv')):
         DATA_ROOT = local_data
         print(f"[SUCCESS] Dataset already present locally at: {DATA_ROOT}")
     else:

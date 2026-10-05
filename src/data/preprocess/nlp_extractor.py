@@ -24,33 +24,34 @@ TARGETS = [
 ]
 
 def build_prompt(report: str) -> str:
-    return f"""You are an expert MSK radiologist. Extract the presence of 12 knee abnormalities from the following MRI radiology report. 
-The report may be in any language (English, Spanish, Dutch, German, etc.). Translate mentally if needed.
+    return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist. 
+Accurately extract the presence of the following 12 knee conditions from this MRI radiology report.
 
-TARGETS:
-- ACL (Anterior Cruciate Ligament tear/injury)
-- MCL (Medial Collateral Ligament tear/injury)
-- Medial Meniscus (tear/injury)
-- Lateral Meniscus (tear/injury)
-- Medial OA (Medial compartment Osteoarthritis / cartilage loss)
-- Lateral OA (Lateral compartment Osteoarthritis / cartilage loss)
-- PF OA (Patellofemoral Osteoarthritis / cartilage loss)
-- Effusion (Joint fluid)
-- Synovitis (Synovial thickening/inflammation)
-- Baker's (Baker's cyst / Popliteal cyst)
-- Contusion (Bone bruise/contusion)
-- Fracture (Bone fracture)
+TARGETS & CLINICAL DEFINITIONS:
+1. ACL: Anterior Cruciate Ligament tear (complete, partial, high-grade, low-grade, or chronic tear). Intact ACL graft/reconstruction = absent. (CAUTION: Do NOT confuse with PCL / Posterior Cruciate).
+2. MCL: Medial Collateral Ligament tear or sprain (grade 1, 2, or 3). (CAUTION: Do NOT confuse with LCL / Lateral Collateral).
+3. Medial Meniscus: Medial meniscus tear (MM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, complex, or degenerative tear).
+4. Lateral Meniscus: Lateral meniscus tear (LM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, or complex tear).
+5. Medial OA: Medial compartment osteoarthritis, cartilage loss, chondral thinning/defect, subchondral sclerosis/osteophytes of medial femoral condyle (MFC) or medial tibial plateau (MTP).
+6. Lateral OA: Lateral compartment osteoarthritis, cartilage loss, chondral thinning/defect, subchondral sclerosis/osteophytes of lateral femoral condyle (LFC) or lateral tibial plateau (LTP).
+7. PF OA: Patellofemoral osteoarthritis, chondromalacia patellae (CMP), patellar or trochlear cartilage defect / fissure / loss / thinning, patellofemoral joint space narrowing.
+8. Effusion: Joint effusion, suprapatellar effusion, intra-articular fluid distension (mild, moderate, or large).
+9. Synovitis: Synovial thickening, synovitis, synovial proliferation, hypervascular pannus, synovial enhancement.
+10. Baker's: Baker's cyst, popliteal cyst, gastrocnemius-semimembranosus bursal distension.
+11. Contusion: Bone bruise, bone contusion, trabecular microfracture, bone marrow edema / signal abnormality following trauma.
+12. Fracture: Cortical bone fracture, subchondral fracture, avulsion fracture, tibial plateau / femoral / patellar / fibular fracture.
 
 CLINICAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
 1. Output MUST be valid JSON matching the exact output schema.
-2. "reasoning": Think step-by-step. Analyze findings and quote carefully before determining state.
-3. "exact_quote": You MUST literally copy/paste the exact sentence from the report that proves the condition. If the condition is not mentioned at all, write "None".
+2. "reasoning": Think step-by-step. Analyze findings, compartments, and quotes carefully before determining state.
+3. "exact_quote": Copy/paste the EXACT verbatim sentence from the report in its ORIGINAL language (do NOT translate the quote). If the condition is not mentioned at all, write "None".
 4. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
-5. "present": Ligaments/Menisci = explicitly torn/injured. OA/Effusion/Synovitis/Bakers/Contusion/Fracture = explicitly present/seen.
-6. "absent": Explicitly normal, intact, or unremarkable. Intact surgical graft without recurrent tear = "absent".
-7. "not_stated": Omitted, hedged (e.g. "cannot exclude", "suspected", "questionable", "possible", "borderline"), or "None" quote.
-8. CRITICAL - CROSS-TALK PREVENTION: PCL (Posterior Cruciate) and LCL (Lateral Collateral) are NOT targets! Never assign PCL findings to ACL, nor LCL findings to MCL.
-9. CRITICAL - CONSISTENCY: If exact_quote is "None", state MUST be "not_stated". Never mark "present" with "None" quote.
+5. "present": Finding is explicitly present, torn, injured, seen, or described as abnormal.
+6. "absent": Finding is explicitly normal, intact, unremarkable, or without abnormality. Intact surgical graft = "absent".
+7. "not_stated": Omitted, hedged (e.g. "cannot exclude", "cannot rule out", "suspected", "questionable", "possible", "borderline", "differential"), or "None" quote.
+8. MULTI-LINGUAL: The report may be in any language (English, German, Spanish, Dutch, French, etc.). Translate mentally to extract findings accurately (e.g., German: Kreuzband=ACL, Innenmeniskus=Medial Meniscus, Knorpeldefekt/Gonarthrose=OA, Erguss=Effusion, Knochenoedem=Contusion; Spanish: LCA=ACL, derrame=effusion, etc.).
+9. CROSS-TALK PREVENTION: PCL (Posterior Cruciate) and LCL (Lateral Collateral) are NOT targets! Never assign PCL findings to ACL, nor LCL findings to MCL.
+10. CONSISTENCY: If exact_quote is "None", state MUST be "not_stated". Never mark "present" with "None" quote.
 
 REPORT:
 {report}
@@ -173,7 +174,11 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                         q_words = set(re.findall(r'\b[a-z]{4,}\b', q_low))
                         rep_words = set(re.findall(r'\b[a-z]{4,}\b', original_report.lower()))
                         overlap = len(q_words & rep_words) / max(1, len(q_words))
-                        if overlap < 0.5:
+                        
+                        # Only reject on word overlap if report is English (avoids penalizing mental translations of foreign reports)
+                        common_en = {"the", "and", "with", "knee", "tear", "intact", "effusion", "ligament", "meniscus", "fluid"}
+                        is_english_report = len(common_en & rep_words) >= 2
+                        if is_english_report and overlap < 0.3:
                             # Fabricated quote hallucination
                             is_present = False
             
@@ -206,8 +211,13 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     train_df['StudyInstanceUID'] = train_df['StudyInstanceUID'].astype(str).str.strip()
     gold_mask = train_df[TARGETS].notna().any(axis=1)
     
+    # Case-insensitive report column resolution
+    report_col = 'Report' if 'Report' in train_df.columns else ('report' if 'report' in train_df.columns else None)
+    if report_col is None:
+        raise KeyError("Could not find 'Report' or 'report' column in train.csv")
+    
     # Filter reports that exist and are not empty
-    to_extract = train_df[~gold_mask & train_df['Report'].notna() & (train_df['Report'].astype(str).str.strip() != '')].copy()
+    to_extract = train_df[~gold_mask & train_df[report_col].notna() & (train_df[report_col].astype(str).str.strip() != '')].copy()
     
     # SOTA Fix: Seamlessly resume from previous crashes by filtering out already processed UIDs
     existing_results = []
@@ -287,7 +297,7 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
     
     for i in range(0, len(to_extract), CHUNK_SIZE):
         chunk_df = to_extract.iloc[i:i+CHUNK_SIZE]
-        raw_reports = [str(r)[:12000] for r in chunk_df['Report']]
+        raw_reports = [str(r)[:12000] for r in chunk_df[report_col]]
         messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
         uids_chunk = chunk_df['StudyInstanceUID'].tolist()
         

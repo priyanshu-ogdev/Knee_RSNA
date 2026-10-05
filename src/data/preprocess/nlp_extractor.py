@@ -43,27 +43,30 @@ TARGETS:
 
 RULES:
 1. Output MUST be valid JSON matching the exact output schema.
-2. "exact_quote": You MUST literally copy/paste the exact sentence from the report that proves the condition. If the condition is not mentioned at all, write "None".
-3. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
-4. "present" = explicitly torn/injured. "absent" = explicitly normal. "not_stated" = omitted or "None" quote.
+2. "reasoning": Think step-by-step. Explain your finding based on the quote.
+3. "exact_quote": You MUST literally copy/paste the exact sentence from the report that proves the condition. If the condition is not mentioned at all, write "None".
+4. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
+5. "present": Ligaments/Menisci = explicitly torn/injured. OA/Effusion/Synovitis/Bakers/Contusion/Fracture = explicitly present/seen.
+6. "absent" = explicitly normal/intact.
+7. "not_stated" = omitted, hedged (e.g. "suspected"), or "None" quote.
 
 REPORT:
 {report}
 
 OUTPUT SCHEMA:
 {{
-  "ACL": {{"exact_quote": "...", "state": "..."}},
-  "MCL": {{"exact_quote": "...", "state": "..."}},
-  "Medial Meniscus": {{"exact_quote": "...", "state": "..."}},
-  "Lateral Meniscus": {{"exact_quote": "...", "state": "..."}},
-  "Medial OA": {{"exact_quote": "...", "state": "..."}},
-  "Lateral OA": {{"exact_quote": "...", "state": "..."}},
-  "PF OA": {{"exact_quote": "...", "state": "..."}},
-  "Effusion": {{"exact_quote": "...", "state": "..."}},
-  "Synovitis": {{"exact_quote": "...", "state": "..."}},
-  "Baker's": {{"exact_quote": "...", "state": "..."}},
-  "Contusion": {{"exact_quote": "...", "state": "..."}},
-  "Fracture": {{"exact_quote": "...", "state": "..."}}
+  "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
+  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "..."}}
 }}
 """
 

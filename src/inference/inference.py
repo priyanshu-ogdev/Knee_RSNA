@@ -29,7 +29,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import src.core.config as config
 
-from src.modeling.ensemble import rank_ensemble_n
 from src.modeling.model import load_checkpoint
 from src.data.preprocess import index as pix
 from src.data.preprocess import slots as pslots

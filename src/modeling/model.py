@@ -383,88 +383,12 @@ def build_model(
     return Model(bb, dim, use_cross_slot=use_cross_slot)
 
 
-# ─────────────────────────────────────── Third-arm ConvNeXt factory ──────────
-def build_convnext_model(
-    variant: str = "convnextv2_base",  # timm name; also accepts local dir
-    n_out: int = len(config.TARGETS),
-    img_size: int = config.PRESETS["v2"].img_size,
-    pretrained_cfg_path: str | None = None,
-) -> nn.Module:
-    """Build a ConvNeXt-V2 model for use as the third ensemble arm.
-
-    Source: Woo et al., "ConvNeXt V2: Co-designing and Scaling…", CVPR 2023.
-    FCMAE pretraining captures local texture patterns (fractures, cartilage)
-    that DINOv2 contrastive pretraining may underemphasise.
-
-    For Kaggle offline use: pass variant as the local directory path containing
-    the timm model files.  Weights must be pre-uploaded as a Kaggle dataset.
-
-    This model does NOT use the slot-based forward pass by design — it treats
-    each slot's stacked windows as a batch of independent 2.5D images and
-    aggregates via global average pooling before the final linear head.
-    This maximises architectural diversity vs. the DINOv2 slot-attention system.
-    """
-    try:
-        import timm
-    except ImportError:
-        raise ImportError(
-            "timm is required for build_convnext_model. "
-            "Install with: pip install timm  (or bundle as a Kaggle dataset)."
-        )
-
-    if os.path.isdir(str(variant)):
-        bb = timm.create_model("convnextv2_base", pretrained=False, num_classes=0,
-                               pretrained_cfg_path=pretrained_cfg_path)
-        state = torch.load(os.path.join(variant, "model.safetensors"), map_location="cpu",
-                           weights_only=True)
-        bb.load_state_dict(state, strict=False)
-    else:
-        bb = timm.create_model(variant, pretrained=False, num_classes=0)
-
-    feat_dim = bb.num_features
-    head = nn.Sequential(
-        nn.LayerNorm(feat_dim),
-        nn.Dropout(0.2),
-        nn.Linear(feat_dim, n_out),
-    )
-
-    class ConvNeXtSlotModel(nn.Module):
-        """Thin wrapper: processes each valid window independently, then GAP."""
-
-        def __init__(self):
-            super().__init__()
-            self.backbone = bb
-            self.head = head
-            self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-            self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-        def forward(self, imgs, mask, wmask=None):
-            if imgs.dim() == 5:
-                imgs = imgs.unsqueeze(2)
-            B, S, W = imgs.shape[:3]
-            x = imgs.reshape(B * S * W, *imgs.shape[3:]).float().div_(255.0)
-            x = (x - self.mean) / self.std
-            # Global average pool over all valid (slot, window) pairs
-            feats = self.backbone(x)                    # [B*S*W, feat_dim]
-            feats = feats.view(B, S * W, -1)
-            # Flat validity mask
-            if wmask is None:
-                wmask = torch.ones(B, S, W, device=imgs.device)
-            valid = ((wmask > 0.5) & (mask.unsqueeze(-1) > 0.5)).view(B, S * W)
-            # Masked mean over valid windows
-            feats = feats * valid.unsqueeze(-1).float()
-            denom = valid.float().sum(-1, keepdim=True).clamp_min(1.0)
-            agg = feats.sum(1) / denom                 # [B, feat_dim]
-            return self.head(agg)                       # [B, n_out]
-
-    return ConvNeXtSlotModel()
-
-
-
-
-
-
-
+# -----------------------------------------------------------------------------
+# ARCHITECTURAL NOTE: ConvNeXt was evaluated and REJECTED in negative review.
+# Reason: Naive global average pooling (GAP) over all S*W windows diluted focal
+# tear signal by 36x, causing severe false negatives on ACL and Meniscus.
+# Our primary architecture is 100% pure DINOv2 + CrossSlotTransformer.
+# -----------------------------------------------------------------------------
 
 def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") -> nn.Module:
     """Load a trained model checkpoint (fold*_ema.pt, fold*_best.pt, or fold*_swa.pt).

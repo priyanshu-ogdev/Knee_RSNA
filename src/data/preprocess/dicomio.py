@@ -109,11 +109,13 @@ def decode_raw(path):
     try:
         import dicomsdl
         ds = dicomsdl.open(path)
-        a = ds.pixelData()
+        # SOTA Fix: Must use storedvalue=True to get raw integers, otherwise dicomsdl double-applies slope/icpt!
+        a = ds.pixelData(storedvalue=True)
         
         # Photometric Interpretation check is CRITICAL
         try:
-            photo = ds.info().get('PhotometricInterpretation', '')
+            # SOTA Fix: dicomsdl does not have .info(). Use direct attribute access.
+            photo = getattr(ds, 'PhotometricInterpretation', '')
             if 'MONOCHROME1' in str(photo).upper():
                 a = a.max() - a
         except Exception:

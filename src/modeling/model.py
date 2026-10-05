@@ -341,7 +341,20 @@ def build_model(
         SlotHead.  Set False for ablation comparison with baseline head.
     """
     src = variant if os.path.isdir(variant) else f"facebook/{variant}"
-    bb = AutoModel.from_pretrained(src, drop_path_rate=0.2, attn_implementation="sdpa")  # SOTA FlashAttention-2 speedup  # Extreme regularization to prevent overfitting on pseudo-labels
+    try:
+        bb = AutoModel.from_pretrained(src, drop_path_rate=0.2, attn_implementation="sdpa", local_files_only=os.path.isdir(src))  # SOTA FlashAttention-2 speedup  # Extreme regularization to prevent overfitting on pseudo-labels
+    except Exception:
+        # Offline fallback: if pretrained weights cannot be fetched (e.g. Kaggle offline submission),
+        # instantiate directly from config since full weights will be loaded from checkpoint state_dict
+        from transformers import AutoConfig
+        local_cfg_dir = os.path.join(os.path.dirname(__file__), "configs")
+        if os.path.isdir(src) and os.path.exists(os.path.join(src, "config.json")):
+            cfg_obj = AutoConfig.from_pretrained(src)
+        elif os.path.exists(os.path.join(local_cfg_dir, "config.json")):
+            cfg_obj = AutoConfig.from_pretrained(local_cfg_dir)
+        else:
+            cfg_obj = AutoConfig.from_pretrained(src)
+        bb = AutoModel.from_config(cfg_obj)
     
     # Unified Memory Speedup: Gradient Checkpointing (-70% VRAM)
     bb.config.use_cache = False

@@ -189,12 +189,13 @@ def run_inference(
 
     # Reorder to match test.csv if provided (mandatory for Kaggle submission)
     if test_csv and os.path.exists(test_csv):
-        order = pd.read_csv(test_csv)["StudyInstanceUID"].tolist()
-        studies = [s for s in order if s in set(studies)] + [s for s in studies if s not in set(order)]
+        order = pd.read_csv(test_csv)["StudyInstanceUID"].astype(str).str.strip().tolist()
+        seen = set(order)
+        studies = list(order) + [s for s in tab.index if s not in seen]
 
     cache_dir = cache_dir or ("/kaggle/temp" if os.path.isdir("/kaggle/temp") else tempfile.gettempdir())
     prefix = os.path.join(cache_dir, "test_cache")
-    slot_rows = {s: tab.loc[s].to_dict() for s in studies}
+    slot_rows = {s: tab.loc[s].to_dict() if s in tab.index else {} for s in studies}
 
     state = {"moved": False}
     preds = np.full((len(studies), len(config.TARGETS)), np.nan, np.float32)

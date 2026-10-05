@@ -9,7 +9,6 @@ timm
 # 3. DGX Offline NLP Extraction (Nemotron-70B / vLLM)
 bitsandbytes
 # 4. Ultra-Fast C++ Data Ingestion & Memory Mapping
-dicomsdl
 opencv-python-headless
 numpy
 pandas
@@ -20,4 +19,7 @@ kagglehub
 python-dotenv
 tqdm
 pydicom
-tenacity
+tenacity
+pylibjpeg
+pylibjpeg-libjpeg
+pylibjpeg-openjpeg

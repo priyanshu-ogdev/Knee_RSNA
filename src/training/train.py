@@ -130,6 +130,8 @@ def train_epoch(
     model.train()
     total_loss_tensor = torch.tensor(0.0, device=device)
     n, opt_step = 0, 0
+    # Pre-cache trainable parameters to avoid scanning module tree at every micro-step
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     
     # Pre-allocate rare vector OUTSIDE the loop to prevent VRAM fragmentation
     _rare_mults = [config.RARE_TARGET_WEIGHTS.get(t, 1.0) for t in config.TARGETS]
@@ -174,9 +176,7 @@ def train_epoch(
 
         if (micro_step + 1) % grad_accum == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], 0.5
-            )
+            torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -205,7 +205,7 @@ def evaluate(
     ctx, _ = _autocast(device)
     for imgs, masks, wmasks, targets, weights in dataloader:
         with ctx:
-            p = model(imgs.to(device), masks.to(device), wmasks.to(device))
+            p = model(imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True), wmasks.to(device, non_blocking=True))
         P.append(torch.sigmoid(p.float()).cpu().numpy())
         Y.append(targets.numpy())
         W.append(weights.numpy())
@@ -305,7 +305,7 @@ def run_training(
         drop_last=len(tr) > batch_size, num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=(num_workers > 0),
-        prefetch_factor=(4 if num_workers > 0 else None),
+        prefetch_factor=(2 if num_workers > 0 else None),
     )
     dl_va = None
     if len(va):

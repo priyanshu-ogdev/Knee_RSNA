@@ -185,8 +185,16 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
 
 if __name__ == "__main__":
     import sys
+    import kagglehub
     # Dynamically resolve project root relative to this script
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-    DATA = os.environ.get("KAGGLEHUB_CACHE", os.path.join(PROJECT_ROOT, "data"))
-    OUT = os.path.join(DATA, "pseudo_labels.csv")
-    run_offline_extraction(DATA, OUT)
+    
+    # SOTA Fix: Force Kagglehub cache to root data folder to align with main.py
+    os.environ['KAGGLEHUB_CACHE'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
+    
+    print("Checking/Downloading RSNA dataset via Kagglehub...")
+    DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
+    print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
+    
+    OUT = os.path.join(DATA_ROOT, "pseudo_labels.csv")
+    run_offline_extraction(DATA_ROOT, OUT)

@@ -80,14 +80,16 @@ def predict_chunk_tta(
         out = []
         for lo in range(a, b, batch):
             rows = list(range(lo, min(lo + batch, b)))
-            rng = np.random.default_rng(rng_seed)
 
-            def _make(i, _rng=rng):
+            def _make(i):
+                # ANTI-DEGRADATION FIX: Seed each thread worker deterministically
+                # to prevent shared-RNG race conditions in multi-threaded TTA
+                row_rng = np.random.default_rng(rng_seed + i)
                 return loader.make_sample(
                     cache, i, cfg,
                     train=False,          # always use eval-mode window selection (evenly spaced)
                     n_use=n_use,
-                    rng=_rng,
+                    rng=row_rng,
                     aug=use_aug,          # augmentation applied only for TTA passes 1+
                 )
 

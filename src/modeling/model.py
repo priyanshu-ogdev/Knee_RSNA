@@ -262,7 +262,6 @@ class Model(nn.Module):
         # Avoids wasting ~1.5 GB of VRAM allocations and millions of arithmetic operations on padded windows.
         valid_idx = torch.where(flat_valid)[0]
         dim = self.backbone.config.hidden_size
-        feat = torch.zeros(B * S * W, dim * 3, device=imgs.device, dtype=torch.float32)
 
         if len(valid_idx) > 0:
             flat_imgs = imgs.reshape(B * S * W, *imgs.shape[3:])
@@ -287,7 +286,12 @@ class Model(nn.Module):
                 1, top_idx.unsqueeze(-1).expand(-1, -1, patches.size(-1))
             )
             focal_tok = gathered.mean(1)                     # [N, dim]
-            feat[valid_idx] = torch.cat([cls_tok, mean_tok, focal_tok], dim=1)
+            valid_feats = torch.cat([cls_tok, mean_tok, focal_tok], dim=1)
+            # ANTI-DEGRADATION FIX: Match feat dtype to valid_feats so downstream attention stays in native Tensor Core BF16
+            feat = torch.zeros(B * S * W, dim * 3, device=imgs.device, dtype=valid_feats.dtype)
+            feat[valid_idx] = valid_feats
+        else:
+            feat = torch.zeros(B * S * W, dim * 3, device=imgs.device, dtype=torch.float32)
 
         feat = feat.view(B, S, W, -1)           # [B, S, W, dim*2]
 

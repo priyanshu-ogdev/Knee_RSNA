@@ -96,8 +96,9 @@ class AsymmetricLoss(nn.Module):
 
         if weights is not None:
             loss = loss * weights
-            # Compute loss independently per class first, then average across classes
-            # This prevents a rare-target's massive weight from shrinking the loss gradients of common targets
+            # Compute loss independently per class first, then average across all C targets (1/C per target).
+            # This bounds each target head's gradient contribution at 1/C, preventing sparse batches
+            # from causing destructive gradient spikes (up to 12x) on the shared ViT backbone.
             class_losses = loss.sum(dim=0) / weights.sum(dim=0).clamp_min(1.0)
             return class_losses.mean()
         return loss.mean()
@@ -111,8 +112,9 @@ class WeightedBCE(nn.Module):
                                                   reduction="none")
         if weights is not None:
             loss = loss * weights
-            # Compute loss independently per class first, then average across classes
-            # This prevents a rare-target's massive weight from shrinking the loss gradients of common targets
+            # Compute loss independently per class first, then average across all C targets (1/C per target).
+            # This bounds each target head's gradient contribution at 1/C, preventing sparse batches
+            # from causing destructive gradient spikes (up to 12x) on the shared ViT backbone.
             class_losses = loss.sum(dim=0) / weights.sum(dim=0).clamp_min(1.0)
             return class_losses.mean()
         return loss.mean()

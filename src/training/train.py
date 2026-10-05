@@ -23,6 +23,7 @@ All data-contract fixes from the previous intermediate version are retained:
   - Best-checkpoint saving
 """
 from __future__ import annotations
+import math
 
 import os
 import time
@@ -176,7 +177,8 @@ def train_epoch(
 
         scaler.scale(loss).backward()
 
-        if (micro_step + 1) % grad_accum == 0:
+        is_last = (micro_step + 1) == len(dataloader)
+        if (micro_step + 1) % grad_accum == 0 or is_last:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
             scaler.step(optimizer)
@@ -214,9 +216,15 @@ def evaluate(
     P, Y, W = np.concatenate(P), np.concatenate(Y), np.concatenate(W)
     per: dict[str, float] = {}
     for j, t in enumerate(config.TARGETS):
-        m = W[:, j] >= 0.99  # CRITICAL FIX: Evaluate ONLY on Gold Labels to prevent sklearn continuous format ValueError on soft pseudo-labels
-        if m.sum() > 1 and 0 < Y[m, j].sum() < m.sum():
-            per[t] = float(roc_auc_score(Y[m, j], P[m, j]))
+        m = W[:, j] >= 0.99  # Primary: Evaluate on Gold Labels
+        if m.sum() < 2 or not (0 < Y[m, j].sum() < m.sum()):
+            # Fallback if fold has no gold samples with both classes (e.g. rare Fracture): evaluate on all labeled samples binarized
+            m = W[:, j] > 0
+            y_eval = (Y[m, j] >= 0.5).astype(float)
+        else:
+            y_eval = Y[m, j]
+        if m.sum() > 1 and 0 < y_eval.sum() < m.sum():
+            per[t] = float(roc_auc_score(y_eval, P[m, j]))
     macro = float(np.mean(list(per.values()))) if per else float("nan")
     return macro, per
 
@@ -365,7 +373,10 @@ def run_training(
     )
 
     # ── LR Schedule (Upgrade J: cosine with warmup) ──────────────────────────
-    total_steps = n_ep * max(len(dl_tr), 1)
+    # ANTI-DEGRADATION FIX: Count actual optimizer steps per epoch under grad_accum
+    # so cosine decay reaches 100% completion rather than truncating at 50%
+    steps_per_epoch = math.ceil(len(dl_tr) / grad_accum) if dl_tr is not None else 1
+    total_steps = n_ep * max(steps_per_epoch, 1)
     scheduler = _build_schedule(optimizer, total_steps, warmup_frac=0.08)
 
     # ── Mixed precision ───────────────────────────────────────────────────────
@@ -437,9 +448,33 @@ def run_training(
             break
 
     # ── SWA: recompute BatchNorm stats, save ─────────────────────────────────
+    def safe_update_bn(loader, model, device):
+        momenta = {}
+        for module in model.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.reset_running_stats()
+                momenta[module] = module.momentum
+        if not momenta:
+            return
+        was_training = model.training
+        model.train()
+        for module in momenta:
+            module.momentum = None
+        for batch in loader:
+            if isinstance(batch, (list, tuple)):
+                imgs = batch[0].to(device)
+                mask = batch[1].to(device) if len(batch) > 1 else None
+                wmask = batch[2].to(device) if len(batch) > 2 else None
+                model(imgs, mask, wmask)
+            else:
+                model(batch.to(device))
+        for bn_module in momenta:
+            bn_module.momentum = momenta[bn_module]
+        model.train(was_training)
+
     if swa_model is not None and swa_epochs > 0:
         print("Updating SWA batch-norm statistics …")
-        update_bn(dl_tr, swa_model, device=device)
+        safe_update_bn(dl_tr, swa_model, device=device)
         torch.save(
             dict(model=swa_model.module.state_dict(),
                  cfg=dataclasses.asdict(cfg),

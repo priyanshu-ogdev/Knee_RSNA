@@ -29,17 +29,17 @@ Accurately extract the presence of the following 12 knee conditions from this MR
 
 TARGETS & CLINICAL DEFINITIONS:
 1. ACL: Anterior Cruciate Ligament tear (complete, partial, high-grade, low-grade, or chronic tear). Intact ACL graft/reconstruction = absent. (CAUTION: Do NOT confuse with PCL / Posterior Cruciate).
-2. MCL: Medial Collateral Ligament tear or sprain (grade 1, 2, or 3). (CAUTION: Do NOT confuse with LCL / Lateral Collateral).
-3. Medial Meniscus: Medial meniscus tear (MM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, complex, or degenerative tear).
-4. Lateral Meniscus: Lateral meniscus tear (LM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, or complex tear).
+2. MCL: Medial Collateral Ligament tear or sprain (grade 1, 2, or 3). (CAUTION: Do NOT confuse with LCL / Lateral Collateral. MPFL / Medial Patellofemoral Ligament or medial retinaculum tears are NOT MCL tears).
+3. Medial Meniscus: Medial meniscus tear (MM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, complex, or degenerative tear). (NOTE: Grade 1 or Grade 2 intrameniscal signal / myxoid degeneration WITHOUT articular surface extension/tear = absent. Only true articular surface extension tear (Grade 3) = present).
+4. Lateral Meniscus: Lateral meniscus tear (LM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, or complex tear). (NOTE: Grade 1 or Grade 2 intrameniscal signal / myxoid degeneration WITHOUT articular surface extension/tear = absent. Only true articular surface extension tear (Grade 3) = present).
 5. Medial OA: Medial compartment osteoarthritis, cartilage loss, chondral thinning/defect, subchondral sclerosis/osteophytes of medial femoral condyle (MFC) or medial tibial plateau (MTP).
 6. Lateral OA: Lateral compartment osteoarthritis, cartilage loss, chondral thinning/defect, subchondral sclerosis/osteophytes of lateral femoral condyle (LFC) or lateral tibial plateau (LTP).
 7. PF OA: Patellofemoral osteoarthritis, chondromalacia patellae (CMP), patellar or trochlear cartilage defect / fissure / loss / thinning, patellofemoral joint space narrowing.
-8. Effusion: Joint effusion, suprapatellar effusion, intra-articular fluid distension (mild, moderate, or large).
+8. Effusion: Joint effusion, suprapatellar effusion, intra-articular fluid distension (mild, moderate, or large). (NOTE: Physiological / minimal trace fluid within normal limits = absent. Only pathological joint effusion or distension = present).
 9. Synovitis: Synovial thickening, synovitis, synovial proliferation, hypervascular pannus, synovial enhancement.
 10. Baker's: Baker's cyst, popliteal cyst, gastrocnemius-semimembranosus bursal distension.
-11. Contusion: Bone bruise, bone contusion, trabecular microfracture, bone marrow edema / signal abnormality following trauma.
-12. Fracture: Cortical bone fracture, subchondral fracture, avulsion fracture, tibial plateau / femoral / patellar / fibular fracture.
+11. Contusion: Bone bruise, bone contusion, trabecular microfracture, bone marrow edema / signal abnormality following trauma. (NOTE: Subchondral sclerosis or subchondral cysts from osteoarthritis without acute marrow edema = absent).
+12. Fracture: Cortical bone fracture, subchondral fracture, avulsion fracture, tibial plateau / femoral / patellar / fibular fracture. (NOTE: Old healed fracture without acute fracture = absent/not_stated).
 
 CLINICAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
 1. Output MUST be valid JSON matching the exact output schema.
@@ -49,8 +49,13 @@ CLINICAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
 5. "present": Finding is explicitly present, torn, injured, seen, or described as abnormal.
 6. "absent": Finding is explicitly normal, intact, unremarkable, or without abnormality. Intact surgical graft = "absent".
 7. "not_stated": Omitted, hedged (e.g. "cannot exclude", "cannot rule out", "suspected", "questionable", "possible", "borderline", "differential"), or "None" quote.
-8. MULTI-LINGUAL: The report may be in any language (English, German, Spanish, Dutch, French, etc.). Translate mentally to extract findings accurately (e.g., German: Kreuzband=ACL, Innenmeniskus=Medial Meniscus, Knorpeldefekt/Gonarthrose=OA, Erguss=Effusion, Knochenoedem=Contusion; Spanish: LCA=ACL, derrame=effusion, etc.).
-9. CROSS-TALK PREVENTION: PCL (Posterior Cruciate) and LCL (Lateral Collateral) are NOT targets! Never assign PCL findings to ACL, nor LCL findings to MCL.
+8. MULTI-LINGUAL: The report may be in any language (English, German, Spanish, Dutch, French, Greek, etc.). Translate mentally to extract findings accurately:
+   - German: Kreuzband=ACL, Innenmeniskus=Medial Meniscus, Knorpeldefekt/Gonarthrose=OA, Erguss=Effusion, Knochenmarködem=Contusion, keine Ruptur/intakt=absent.
+   - Spanish: LCA=ACL, derrame=effusion, edema óseo=contusion, sin rotura/conservado=absent.
+   - Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, beenmergoedeem=contusion, geen scheur/intact=absent.
+   - French: LCA=ACL, épanchement=effusion, sans fissure/intact=absent.
+   - Greek: ρήξη=tear, αρθρική συλλογή=effusion, οστεομυελικό οίδημα=contusion, ακέραιο/χωρίς ρήξη=absent.
+9. CROSS-TALK PREVENTION: PCL (Posterior Cruciate) and LCL (Lateral Collateral) are NOT targets! Never assign PCL findings to ACL, nor LCL/MPFL findings to MCL.
 10. CONSISTENCY: If exact_quote is "None", state MUST be "not_stated". Never mark "present" with "None" quote.
 
 REPORT:
@@ -74,10 +79,11 @@ OUTPUT SCHEMA:
 """
 
 def clean_txt(s: str) -> str:
-    return re.sub(r'[^a-z0-9]', '', str(s).lower())
+    # SOTA Fix: Unicode-aware stripping keeps Greek, Spanish, German, French, Dutch letters
+    return re.sub(r'[^\w]', '', str(s).lower(), flags=re.UNICODE)
 
 def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> dict:
-    """Safely extracts JSON from the LLM output with a Dual-Layer Clinical Hallucination Shield."""
+    """Safely extracts JSON from the LLM output with a Quadruple-Layer Clinical Hallucination Shield."""
     if not raw_text or not isinstance(raw_text, str):
         print(f"[ERROR] Empty raw_text for {uid}")
         return None
@@ -98,14 +104,13 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         print(f"[ERROR] No JSON block found in output for {uid}")
         return None
         
-    # SOTA Fix: Strip trailing commas before closing braces/brackets (fatal for json.loads)
-    clean_json_sanitized = re.sub(r',\s*([}\]])', r'\1', clean_json)
-        
     try:
+        # SOTA Fix: Remove trailing commas before closing braces/brackets which frequently crash json.loads
+        clean_json_sanitized = re.sub(r',\s*([}\]])', r'\1', clean_json)
         try:
             data = json.loads(clean_json_sanitized)
-        except Exception:
-            # Fallback using ast.literal_eval with JSON literals translated to Python literals
+        except json.JSONDecodeError:
+            # Fallback using ast.literal_eval for non-strict python-like dicts
             import ast
             ast_str = clean_json_sanitized.replace('true', 'True').replace('false', 'False').replace('null', 'None')
             data = ast.literal_eval(ast_str)
@@ -113,7 +118,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         out = {"StudyInstanceUID": str(uid).strip()}
         
         # SOTA Fix: Aggressive alphanumeric key normalization to completely eliminate 
-        # missing keys due to LLM hallucinating curly quotes (Baker’s vs Baker's) or extra spaces.
+        # missing keys due to LLM hallucinating curly quotes (Baker's vs Baker's) or extra spaces.
         def normalize_key(k):
             return re.sub(r'[^a-zA-Z0-9]', '', str(k)).lower()
             
@@ -141,38 +146,173 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 is_absent = (raw_state == 0)
             elif isinstance(raw_state, str):
                 s_low = raw_state.lower().strip()
-                # Check for explicit absent/normal/intact/no
-                if any(x in s_low for x in ["absent", "normal", "intact", "unremarkable", "no tear", "no fracture", "not present", "not seen"]):
+                # Multi-lingual absent tokens
+                absent_tokens = [
+                    "absent", "normal", "intact", "unremarkable", "no tear", "no fracture", 
+                    "not present", "not seen", "negative", "negativo", "negatief", "no", 
+                    "ausente", "afwezig", "unauffällig", "regelrecht", "intakt", "conservado", 
+                    "íntegro", "integro", "χωρίς"
+                ]
+                # Multi-lingual present tokens
+                present_tokens = [
+                    "present", "torn", "tear", "fracture", "positive", "positivo", 
+                    "positief", "presente", "vorhanden", "anwesend", "ρήξη"
+                ]
+                if any(x in s_low for x in absent_tokens):
                     is_absent = True
-                elif any(x in s_low for x in ["present", "torn", "tear", "fracture", "positive"]):
+                elif any(x in s_low for x in present_tokens):
                     is_present = True
             
             # =========================================================================
-            # DUAL-LAYER CLINICAL HALLUCINATION SHIELD
+            # QUADRUPLE-LAYER CLINICAL HALLUCINATION SHIELD
             # =========================================================================
             q_low = exact_quote.lower().strip()
             if is_present:
+                # ---------------------------------------------------------------------
                 # Shield 1: Discard ungrounded "present" with empty or "None" quote
+                # ---------------------------------------------------------------------
                 if q_low in ["none", "null", "n/a", "", "not mentioned", "not stated", "none."]:
                     is_present = False
                     
-                # Shield 2: Invert contradictory quotes describing a normal/intact structure
-                elif any(x in q_low for x in ["intact", "normal", "unremarkable", "no tear", "no fracture", "without tear", "no acute tear"]):
-                    is_present = False
-                    is_absent = True
+                # ---------------------------------------------------------------------
+                # Shield 2: Anatomical Cross-Talk Prevention
+                # ---------------------------------------------------------------------
+                # ACL vs PCL
+                elif t == "ACL":
+                    pcl_terms = ["posterior cruciate", "pcl", "achterste kruisband", "akb", "hinteres kreuzband", "hkb", "cruzado posterior", "lcp", "croise posterieur", "croisé postérieur"]
+                    acl_terms = ["anterior", "acl", "voorste", "vkb", "vorderes", "lca", "croise anterieur", "croisé antérieur"]
+                    if any(p in q_low for p in pcl_terms) and not any(a in q_low for a in acl_terms):
+                        is_present = False
+                
+                # MCL vs LCL & MPFL
+                elif t == "MCL":
+                    lcl_terms = ["lateral collateral", "lcl", "fcl", "fibular collateral", "laterale band", "aussenband", "außenband", "colateral lateral", "colateral externo", "lce", "collatéral latéral"]
+                    mcl_terms = ["medial", "mcl", "binnenband", "innenband", "colateral medial", "colateral interno", "lcm", "collatéral médial"]
+                    if any(l in q_low for l in lcl_terms) and not any(m in q_low for m in mcl_terms):
+                        is_present = False
+                        
+                    mpfl_terms = ["mpfl", "patellofemoral ligament", "patelofemoral", "medial retinaculum", "retináculo medial", "retinaculo medial", "mediale retinaculum"]
+                    mcl_specific = ["collateral", "colateral", "mcl", "tibiaal", "tibial", "binnenband", "innenband"]
+                    if any(mp in q_low for mp in mpfl_terms) and not any(ms in q_low for ms in mcl_specific):
+                        is_present = False
+
+                # Medial Meniscus vs Lateral Meniscus
+                elif t == "Medial Meniscus":
+                    lm_terms = ["lateral meniscus", "lateralen meniskus", "buitenmeniscus", "menisco lateral", "menisco externo", "menisque lateral"]
+                    mm_terms = ["medial", "innenmeniskus", "binnenmeniscus", "menisco medial", "menisco interno", "menisque medial"]
+                    if any(lm in q_low for lm in lm_terms) and not any(mm in q_low for mm in mm_terms):
+                        is_present = False
+
+                elif t == "Lateral Meniscus":
+                    mm_terms = ["medial meniscus", "medialen meniskus", "binnenmeniscus", "innenmeniskus", "menisco medial", "menisco interno", "menisque medial"]
+                    lm_terms = ["lateral", "aussenmeniskus", "außenmeniskus", "buitenmeniscus", "externo", "externe"]
+                    if any(mm in q_low for mm in mm_terms) and not any(lm in q_low for lm in lm_terms):
+                        is_present = False
+
+                # Grade 1 / Grade 2 Intrameniscal Degeneration Shield (Non-tear signal)
+                if is_present and t in ["Medial Meniscus", "Lateral Meniscus"]:
+                    grade_terms = ["grade 1", "grade i", "grade 2", "grade ii", "grad 1", "grad i", "grad 2", "grad ii", "intrameniscal", "intrameniscale", "myxoid", "myxoide"]
+                    no_tear_terms = ["without surface", "no surface extension", "no tear", "ohne riss", "zonder scheur", "sin rotura", "no articular", "sin extension", "sin extensión", "zonder doorbraak", "intact surface"]
+                    if any(g in q_low for g in grade_terms) and any(nt in q_low for nt in no_tear_terms):
+                        is_present = False
+                        is_absent = True
+
+                # Physiological Fluid Shield for Effusion
+                if is_present and t == "Effusion":
+                    phys_terms = ["physiological", "minimal trace", "trace fluid", "no effusion", "kein erguss", "geen hydrops", "sin derrame", "fisiológico", "fisiologico", "fysiologische"]
+                    heavy_terms = ["moderate", "large", "marked", "copious", "severo", "groot", "ausgeprägt", "substantieel"]
+                    if any(p in q_low for p in phys_terms) and not any(h in q_low for h in heavy_terms):
+                        is_present = False
+                        is_absent = True
+
+                # ---------------------------------------------------------------------
+                # Shield 3: Multi-Lingual Hedging & Uncertainty Demotion
+                # ---------------------------------------------------------------------
+                if is_present:
+                    hedging_phrases = [
+                        # English
+                        "cannot exclude", "cannot rule out", "suspected", "questionable", "possible", 
+                        "borderline", "differential diagnosis", "may represent", "inconclusive", "not definitely",
+                        # Spanish
+                        "no descartable", "sospecha", "cuestionable", "no se puede descartar", "dudoso", "dudosa",
+                        # Dutch
+                        "niet uit te sluiten", "niet geheel uit te sluiten", "verdacht", "mogelijk", "twijfelachtig", "geen zekere",
+                        # German
+                        "nicht auszuschliessen", "nicht auszuschließen", "fraglich", "differenzialdiagnose", "v.a.", "verdacht auf", "unklar",
+                        # French
+                        "ne peut etre exclu", "ne peut être exclu", "douteux", "douteuse", "suspect",
+                        # Greek
+                        "δεν μπορεί να αποκλειστεί", "πιθανή", "αμφίβολ", "ύποπτ"
+                    ]
+                    if any(h in q_low for h in hedging_phrases):
+                        is_present = False
+
+                # ---------------------------------------------------------------------
+                # Shield 4: Invert Contradictory Quotes Describing Normal / Intact Structure
+                # ---------------------------------------------------------------------
+                if is_present:
+                    explicit_normal_phrases = [
+                        # English
+                        "intact", "normal", "unremarkable", "preserved", "in continuity", "without tear",
+                        "no tear", "no fracture", "no acute tear", "no evidence of tear", "not torn", "no effusion",
+                        # Spanish
+                        "sin rotura", "sin desgarro", "sin signos de rotura", "sin lesiones", "sin alteraciones", 
+                        "conservado", "conservada", "íntegro", "integro", "sin derrame", "sin fractura", "sin edema", 
+                        "dentro de límites normales", "dentro de limites normales",
+                        # Dutch
+                        "geen scheur", "ongestoord", "geen afwijkingen", "geen meniscusletsel", "geen hydrops", 
+                        "geen kraakbeendefect", "slank en doorlopend", "zonder scheur", "zonder ruptuur", 
+                        "zonder afwijkingen", "geen fractuur",
+                        # German
+                        "keine ruptur", "kein riss", "intakt", "regelrecht", "unauffällig", "unauffaellig", 
+                        "ohne befund", "ohne riss", "ohne fraktur", "kein erguss", "kein knorpelschaden", "keine meniskusläsion",
+                        # French
+                        "sans rupture", "sans fissure", "sans anomalie", "sans lesion", "sans lésion", 
+                        "sans épanchement", "sans epanchement", "intégrité", "integrite",
+                        # Greek
+                        "χωρίς ρήξη", "χωρίς κάταγμα", "ακέραι", "φυσιολογικ", "χωρίς παθολογ", "χωρίς συλλογή"
+                    ]
+                    injury_words = [
+                        "tear", "torn", "ruptur", "rotur", "scheur", "riss", "sprain", "fractur", 
+                        "fracture", "fraktur", "edema", "oedeem", "ödem", "defect", "loss", "thinning", 
+                        "effusion", "erguss", "derrame", "hydrops", "cyst", "kyste", "zyste"
+                    ]
+                    has_normal = any(n in q_low for n in explicit_normal_phrases)
+                    has_injury = any(inj in q_low for inj in injury_words)
                     
-                # Shield 3: Demote hedged / uncertain phrases to not_stated
-                elif any(x in q_low for x in ["cannot exclude", "cannot rule out", "suspected", "questionable", "possible tear", "differential"]):
-                    is_present = False
-                    
-                # Shield 4: Grounding verification against original report
-                elif original_report:
+                    if has_normal and not has_injury:
+                        # Clean normal quote: invert to absent
+                        is_present = False
+                        is_absent = True
+                    elif has_normal and has_injury:
+                        # Contains both (e.g. "no tear of the medial meniscus").
+                        # Check if injury is explicitly negated:
+                        explicit_neg = any(neg in q_low for neg in [
+                            "no tear", "without tear", "no acute tear", "sin rotura", "sin signos de rotura",
+                            "geen scheur", "zonder scheur", "keine ruptur", "ohne riss", "sans fissure",
+                            "sans rupture", "no fracture", "sin fractura", "geen fractuur", "ohne fraktur",
+                            "no effusion", "sin derrame", "geen hydrops", "kein erguss", "χωρίς ρήξη"
+                        ])
+                        pos_injuries = [
+                            "acute tear", "complete tear", "partial tear", "radial tear", "horizontal tear", 
+                            "bucket-handle", "rotura completa", "rotura parcial", "scheur van", "complexe scheur", 
+                            "knochenmarködem", "bone bruise", "joint effusion"
+                        ]
+                        has_pos_injury = any(p in q_low for p in pos_injuries)
+                        if explicit_neg and not has_pos_injury:
+                            is_present = False
+                            is_absent = True
+
+                # ---------------------------------------------------------------------
+                # Shield 5: Grounding Verification Against Original Report
+                # ---------------------------------------------------------------------
+                if is_present and original_report:
                     clean_q = clean_txt(exact_quote)
                     clean_rep = clean_txt(original_report)
                     if len(clean_q) > 10 and clean_q not in clean_rep:
                         # Check word overlap if direct character substring fails
-                        q_words = set(re.findall(r'\b[a-z]{4,}\b', q_low))
-                        rep_words = set(re.findall(r'\b[a-z]{4,}\b', original_report.lower()))
+                        q_words = set(re.findall(r'\b\w{4,}\b', q_low, flags=re.UNICODE))
+                        rep_words = set(re.findall(r'\b\w{4,}\b', original_report.lower(), flags=re.UNICODE))
                         overlap = len(q_words & rep_words) / max(1, len(q_words))
                         
                         # Only reject on word overlap if report is English (avoids penalizing mental translations of foreign reports)
@@ -180,6 +320,9 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                         is_english_report = len(common_en & rep_words) >= 2
                         if is_english_report and overlap < 0.3:
                             # Fabricated quote hallucination
+                            is_present = False
+                        elif not is_english_report and len(q_words) >= 3 and overlap < 0.15:
+                            # Fabricated non-English quote
                             is_present = False
             
             # Map verified findings to labels & confidence weights
@@ -189,7 +332,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 out[t], out[f"{t}_weight"] = 0.0, 0.5
             else:
                 # not_stated / hedged / missing
-                if t in ["ACL", "Medial Meniscus", "Lateral Meniscus", "Effusion", "MCL"]:
+                if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
                     out[t], out[f"{t}_weight"] = 0.0, 0.0 # Strict Mask
                 else:
                     out[t], out[f"{t}_weight"] = 0.0, 0.1 # Soft Negative

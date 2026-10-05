@@ -311,13 +311,17 @@ class Model(nn.Module):
 
 # ─────────────────────────────────────────────────────────── Factory ──────────
 def build_model(
+    variant: str = "dinov2-base",          # Standard first argument
     unfreeze_last: int = config.UNFREEZE_LAST,
-    variant: str = "dinov2-base",          # Upgrade A: default changed to Base
     use_cross_slot: bool = True,           # Upgrade C: CrossSlotTransformer
     lora_rank: int = 16,                   # Upgrade B: LoRA rank (0 = disable)
     lora_alpha: int = 32,
     truncate_blocks: int = 0,              # Phase 2 Speedup: drop last 3 blocks
 ) -> Model:
+    # Polymorphic argument resolution for backward compatibility
+    if isinstance(variant, int):
+        unfreeze_last = variant
+        variant = "dinov2-base" 
     """Build and configure the model.
 
     Parameters
@@ -465,11 +469,21 @@ def build_convnext_model(
 def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") -> nn.Module:
     """Load a trained model checkpoint (fold*_ema.pt, fold*_best.pt, or fold*_swa.pt).
     Reconstructs the model architecture with the exact saved configuration and loads weights.
+    Safely strips torch.compile (_orig_mod.) and DataParallel (module.) prefixes if present.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     variant = ckpt.get("variant", "dinov2-base")
     use_cross_slot = ckpt.get("use_cross_slot", True)
     model = build_model(variant=variant, use_cross_slot=use_cross_slot).to(device)
-    model.load_state_dict(ckpt["model"])
+    state_dict = ckpt["model"]
+    cleaned_state_dict = {}
+    for k, v in state_dict.items():
+        clean_k = k
+        if clean_k.startswith("_orig_mod."):
+            clean_k = clean_k[len("_orig_mod."):]
+        if clean_k.startswith("module."):
+            clean_k = clean_k[len("module."):]
+        cleaned_state_dict[clean_k] = v
+    model.load_state_dict(cleaned_state_dict)
     model.eval()
     return model

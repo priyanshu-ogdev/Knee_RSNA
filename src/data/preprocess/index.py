@@ -40,10 +40,16 @@ def discover_root(explicit=None):
 
 
 def list_series_dirs(root, split):
-    base = os.path.join(root, SPLIT_DIRS[split])
+    base = os.path.join(root, SPLIT_DIRS.get(split, split))
     items = []
     if not os.path.isdir(base):
-        return items
+        for alt in (split, f"{split}_series", f"{split}_images"):
+            alt_path = os.path.join(root, alt)
+            if os.path.isdir(alt_path):
+                base = alt_path
+                break
+        else:
+            return items
     with os.scandir(base) as it:
         studies = sorted(e.name for e in it if e.is_dir())
     for st in studies:

@@ -5,24 +5,26 @@ import src.core.config as config
 from . import sampling
 
 
-def make_sample(cache, i, cfg, train=False, n_use=None, rng=None, aug=True):
+def make_sample(cache, i, cfg, train=False, n_use=None, rng=None, aug=None):
     """One study from the memmap cache.
 
     Returns imgs uint8 [S, W, G, H, W], slot_mask uint8 [S], win_mask bool [S, W].
     train: independent stratified-random windows per slot + one geometric/intensity augmentation per slot.
-    eval : the same evenly spaced windows for every slot (n_use=None -> all windows)."""
+    eval : the same evenly spaced windows for every slot (n_use=None -> all windows).
+    aug  : if None, defaults to train. If explicitly bool, forces augmentation on or off (e.g. for TTA)."""
     S, G, H = config.N_SLOTS, cfg.group, cfg.img_size
     D, stride = cfg.stack_depth, cfg.win_stride
     W = sampling.n_windows(D, G, stride) if n_use is None else min(n_use, sampling.n_windows(D, G, stride))
     imgs = np.zeros((S, W, G, H, H), np.uint8)
     wmask = np.zeros((S, W), bool)
     rng = rng if rng is not None else np.random.default_rng(0)
+    should_aug = aug if aug is not None else train
     for s in range(S):
         if not cache.slot[i, s]:
             continue
         starts = sampling.window_starts(D, G, stride, W, train, rng)
         win, wv = sampling.gather_windows(cache.images[i, s], cache.valid[i, s], starts, G)
-        if train and aug:
+        if should_aug:
             win = sampling.augment_slot(win, rng, config.AUG_ROT_DEG, config.AUG_SCALE, config.AUG_SHIFT, config.AUG_INTENSITY)
         n = len(starts)
         imgs[s, :n], wmask[s, :n] = win, wv

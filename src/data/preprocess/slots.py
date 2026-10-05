@@ -52,6 +52,8 @@ def annotate(df, fs_priority='hdr', csv_fallback=True):
     fs_priority='csv' the CSV flag wins whenever present.
     """
     df = df.copy()
+    if 'plane' not in df.columns:
+        df['plane'] = plane_of(df)
     for c in NEEDED:
         if c not in df.columns:
             df[c] = None
@@ -125,6 +127,8 @@ def assign_slots(g, prefer_2d=True, slots=None):
       extras: series not used by any slot
     Rule (public): most slices wins. With prefer_2d a 2-D series always beats a 3-D volume.
     """
+    if 'plane' not in g.columns or 'fatsat' not in g.columns or 'fluid' not in g.columns or 'is3d' not in g.columns:
+        g = annotate(g)
     slots = slots or config.SLOTS
     chosen, alts, used = {}, {}, set()
     if 'n_slices' in g.columns:
@@ -142,7 +146,7 @@ def assign_slots(g, prefer_2d=True, slots=None):
         if len(c) == 0:
             continue
         if prefer_2d:
-            c = c.assign(_k=c['is3d'].astype(int))
+            c = c.assign(_k=c['is3d'].fillna(False).astype(int))
             c = c.sort_values(['_k', '_n', 'SeriesInstanceUID'], ascending=[True, False, True])
         else:
             c = c.sort_values(['_n', 'SeriesInstanceUID'], ascending=[False, True])

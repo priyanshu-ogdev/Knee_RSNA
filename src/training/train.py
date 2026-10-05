@@ -138,7 +138,6 @@ def train_epoch(
     for micro_step, batch in enumerate(dataloader):
         imgs, masks, wmasks, targets, weights = batch
         imgs    = imgs.to(device, non_blocking=True)
-        imgs.requires_grad_(True)  # CRITICAL for Unified Memory Gradient Checkpointing
         masks   = masks.to(device, non_blocking=True)
         wmasks  = wmasks.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)

@@ -233,6 +233,9 @@ def run_inference(
     # We output the raw, natively calibrated Sigmoid probabilities.
     sub = pd.DataFrame(preds, columns=config.TARGETS)
     sub.insert(0, "StudyInstanceUID", studies)
+    if test_csv and os.path.exists(test_csv):
+        # Mandatory Kaggle submission rule: exact 1-to-1 match with test.csv rows and order
+        sub = sub.set_index("StudyInstanceUID").reindex(order).reset_index()
     sub.to_csv(out_csv, index=False)
 
     return sub, stats

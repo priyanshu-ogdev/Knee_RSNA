@@ -483,70 +483,159 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia
 
 
 # =============================================================================
-# CLINICAL SHIELD HEURISTIC ENGINE (Vectorized / CPU Fallback)
+# CLINICAL SHIELD HEURISTIC ENGINE (Multilingual SOTA Extractor / CPU Fallback)
 # =============================================================================
-CLINICAL_RULES = {
-    "ACL": {
-        "pos": [r"\bacl\b.*?\b(tear|ruptur|sprain|torn)", r"\banterior cruciate\b.*?\b(tear|ruptur|sprain|torn)", r"\brotura.*?\blca\b", r"\brupp?tur.*?\b(vkb|vorderes kreuzband)", r"\bscheur.*?\bvkb\b"],
-        "neg": [r"\bacl\b.*?\b(intact|normal|unremarkable|conservad|intakt|ongestoord|zonder scheur)", r"\banterior cruciate\b.*?\b(intact|normal|unremarkable)", r"\bkeine ruptur.*?\b(vkb|kreuzband)", r"\bsin rotura.*?\blca\b"],
-        "crosstalk_exclude": [r"\bposterior cruciate\b", r"\bpcl\b", r"\bhkb\b", r"\blcp\b", r"\bachterste kruisband\b"]
-    },
-    "MCL": {
-        "pos": [r"\bmcl\b.*?\b(tear|sprain|ruptur|torn|distension)", r"\bmedial collateral\b.*?\b(tear|sprain|ruptur|torn)", r"\brotura.*?\blcm\b", r"\binnenband.*?\b(ruptur|riss|scheur)"],
-        "neg": [r"\bmcl\b.*?\b(intact|normal|unremarkable|conservad|intakt)", r"\bmedial collateral\b.*?\b(intact|normal|unremarkable)", r"\bsin rotura.*?\blcm\b"],
-        "crosstalk_exclude": [r"\blateral collateral\b", r"\blcl\b", r"\bmpfl\b", r"\bpatellofemoral ligament\b"]
-    },
-    "Medial Meniscus": {
-        "pos": [r"\bmedial meniscus\b.*?\b(tear|ruptur|scheur|torn|riss)", r"\brotura.*?\bmenisco med", r"\brotura.*?\bmenisco int", r"\briss.*?\b(innenmeniskus|medialen meniskus)", r"\bscheur.*?\bmediale meniscus"],
-        "neg": [r"\bmedial meniscus\b.*?\b(intact|normal|unremarkable|unauff)", r"\bsin rotura.*?\bmenisco med", r"\bkein(e)? (meniskus)?riss.*?\binnenmeniskus", r"\bgeen scheur.*?\bmediale meniscus"],
-        "crosstalk_exclude": [r"\blateral meniscus\b", r"\baussenmeniskus\b", r"\blaterale meniscus\b"]
-    },
-    "Lateral Meniscus": {
-        "pos": [r"\blateral meniscus\b.*?\b(tear|ruptur|scheur|torn|riss)", r"\brotura.*?\bmenisco lat", r"\brotura.*?\bmenisco ext", r"\briss.*?\b(aussenmeniskus|außenmeniskus|lateralen meniskus)", r"\bscheur.*?\blaterale meniscus"],
-        "neg": [r"\blateral meniscus\b.*?\b(intact|normal|unremarkable|unauff)", r"\bsin rotura.*?\bmenisco lat", r"\bkein(e)? (meniskus)?riss.*?\baussenmeniskus", r"\bgeen scheur.*?\blaterale meniscus"],
-        "crosstalk_exclude": [r"\bmedial meniscus\b", r"\binnenmeniskus\b", r"\bmediale meniscus\b"]
-    },
-    "Medial OA": {
-        "pos": [r"\bmedial.*?\b(osteoarthr|arthros|cartilage defect|cartilage loss|chondromalacia|joint space narrowing)", r"\bartejo med.*?\barthros", r"\bmedialen kompartiment.*?\b(arthrose|knorpelschaden)"],
-        "neg": [r"\bmedial.*?\b(no osteoarthritis|no arthrosis|cartilage intact|normal joint space)"],
-        "crosstalk_exclude": [r"\blateral compartment\b", r"\bpatellofemoral\b"]
-    },
-    "Lateral OA": {
-        "pos": [r"\blateral.*?\b(osteoarthr|arthros|cartilage defect|cartilage loss|chondromalacia|joint space narrowing)", r"\bartejo lat.*?\barthros", r"\blateralen kompartiment.*?\b(arthrose|knorpelschaden)"],
-        "neg": [r"\blateral.*?\b(no osteoarthritis|no arthrosis|cartilage intact|normal joint space)"],
-        "crosstalk_exclude": [r"\bmedial compartment\b", r"\bpatellofemoral\b"]
-    },
-    "PF OA": {
-        "pos": [r"\b(patellofemoral|trochle|patella).*?\b(osteoarthr|arthros|chondromalacia|cartilage loss|cartilage defect|facet arthrosis)", r"\bfemoro-patelar.*?\barthros", r"\bretropatellar.*?\b(arthrose|knorpelschaden)"],
-        "neg": [r"\b(patellofemoral|trochle|patella).*?\b(normal|intact|no arthrosis)"],
-        "crosstalk_exclude": []
-    },
-    "Effusion": {
-        "pos": [r"\b(joint )?effusion\b", r"\bhydrops\b", r"\bderrame articular\b", r"\berguss\b", r"\bgelenkerguss\b", r"\bfluid in (the )?(joint|suprapatellar)", r"\bvloeistof.*?\bgewricht\b"],
-        "neg": [r"\b(no|without|sin|geen|kein).*?\b(effusion|hydrops|derrame|erguss)"],
-        "crosstalk_exclude": []
-    },
-    "Synovitis": {
-        "pos": [r"\bsynovit(is|e)\b", r"\bsynovial (thickening|proliferation|hypertrophy|enhancement)", r"\bsinovitis\b", r"\bsynovialitis\b"],
-        "neg": [r"\b(no|without|sin|geen|kein).*?\bsynovit"],
-        "crosstalk_exclude": []
-    },
-    "Baker's": {
-        "pos": [r"\bbaker(')?s? cyst\b", r"\bpopliteal cyst\b", r"\bquiste de baker\b", r"\bpopliteacyste\b", r"\bbaker(-)?zyste\b", r"\bkyste de baker\b"],
-        "neg": [r"\b(no|without|sin|geen|kein).*?\b(baker|popliteal cyst|baker-zyste)"],
-        "crosstalk_exclude": []
-    },
-    "Contusion": {
-        "pos": [r"\bbone (marrow )?(contusion|bruise|edema)\b", r"\bknochenmark(s)?(oedem|ödem)\b", r"\bedema oseo\b", r"\bedema subcondral\b", r"\bosteochondral contusion\b", r"\bbotkneuzing\b", r"\bbotoedeem\b"],
-        "neg": [r"\b(no|without|sin|geen|kein).*?\b(contusion|bone bruise|knochenmarködem|edema oseo)"],
-        "crosstalk_exclude": []
-    },
-    "Fracture": {
-        "pos": [r"\bfractur(e|a|atie)\b", r"\bfraktur\b", r"\bcortical (break|disruption|step)\b", r"\bavulsion\b"],
-        "neg": [r"\b(no|without|sin|geen|kein).*?\b(fracture|fraktur|fractura|avulsion)"],
-        "crosstalk_exclude": []
-    }
-}
+CLINICAL_RULES = {   'ACL': {   'crosstalk_exclude': [   '\\bposterior cruciate\\b',
+                                        '\\bpcl\\b',
+                                        '\\bhkb\\b',
+                                        '\\blcp\\b',
+                                        '\\bachterste kruisband\\b'],
+               'neg': [   '\\bacl\\b.*?\\b(intact|normal|unremarkable|conservad|intakt|ongestoord|zonder scheur)',
+                          '\\banterior cruciate\\b.*?\\b(intact|normal|unremarkable)',
+                          '\\bkeine ruptur.*?\\b(vkb|kreuzband)',
+                          '\\bsin rotura.*?\\blca\\b',
+                          '\\bligament croisé antérieur\\s*:\\s*normal\\b',
+                          '\\b(lca|ligamento cruzado anterior).*?\\b(intacto|normal|conservado)'],
+               'pos': [   '\\bacl\\b.*?\\b(tear|ruptur|sprain|torn|riss|scheur)',
+                          '\\banterior cruciate\\b.*?\\b(tear|ruptur|sprain|torn)',
+                          '\\b(rotura|ruptura|desgarro).*?\\b(del )?(lca|ligamento cruzado anterior)',
+                          '\\b(ligamento cruzado anterior|lca).*?\\b(rotura|ruptura|desgarro)',
+                          '\\brupp?tur.*?\\b(vkb|vorderes kreuzband)',
+                          '\\bvorderes kreuzband.*?\\b(ruptur|riss)',
+                          '\\bscheur.*?\\bvkb\\b',
+                          '\\bligament croisé antérieur.*?\\b(rupture|déchirure|lésion)',
+                          '\\b(разрыв|повреждение).*?\\b(пкс|передней крестообразной)']},
+    "Baker's": {   'crosstalk_exclude': [],
+                   'neg': [   "\\b(no|without|sin|geen|kein|pas d[e\\'])(\\s+\\w+){0,3}\\s+(baker|popliteal "
+                              'cyst|baker-zyste|quiste de baker)',
+                              '\\bkyste de baker\\s*:\\s*(aucun|absent|normal|non)'],
+                   'pos': [   "\\bbaker(')?s? cyst\\b",
+                              '\\bpopliteal cyst\\b',
+                              '\\bquiste de baker\\b',
+                              '\\bpopliteacyste\\b',
+                              '\\bbaker(-)?zyste\\b',
+                              '\\bkyste de baker\\b',
+                              '\\bкиста бейкера\\b']},
+    'Contusion': {   'crosstalk_exclude': [],
+                     'neg': [   "\\b(no|without|sin|geen|kein|pas d[e\\'])(\\s+\\w+){0,3}\\s+(contusion|bone "
+                                'bruise|knochenmarködem|edema [oó]seo)'],
+                     'pos': [   '\\bbone (marrow )?(contusion|bruise|edema)\\b',
+                                '\\bknochenmark(s)?(oedem|ödem)\\b',
+                                '\\bedema [oó]seo\\b',
+                                '\\bedema subcondral\\b',
+                                '\\bcontusi[oó]n [oó]sea\\b',
+                                '\\bosteochondral contusion\\b',
+                                '\\bbotkneuzing\\b',
+                                '\\bbotoedeem\\b',
+                                '\\bcontusion osseuse\\b',
+                                '\\bконтузия кости\\b']},
+    'Effusion': {   'crosstalk_exclude': [],
+                    'neg': [   '\\b(no|without|sin|geen|kein|pas '
+                               "d[e\\'])(\\s+\\w+){0,3}\\s+(effusion|hydrops|derrame|erguss|épanchement)",
+                               '\\bépanchement articulaire\\s*:\\s*(aucun|pas de liquide|normal)'],
+                    'pos': [   '\\b(joint )?effusion\\b',
+                               '\\bhydrops\\b',
+                               '\\bderrame\\b',
+                               '\\berguss\\b',
+                               '\\bgelenkerguss\\b',
+                               '\\bfluid in (the )?(joint|suprapatellar)',
+                               '\\bépanchement articulaire\\b',
+                               '\\bvloeistof.*?\\bgewricht\\b',
+                               '\\b(синовит|выпот)\\b']},
+    'Fracture': {   'crosstalk_exclude': [],
+                    'neg': [   '\\b(no|without|sin|geen|kein|pas '
+                               "d[e\\'])(\\s+\\w+){0,3}\\s+(fracture|fraktur|fractura|avulsion)",
+                               '\\bfractures?\\s*:\\s*(aucune|normal|pas de)'],
+                    'pos': [   '\\bfractur(e|a|atie)\\b',
+                               '\\bfraktur\\b',
+                               '\\bcortical (break|disruption|step)\\b',
+                               '\\bavulsion\\b',
+                               '\\bперелом\\b']},
+    'Lateral Meniscus': {   'crosstalk_exclude': [   '\\bmedial meniscus\\b',
+                                                     '\\binnenmeniskus\\b',
+                                                     '\\bmediale meniscus\\b',
+                                                     '\\bmenisco interno\\b'],
+                            'neg': [   '\\blateral meniscus\\b.*?\\b(intact|normal|unremarkable|unauff)',
+                                       '\\b(sin|no).*?\\brotura.*?\\bmenisco (externo|lateral|ext\\b|lat\\b)',
+                                       '\\bmenisco (externo|lateral).*?\\b(intacto|normal|conservado|sin rotura)',
+                                       '\\bménisque latéral\\s*:\\s*normal'],
+                            'pos': [   '\\blateral meniscus\\b.*?\\b(tear|ruptur|scheur|torn|riss)',
+                                       '\\b(rotura|ruptura|desgarro|fisura|lesi[oó]n).*?\\bmenisco '
+                                       '(externo|lateral|ext\\b|lat\\b)',
+                                       '\\bmenisco '
+                                       '(externo|lateral|ext\\b|lat\\b).*?\\b(rotura|ruptura|desgarro|fisura|lesi[oó]n)',
+                                       '\\briss.*?\\b(aussenmeniskus|außenmeniskus|lateralen meniskus)',
+                                       '\\b(aussenmeniskus|außenmeniskus|lateralen meniskus).*?\\b(riss|ruptur)',
+                                       '\\bscheur.*?\\blaterale meniscus',
+                                       '\\bménisque latéral.*?\\b(déchirure|rupture|lésion|fissure)',
+                                       '\\b(разрыв|повреждение).*?\\bлатерального мениска']},
+    'Lateral OA': {   'crosstalk_exclude': ['\\bmedial compartment\\b', '\\bpatellofemoral\\b'],
+                      'neg': [   '\\blateral.*?\\b(no osteoarthritis|no arthrosis|cartilage intact|normal joint space)',
+                                 '\\bcompartiment latéral\\s*:\\s*normal'],
+                      'pos': [   '\\blateral.*?\\b(osteoarthr|arthros|cartilage defect|cartilage '
+                                 'loss|chondromalacia|joint space narrowing|chondropat)',
+                                 '\\b(osteoarthr|arthros|gonartros|condropat[ií]a|chondropat).*?\\b(lateral|femorotibial '
+                                 'lateral|compartimento lateral|compartimento externo)',
+                                 '\\blateralen kompartiment.*?\\b(arthrose|knorpelschaden)',
+                                 '\\bchondropatie.*?\\bcompartiment(s)? latéral']},
+    'MCL': {   'crosstalk_exclude': [   '\\blateral collateral\\b',
+                                        '\\blcl\\b',
+                                        '\\bmpfl\\b',
+                                        '\\bpatellofemoral ligament\\b'],
+               'neg': [   '\\bmcl\\b.*?\\b(intact|normal|unremarkable|conservad|intakt)',
+                          '\\bmedial collateral\\b.*?\\b(intact|normal|unremarkable)',
+                          '\\bsin rotura.*?\\b(lcm|lli)\\b',
+                          '\\bligament collatéral médial\\s*:\\s*normal\\b'],
+               'pos': [   '\\bmcl\\b.*?\\b(tear|sprain|ruptur|torn|distension)',
+                          '\\bmedial collateral\\b.*?\\b(tear|sprain|ruptur|torn)',
+                          '\\b(rotura|ruptura|esguince|distensi[oó]n).*?\\b(del )?(lcm|lli|ligamento colateral '
+                          'medial|ligamento lateral interno)',
+                          '\\b(lcm|lli|ligamento colateral medial).*?\\b(rotura|esguince|distensi[oó]n)',
+                          '\\binnenband.*?\\b(ruptur|riss|scheur)',
+                          '\\bligament collatéral médial.*?\\b(entorse|rupture|lésion)',
+                          '\\b(разрыв|повреждение).*?\\b(бкс|большеберцовой коллатеральной)']},
+    'Medial Meniscus': {   'crosstalk_exclude': [   '\\blateral meniscus\\b',
+                                                    '\\baussenmeniskus\\b',
+                                                    '\\blaterale meniscus\\b',
+                                                    '\\bmenisco externo\\b'],
+                           'neg': [   '\\bmedial meniscus\\b.*?\\b(intact|normal|unremarkable|unauff)',
+                                      '\\b(sin|no).*?\\brotura.*?\\bmenisco (interno|medial|int\\b|med\\b)',
+                                      '\\bmenisco (interno|medial).*?\\b(intacto|normal|conservado|sin rotura)',
+                                      '\\bpas de déchirure méniscale',
+                                      '\\bménisque médial\\s*:\\s*normal'],
+                           'pos': [   '\\bmedial meniscus\\b.*?\\b(tear|ruptur|scheur|torn|riss)',
+                                      '\\b(rotura|ruptura|desgarro|fisura|lesi[oó]n).*?\\bmenisco '
+                                      '(interno|medial|int\\b|med\\b)',
+                                      '\\bmenisco '
+                                      '(interno|medial|int\\b|med\\b).*?\\b(rotura|ruptura|desgarro|fisura|lesi[oó]n)',
+                                      '\\briss.*?\\b(innenmeniskus|medialen meniskus)',
+                                      '\\b(innenmeniskus|medialen meniskus).*?\\b(riss|ruptur)',
+                                      '\\bscheur.*?\\bmediale meniscus',
+                                      '\\bménisque médial.*?\\b(déchirure|rupture|lésion|fissure)',
+                                      '\\b(разрыв|повреждение).*?\\bмедиального мениска']},
+    'Medial OA': {   'crosstalk_exclude': ['\\blateral compartment\\b', '\\bpatellofemoral\\b'],
+                     'neg': [   '\\bmedial.*?\\b(no osteoarthritis|no arthrosis|cartilage intact|normal joint space)',
+                                '\\bcompartiment médial\\s*:\\s*normal'],
+                     'pos': [   '\\bmedial.*?\\b(osteoarthr|arthros|cartilage defect|cartilage '
+                                'loss|chondromalacia|joint space narrowing|chondropat)',
+                                '\\b(osteoarthr|arthros|gonartros|condropat[ií]a|chondropat).*?\\b(medial|femorotibial '
+                                'medial|compartimento medial|compartimento interno)',
+                                '\\bmedialen kompartiment.*?\\b(arthrose|knorpelschaden)',
+                                '\\bchondropatie.*?\\bcompartiment(s)? médial']},
+    'PF OA': {   'crosstalk_exclude': [],
+                 'neg': [   '\\b(patellofemoral|trochle|patella).*?\\b(normal|intact|no arthrosis)',
+                            '\\bcartilago patelar normal'],
+                 'pos': [   '\\b(patellofemoral|trochle|patella).*?\\b(osteoarthr|arthros|chondromalacia|cartilage '
+                            'loss|cartilage defect|facet arthrosis|chondropat)',
+                            '\\b(osteoarthr|arthros|gonartros|condropat[ií]a|chondropat).*?\\b(patel|femoropatel|rotulian|troclea)',
+                            '\\bretropatellar.*?\\b(arthrose|knorpelschaden|chondromalaz)',
+                            '\\bchondropatie rétropatellaire']},
+    'Synovitis': {   'crosstalk_exclude': [],
+                     'neg': ["\\b(no|without|sin|geen|kein|pas d[e\\'])(\\s+\\w+){0,3}\\s+synovit"],
+                     'pos': [   '\\bsynovit(is|e)\\b',
+                                '\\bsynovial (thickening|proliferation|hypertrophy|enhancement)',
+                                '\\bsinovitis\\b',
+                                '\\bsynovialitis\\b']}}
 
 HEDGING_PHRASES = [
     "cannot exclude", "cannot rule out", "suspected", "questionable", "possible", "borderline", 
@@ -554,8 +643,14 @@ HEDGING_PHRASES = [
     "nicht auszuschliessen", "nicht auszuschließen", "fraglich", "verdacht auf"
 ]
 
+NEG_WORDS = [
+    r"\bno\b", r"\bsin\b", r"\bgeen\b", r"\bkein\b", r"\bkeine\b", r"\bkeinen\b",
+    r"\bwithout\b", r"\bnot seen\b", r"\babsent\b", r"\baucun\b", r"\baucune\b",
+    r"\bpas de\b", r"\babsence de\b"
+]
+
 def extract_by_rules(report: str, uid: str) -> dict:
-    """Fast, deterministic Clinical Shield Heuristic Extractor applying identical multi-lingual clinical logic."""
+    """Fast, deterministic Clinical Shield Heuristic Extractor applying verified multilingual clinical logic."""
     rep_low = str(report).lower()
     out = {"StudyInstanceUID": str(uid).strip()}
     
@@ -572,15 +667,22 @@ def extract_by_rules(report: str, uid: str) -> dict:
         for pat in rule["pos"]:
             m = re.search(pat, rep_low, flags=re.IGNORECASE)
             if m:
-                start = max(0, m.start() - 40)
-                end = min(len(rep_low), m.end() + 40)
-                snippet = rep_low[start:end]
+                # Look at 40 chars before the match specifically for negation
+                start_pre = max(0, m.start() - 40)
+                pre_snippet = rep_low[start_pre:m.start()]
                 
-                if any(h in snippet for h in HEDGING_PHRASES):
+                # Check snippet window
+                start_full = max(0, m.start() - 30)
+                end_full = min(len(rep_low), m.end() + 30)
+                full_snippet = rep_low[start_full:end_full]
+                
+                if any(h in full_snippet for h in HEDGING_PHRASES):
                     continue
-                if any(re.search(x, snippet, flags=re.IGNORECASE) for x in rule["crosstalk_exclude"]):
+                if any(re.search(x, full_snippet, flags=re.IGNORECASE) for x in rule["crosstalk_exclude"]):
                     continue
-                if any(neg in snippet for neg in ["no ", "sin ", "geen ", "kein ", "without ", "not seen"]):
+                    
+                # Exact word-boundary negation check BEFORE the positive match
+                if any(re.search(neg, pre_snippet, flags=re.IGNORECASE) for neg in NEG_WORDS):
                     neg_found = True
                     continue
                     

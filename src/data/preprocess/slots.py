@@ -164,6 +164,11 @@ def assign_all(index_df, prefer_2d=True, fs_priority='hdr', csv_fallback=True):
       slot_table: DataFrame indexed by StudyInstanceUID, one column per slot holding a SeriesInstanceUID or None;
       slot_table.attrs['alts']: {slot: {study: [alternate SeriesInstanceUIDs]}} for view-swap augmentation.
     Tie-break is deterministic (series UID), unlike a stable sort over directory order."""
+    if index_df.empty or 'StudyInstanceUID' not in index_df.columns:
+        studies = pd.Index([], name='StudyInstanceUID')
+        tab = pd.DataFrame(index=studies, columns=[n for n, *_ in config.SLOTS], dtype=object)
+        tab.attrs['alts'] = {}
+        return index_df.copy(), tab
     df = index_df.copy()
     df['plane'] = plane_of(df)
     df = annotate(df, fs_priority, csv_fallback)

@@ -139,6 +139,11 @@ def build_index(root, splits=('train', 'test'), workers=None, chunk=1000, cache_
 
 def attach_csv_flags(index_df, root):
     """Left-join the competition CSV flags (plane / fluid / fat-sat) onto the on-disk index."""
+    if index_df.empty or 'SeriesInstanceUID' not in index_df.columns:
+        for c in ('SeriesInstanceUID', 'Anatomical_Plane', 'Fluid_Sensitive', 'Fat_Suppression'):
+            if c not in index_df.columns:
+                index_df[c] = [] if index_df.empty else (np.nan if c != 'Anatomical_Plane' else None)
+        return index_df
     frames = []
     for name in ('train_series.csv', 'test_series.csv'):
         p = os.path.join(root, name)
@@ -170,10 +175,15 @@ def load_index(path):
 def index_report(df):
     """Human-readable data-contract statistics (printed by tools/build_index.py)."""
     rep = {}
+    if df.empty:
+        rep['series'] = 0
+        rep['series_with_error'] = 0
+        rep['empty_series'] = 0
+        return rep
     ok = df[df.err.isna()] if 'err' in df else df
     rep['series'] = len(df)
     rep['series_with_error'] = int(df.err.notna().sum()) if 'err' in df else 0
-    rep['empty_series'] = int((df.n_files == 0).sum())
+    rep['empty_series'] = int((df.n_files == 0).sum()) if 'n_files' in df else 0
     if 'order_method' in ok:
         rep['order_method'] = ok.order_method.value_counts().to_dict()
     if 'orient_code' in ok and 'plane_geo' in ok:

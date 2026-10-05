@@ -90,7 +90,32 @@ def make_study_meta(index_df, train_csv=None, labels_df=None):
     """Study-level table (vendor, scanner model, report language, gold flag, metadata-poor flag) straight from the
     index + train.csv, so the notebook never needs the audit's study_meta.csv."""
     from .text import guess_lang, vendor_of
-    df = index_df[index_df['split'] == 'train'] if 'split' in index_df.columns else index_df
+    if index_df is None or len(index_df) == 0:
+        df = pd.DataFrame()
+    else:
+        df = index_df[index_df['split'] == 'train'] if 'split' in index_df.columns else index_df
+    if df.empty or 'StudyInstanceUID' not in df.columns:
+        if labels_df is not None and 'StudyInstanceUID' in labels_df.columns:
+            studies = pd.Index(labels_df['StudyInstanceUID'].unique(), name='StudyInstanceUID')
+        elif train_csv is not None and 'StudyInstanceUID' in train_csv.columns:
+            studies = pd.Index(train_csv['StudyInstanceUID'].unique(), name='StudyInstanceUID')
+        else:
+            studies = pd.Index([], name='StudyInstanceUID')
+        sm = pd.DataFrame({'vendor': '?', 'model': '?', 'poor': False}, index=studies).reset_index()
+        sm['lang'] = '?'
+        if train_csv is not None and 'Report' in train_csv.columns:
+            lang = train_csv.set_index('StudyInstanceUID')['Report'].map(guess_lang)
+            sm['lang'] = sm['StudyInstanceUID'].map(lang).fillna('?')
+        sm['gold'] = False
+        if labels_df is not None:
+            import src.core.config as config
+            if 'source' in labels_df.columns:
+                has = labels_df['source'] == 'gold'
+            else:
+                has = labels_df[[t for t in config.TARGETS if t in labels_df.columns]].notna().any(axis=1)
+            gold = labels_df.assign(_g=has).set_index('StudyInstanceUID')['_g']
+            sm['gold'] = sm['StudyInstanceUID'].map(gold).fillna(False)
+        return sm
     mode = lambda s: s.dropna().mode().iloc[0] if s.notna().any() else np.nan
     g = df.groupby('StudyInstanceUID')
     studies = pd.Index(df['StudyInstanceUID'].unique(), name='StudyInstanceUID')

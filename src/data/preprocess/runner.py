@@ -72,11 +72,11 @@ def run_index(root, out_dir, splits=('train', 'test'), workers=None, limit=0, pr
     rep['slot_coverage_pct'] = (tab.notna().mean() * 100).round(1).to_dict()
     rep['slots_filled_per_study'] = {int(k): int(v) for k, v in tab.notna().sum(axis=1).value_counts().sort_index().items()}
     rep['laterality'] = qc.laterality_report(sides)
-    rep['header_vs_csv_fatsat_conflicts'] = int(ann['fs_conflict'].sum())
+    rep['header_vs_csv_fatsat_conflicts'] = int(ann['fs_conflict'].sum()) if 'fs_conflict' in ann else 0
     pix.save_index(ann, os.path.join(out_dir, 'index.pkl'))
     pd.to_pickle(tab, os.path.join(out_dir, 'slots.pkl'))
     json.dump(sides, open(os.path.join(out_dir, 'sides.json'), 'w'))
-    ann.drop(columns=['ordered_files', 'positions']).to_csv(os.path.join(out_dir, 'series_table.csv.gz'), index=False)
+    ann.drop(columns=['ordered_files', 'positions'], errors='ignore').to_csv(os.path.join(out_dir, 'series_table.csv.gz'), index=False)
     json.dump(rep, open(os.path.join(out_dir, 'report.json'), 'w'), indent=1, default=str)
     lat = rep['laterality']
     print(json.dumps(rep, indent=1, default=str))
@@ -116,7 +116,7 @@ def run_cache(index, split, prefix, preset='v2', workers=None, limit_studies=0, 
         studies = studies[:limit_studies]
     need = estimate_cache_gb(len(studies), cfg)
     print(f'{len(studies)} studies -> cache {need:.1f} GB  (preset={cfg.name}, D={cfg.stack_depth}, {cfg.img_size}px) at {prefix}')
-    sub = ann[ann['StudyInstanceUID'].isin(set(studies))]
+    sub = ann[ann['StudyInstanceUID'].isin(set(studies))] if ('StudyInstanceUID' in ann.columns) else ann
     records = pipeline.index_to_records(sub)
     slot_rows = {s: tab.loc[s].to_dict() for s in studies if s in tab.index}
     cache, stats = pcache.build_cache(prefix, studies, slot_rows, records, sides, cfg, workers, resume=not fresh)

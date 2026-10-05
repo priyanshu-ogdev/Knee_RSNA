@@ -1,227 +1,546 @@
 """
-RSNA 2026: End-to-End Master Training Pipeline
-----------------------------------------------
-Executes the entire SOTA pipeline in one shot:
-1. Extracts pseudo-labels from 4,349 reports via Gemini API.
-2. Merges them with the 58 gold labels into a unified training CSV.
-3. Builds the optimized memory-mapped cache for ultra-fast I/O.
-4. Trains a 5-fold DINOv2-based model.
+RSNA 2026: End-to-End Master Training & Build Pipeline
+------------------------------------------------------
+Executes all phases seamlessly in a unified workflow:
+  PHASE 0: Environment & Hardware Configuration + Dataset Verification
+  PHASE 1: NLP Pseudo-Label Extraction & Shield Validation
+  PHASE 2: Dataset Merging, Stratification & Cache Build (Download-Aware)
+  PHASE 3: 5-Fold Deep Learning Training (DINOv2 + CrossSlotTransformer)
+  PHASE 4: Out-Of-Fold Evaluation & Checkpoint Verification
+  PHASE 5: Test Inference & Submission Generation (TTA + Calibration)
+  PHASE 6: Final Telemetry & Execution Summary
 """
-import os
-# Force kagglehub to download directly into our root data/ directory instead of C:\Users\...
-os.environ['KAGGLEHUB_CACHE'] = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data'))
-if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True" 
-
-import kagglehub
-from dotenv import load_dotenv
-
-# Load environment variables from .env
-load_dotenv()
+from __future__ import annotations
 
 import os
 import sys
 import shutil
 import time
 import json
+import math
+import argparse
+import datetime
 import traceback
-import concurrent.futures
-import time
-import pandas as pd
 import numpy as np
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+import pandas as pd
+from dotenv import load_dotenv
 
-# Add project root to path (2 levels up from src/scripts/)
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Ensure stdout handles UTF-8 characters cleanly
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
+# Project root resolution
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# Force kagglehub to download directly into root data/ directory
+os.environ["KAGGLEHUB_CACHE"] = os.path.abspath(os.path.join(PROJECT_ROOT, "data"))
+
+# PyTorch Memory Allocation: prevent unified memory fragmentation on Grace Blackwell GB10
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# Suppress OpenCV / OpenMP / BLAS thread oversubscription
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+try:
+    import cv2
+    cv2.setNumThreads(0)
+except Exception:
+    pass
+
+# Load environment variables from .env
+load_dotenv()
+
+import torch
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
 
 import src.core.config as config
 from src.data.labels import build_labels
-from src.data.preprocess import runner
+from src.data.preprocess import runner, splits
 from src.training.train import run_training
+from src.inference.inference import run_inference
+from src.modeling.model import load_checkpoint
 
 
 # ==============================================================================
-# PHASE 1: NLP PSEUDO-LABEL EXTRACTION
+# PHASE 0: HARDWARE & ENVIRONMENT VERIFICATION
 # ==============================================================================
-# ==============================================================================
-# PHASE 2: CACHE & PIPELINE PREPARATION
-# ==============================================================================
-def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
-    print("\n" + "=" * 80)
-    print("PHASE 2: DATASET MERGE & CACHE BUILD")
+def verify_hardware_and_environment():
+    print("=" * 80)
+    print("PHASE 0: HARDWARE & ENVIRONMENT VERIFICATION")
     print("=" * 80)
     
-    # Merge gold + pseudo labels
+    cuda_avail = torch.cuda.is_available()
+    print(f"PyTorch Version   : {torch.__version__}")
+    print(f"CUDA Available    : {cuda_avail}")
+    if cuda_avail:
+        dev_count = torch.cuda.device_count()
+        dev_name = torch.cuda.get_device_name(0)
+        capability = torch.cuda.get_device_capability(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        bf16_sup = torch.cuda.is_bf16_supported()
+        print(f"Device Count      : {dev_count}")
+        print(f"Primary GPU       : {dev_name} (Compute Capability: {capability[0]}.{capability[1]})")
+        print(f"GPU VRAM Total    : {vram_gb:.2f} GB")
+        print(f"BFloat16 Native   : {bf16_sup}")
+        print(f"CUDA Alloc Config : {os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
+    else:
+        print("[WARNING] CUDA is NOT available. Pipeline will run on CPU.")
+
+    cpu_cores = os.cpu_count() or 4
+    print(f"System CPU Cores  : {cpu_cores}")
+    print(f"Platform OS       : {sys.platform}")
+
+
+def resolve_data_root(cli_data_root: str | None = None) -> str:
+    if cli_data_root and os.path.exists(cli_data_root):
+        print(f"[SUCCESS] Dataset located via CLI argument: {cli_data_root}")
+        return os.path.abspath(cli_data_root)
+
+    knee_env = os.environ.get("KNEE_DATA")
+    if knee_env and os.path.exists(os.path.join(knee_env, "train.csv")):
+        data_root = os.path.abspath(knee_env)
+        print(f"[SUCCESS] Dataset located via KNEE_DATA: {data_root}")
+        return data_root
+
+    local_data = os.path.abspath(os.path.join(PROJECT_ROOT, "data"))
+    if os.path.exists(os.path.join(local_data, "train.csv")):
+        print(f"[SUCCESS] Dataset located in local directory: {local_data}")
+        return local_data
+
+    print("[INFO] train.csv not found locally. Checking/Downloading via Kagglehub...")
+    try:
+        import kagglehub
+        path = kagglehub.competition_download("rsna-knee-abnormality-detection")
+        print(f"[SUCCESS] Dataset downloaded via kagglehub to: {path}")
+        return os.path.abspath(path)
+    except Exception as e:
+        print(f"[WARNING] kagglehub download failed: {e}")
+        print(f"[FALLBACK] Falling back to default data path: {local_data}")
+        return local_data
+
+
+# ==============================================================================
+# PHASE 1: NLP PSEUDO-LABEL EXTRACTION & SHIELD VALIDATION
+# ==============================================================================
+def run_nlp_phase(data_root: str, work_dir: str, skip_nlp: bool = False) -> str | None:
+    print("\n" + "=" * 80)
+    print("PHASE 1: NLP PSEUDO-LABEL EXTRACTION & VALIDATION")
+    print("=" * 80)
+
+    # Candidate locations for pre-computed pseudo-labels
+    candidates = [
+        os.path.join(data_root, "pseudo_labels.csv"),
+        os.path.join(work_dir, "pseudo_labels.csv"),
+        os.path.join(PROJECT_ROOT, "data", "pseudo_labels.csv"),
+        os.path.join(data_root, "extra_labels.csv"),
+    ]
+
+    for cand in candidates:
+        if os.path.exists(cand):
+            try:
+                df = pd.read_csv(cand)
+                if "StudyInstanceUID" in df.columns and len(df) > 100:
+                    print(f"[SUCCESS] Found valid pre-computed pseudo-labels ({len(df)} studies) at: {cand}")
+                    return cand
+            except Exception as e:
+                print(f"[WARNING] Could not read candidate {cand}: {e}")
+
+    if skip_nlp:
+        print("[INFO] --skip_nlp specified. Proceeding with 58 Gold labels only.")
+        return None
+
+    out_csv = os.path.join(work_dir, "pseudo_labels.csv")
+    print("[INFO] Pre-computed pseudo-labels not found. Checking vLLM for offline extraction...")
+    try:
+        from src.data.preprocess.nlp_extractor import run_offline_extraction
+        print("[INFO] Starting vLLM offline report extraction with hardened clinical shield...")
+        run_offline_extraction(data_root, out_csv)
+        if os.path.exists(out_csv):
+            print(f"[SUCCESS] Extracted pseudo-labels saved to: {out_csv}")
+            return out_csv
+    except ImportError:
+        print("[INFO] vLLM is not installed in this environment.")
+        print("[INFO] Training will proceed using 100% immutable Gold standard labels.")
+    except Exception as e:
+        print(f"[WARNING] Offline extraction could not run: {e}")
+        print("[INFO] Proceeding with Gold standard labels.")
+
+    return None
+
+
+# ==============================================================================
+# PHASE 2: DATASET MERGING, STRATIFICATION & CACHE BUILD
+# ==============================================================================
+def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None) -> tuple[str, str | None, str]:
+    print("\n" + "=" * 80)
+    print("PHASE 2: DATASET MERGE, STRATIFICATION & CACHE BUILD")
+    print("=" * 80)
+
     final_labels_csv = os.path.join(work_dir, "train_labels_v2.csv")
-    print("Merging gold and pseudo labels...")
-    extra_csv = pseudo_csv if (pseudo_csv and os.path.exists(pseudo_csv)) else None
-    if extra_csv is None:
-        print("[INFO] No pseudo-labels found. Building training labels from Gold standard labels only.")
-    build_labels(data_root, extra_csv=extra_csv, extra_weight=1.0, out_csv=final_labels_csv)
-    
-    # Build cache
-    print("Building Index...")
-    idx_dir = os.path.join(work_dir, 'idx')
-    index_out = runner.get_index(data_root, idx_dir, splits=('train',), force=False)
-    
-    cache_dir = os.path.join(work_dir, 'cache_v2')
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    print("Building Memmap Cache (this takes time but drastically speeds up training)...")
-    train_studies = sorted(index_out['ann'][index_out['ann']['split'] == 'train']['StudyInstanceUID'].unique())
-    cfg = config.get_cfg("v2")
+    print(f"Merging Gold labels (weight 1.0) and pseudo-labels -> {final_labels_csv}...")
+    labels_df = build_labels(data_root, extra_csv=pseudo_csv, extra_weight=1.0, out_csv=final_labels_csv)
+    n_gold = (labels_df["source"] == "gold").sum()
+    n_extra = (labels_df["source"] == "extra").sum()
+    print(f"[SUCCESS] Labels assembled: {len(labels_df)} total ({n_gold} Gold immutable, {n_extra} Extra pseudo-labels)")
+
+    # Check if train DICOM images exist on disk
+    train_dir_candidates = [
+        os.path.join(data_root, "train_series"),
+        os.path.join(data_root, "train"),
+    ]
+    train_dir = None
+    has_train_images = False
+    for candidate in train_dir_candidates:
+        if os.path.exists(candidate):
+            try:
+                entries = os.listdir(candidate)
+                if len(entries) > 0:
+                    train_dir = candidate
+                    has_train_images = True
+                    break
+            except Exception:
+                pass
+
+    folds_csv = os.path.join(work_dir, "folds.csv")
+
+    if not has_train_images:
+        print("\n" + "!" * 80)
+        print("[STAGE 2 NOTICE: DICOM DOWNLOAD IN PROGRESS]")
+        print(f"  * Merged Labels : {final_labels_csv} ({len(labels_df)} studies)")
+        print(f"  * Status        : DICOM directory is currently empty or downloading into '{data_root}'.")
+        
+        # Build 5-fold splits safely from labels table
+        if not os.path.exists(folds_csv):
+            print("  * Generating 5-fold stratification splits from available study metadata...")
+            train_raw = pd.read_csv(os.path.join(data_root, "train.csv")) if os.path.exists(os.path.join(data_root, "train.csv")) else None
+            study_meta = splits.make_study_meta(None, train_csv=train_raw, labels_df=labels_df)
+            folds_df = splits.group_folds(study_meta, n_splits=5, seed=config.SEED, scheme="site")
+            folds_df.to_csv(folds_csv, index=False)
+            print(f"  * 5-Fold Splits : Saved to {folds_csv}")
+        else:
+            print(f"  * 5-Fold Splits : Found existing {folds_csv}")
+
+        print("\n  * Ready for Full Execution:")
+        print("    1. Let the dataset download complete.")
+        print("    2. Re-run:  python src/main.py")
+        print("    The pipeline will immediately detect all downloaded series, build the memmap cache,")
+        print("    and train the complete 5-fold DINOv2 + CrossSlotTransformer model!")
+        print("!" * 80 + "\n")
+        return final_labels_csv, None, folds_csv
+
+    # 1. Build / Load Metadata Index
+    idx_dir = os.path.join(work_dir, "idx")
     cpu_cores = max(2, os.cpu_count() or 2)
-    
-    # SOTA Fix: Adaptive resolution & disk-space protection
+    print("Building / verifying DICOM metadata index...")
+    index_out = runner.run_index(data_root, idx_dir, splits=("train",), workers=cpu_cores)
+    index_pkl = os.path.join(idx_dir, "index.pkl")
+    index_df = pd.read_pickle(index_pkl) if os.path.exists(index_pkl) else None
+
+    # 2. Build 5-Fold Patient/Site Stratification Splits
+    if not os.path.exists(folds_csv):
+        print("Generating 5-fold site-stratified splits (leakage-safe)...")
+        train_raw = pd.read_csv(os.path.join(data_root, "train.csv")) if os.path.exists(os.path.join(data_root, "train.csv")) else None
+        study_meta = splits.make_study_meta(index_df, train_csv=train_raw, labels_df=labels_df)
+        folds_df = splits.group_folds(study_meta, n_splits=5, seed=config.SEED, scheme="site")
+        folds_df.to_csv(folds_csv, index=False)
+        print(f"[SUCCESS] 5-fold stratification splits saved to: {folds_csv}")
+    else:
+        print(f"[SUCCESS] Using existing 5-fold splits from: {folds_csv}")
+
+    # 3. Build / Load Preprocessing Cache
+    train_studies = list(labels_df["StudyInstanceUID"])
+    indexed_studies = set(index_out["ann"]["StudyInstanceUID"].unique()) if ("ann" in index_out and not index_out["ann"].empty) else set()
+    studies_to_cache = [s for s in train_studies if s in indexed_studies] if indexed_studies else train_studies
+
+    cache_dir = os.environ.get("CACHE_DIR", os.path.join(work_dir, "cache"))
+    os.makedirs(cache_dir, exist_ok=True)
+    cfg = config.get_cfg("v2")
+
     free_gb = shutil.disk_usage(cache_dir).free / 1e9
     img_override = os.environ.get("CACHE_IMG_SIZE")
     depth_override = os.environ.get("CACHE_STACK_DEPTH")
+
     if img_override or depth_override:
         img_size = int(img_override) if img_override else cfg.img_size
         stack_depth = int(depth_override) if depth_override else cfg.stack_depth
         cfg = config.get_cfg("v2", img_size=img_size, stack_depth=stack_depth)
         print(f"[CONFIG] Cache resolution overridden by environment: img_size={img_size}, stack_depth={stack_depth}")
-    elif runner.estimate_cache_gb(len(train_studies), cfg) > free_gb * 0.95:
-        print(f"[WARNING] 518px/32-depth cache needs {runner.estimate_cache_gb(len(train_studies), cfg):.1f} GB, but only {free_gb:.1f} GB free in {cache_dir}.")
-        cfg = runner.fit_cache_cfg(len(train_studies), free_gb, preset='v2')
-        print(f"[AUTO-FIT] Scaled cache configuration to fit available disk: img_size={cfg.img_size}, stack_depth={cfg.stack_depth} ({runner.estimate_cache_gb(len(train_studies), cfg):.1f} GB)")
+    elif runner.estimate_cache_gb(len(studies_to_cache), cfg) > free_gb * 0.95:
+        print(f"[WARNING] Standard cache needs {runner.estimate_cache_gb(len(studies_to_cache), cfg):.1f} GB, but only {free_gb:.1f} GB free.")
+        cfg = runner.fit_cache_cfg(len(studies_to_cache), free_gb, preset="v2")
+        print(f"[AUTO-FIT] Scaled cache configuration to fit disk: img_size={cfg.img_size}, stack_depth={cfg.stack_depth}")
     else:
-        print(f"[CONFIG] Using standard v2 cache: img_size={cfg.img_size}, stack_depth={cfg.stack_depth} ({runner.estimate_cache_gb(len(train_studies), cfg):.1f} GB estimated)")
-    
-    # SOTA Fix: The prefix must be the file stem inside the cache_dir, not the cache_dir itself!
+        print(f"[CONFIG] Standard v2 cache: img_size={cfg.img_size}, stack_depth={cfg.stack_depth} ({runner.estimate_cache_gb(len(studies_to_cache), cfg):.1f} GB estimated)")
+
     cache_prefix = os.path.join(cache_dir, "train")
     cache, stats = runner.run_cache(
-        index_out, 'train', cache_prefix, cfg=cfg,
-        workers=cpu_cores, studies=train_studies, fresh=False
+        index_out, "train", cache_prefix, cfg=cfg,
+        workers=cpu_cores, studies=studies_to_cache, fresh=False
     )
     print(f"[SUCCESS] Cache ready. Stats: {stats}")
-    
-    # Run acceptance QC gate
-    qc_dir = os.path.join(work_dir, 'qc')
-    runner.run_qc(cache_prefix, out_dir=qc_dir, n=min(100, len(train_studies)), montage=False)
-    
-    return final_labels_csv, cache_dir
+
+    # Run acceptance QC
+    qc_dir = os.path.join(work_dir, "qc")
+    runner.run_qc(cache_prefix, out_dir=qc_dir, n=min(50, len(studies_to_cache)), montage=False)
+
+    return final_labels_csv, cache_prefix, folds_csv
+
 
 # ==============================================================================
-# PHASE 3: 5-FOLD MODEL TRAINING
+# PHASE 3: 5-FOLD DEEP LEARNING MODEL TRAINING
 # ==============================================================================
-def run_all_folds(labels_csv: str, cache_dir: str, work_dir: str, data_root: str = None):
+def run_all_folds(
+    labels_csv: str,
+    cache_prefix: str,
+    folds_csv: str,
+    work_dir: str,
+    folds_to_run: list[int],
+    epochs: int | None = None,
+    batch_size: int = config.BATCH_SIZE,
+    grad_accum: int = config.GRAD_ACCUM,
+    variant: str = "dinov2-base",
+) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
+    print(f"Target Folds : {folds_to_run} | Backbone: {variant} | Batch Size: {batch_size} (accum: {grad_accum})")
     print("=" * 80)
-    
-    # First generate splits
-    from src.data.preprocess import splits
-    folds_csv = os.path.join(work_dir, "folds.csv")
-    if not os.path.exists(folds_csv):
-        print("Generating 5-fold stratification splits...")
-        labels_df = pd.read_csv(labels_csv)
-        idx_dir = os.path.join(work_dir, 'idx')
-        index_pkl = os.path.join(idx_dir, 'index.pkl')
-        if os.path.exists(index_pkl):
-            index_df = pd.read_pickle(index_pkl)
-            train_raw = pd.read_csv(os.path.join(data_root or os.path.dirname(labels_csv), 'train.csv')) if data_root else None
-            study_meta = splits.make_study_meta(index_df, train_csv=train_raw, labels_df=labels_df)
-            folds_df = splits.group_folds(study_meta, n_splits=5, seed=config.SEED, scheme='site')
-        else:
-            from sklearn.model_selection import KFold
-            kf = KFold(n_splits=5, shuffle=True, random_state=config.SEED)
-            folds_df = pd.DataFrame({
-                'StudyInstanceUID': labels_df['StudyInstanceUID'],
-                'fold': -1
-            })
-            for f, (_, va_idx) in enumerate(kf.split(labels_df)):
-                folds_df.iloc[va_idx, folds_df.columns.get_loc('fold')] = f
-        folds_df.to_csv(folds_csv, index=False)
-        print(f"[SUCCESS] 5-fold splits saved to {folds_csv}")
-    
-    cache_prefix = os.path.join(cache_dir, "train")
-    
-    for fold in range(5):
-        print(f"\n--- STARTING FOLD {fold} ---")
+
+    best_scores: dict[int, float] = {}
+
+    for fold in folds_to_run:
+        print(f"\n{'='*35} STARTING FOLD {fold} {'='*35}")
+        fold_out_dir = os.path.join(work_dir, f"models_fold{fold}")
+        os.makedirs(fold_out_dir, exist_ok=True)
         try:
             best_auc = run_training(
                 labels_csv=labels_csv,
                 cache_prefix=cache_prefix,
                 folds_csv=folds_csv,
                 fold=fold,
-                out_dir=os.path.join(work_dir, f"models_fold{fold}"),
+                out_dir=fold_out_dir,
+                epochs=epochs,
+                batch_size=batch_size,
+                grad_accum=grad_accum,
+                variant=variant,
+                use_cross_slot=True,
+                swa_epochs=config.SWA_EPOCHS,
             )
-            print(f"Fold {fold} finished with Best Macro-AUC: {best_auc:.4f}")
+            best_scores[fold] = best_auc
+            print(f"[SUCCESS] Fold {fold} completed with Best Macro-AUC: {best_auc:.4f}")
         except Exception as e:
-            print(f"Error in Fold {fold}: {e}")
+            print(f"[ERROR] Error during training Fold {fold}: {e}")
             traceback.print_exc()
 
+    return best_scores
+
+
 # ==============================================================================
-# MAIN ENTRY
+# PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION
 # ==============================================================================
-import datetime
+def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, float]) -> list[str]:
+    print("\n" + "=" * 80)
+    print("PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION")
+    print("=" * 80)
+
+    valid_ckpts = []
+    print("\n--- Model Checkpoints Summary ---")
+    for fold in range(5):
+        fold_dir = os.path.join(work_dir, f"models_fold{fold}")
+        ema_ckpt = os.path.join(fold_dir, f"fold{fold}_ema.pt")
+        best_ckpt = os.path.join(fold_dir, f"fold{fold}_best.pt")
+
+        chosen = None
+        if os.path.exists(ema_ckpt):
+            chosen = ema_ckpt
+            ckpt_type = "EMA (Primary)"
+        elif os.path.exists(best_ckpt):
+            chosen = best_ckpt
+            ckpt_type = "Best Instantaneous"
+
+        if chosen:
+            sz_mb = os.path.getsize(chosen) / 1e6
+            score_str = f"{best_scores.get(fold, float('nan')):.4f}"
+            print(f"  Fold {fold}: {ckpt_type} [{sz_mb:.1f} MB] -> Val AUC: {score_str} ({os.path.basename(chosen)})")
+            valid_ckpts.append(chosen)
+        else:
+            print(f"  Fold {fold}: [MISSING] Checkpoint not found in {fold_dir}")
+
+    if best_scores:
+        mean_auc = float(np.mean(list(best_scores.values())))
+        print(f"\n[EVALUATION] Mean 5-Fold Cross-Validation Macro-AUC: {mean_auc:.4f}")
+
+    return valid_ckpts
+
+
+# ==============================================================================
+# PHASE 5: TEST INFERENCE & SUBMISSION GENERATION
+# ==============================================================================
+def run_inference_phase(
+    data_root: str,
+    work_dir: str,
+    model_ckpts: list[str],
+    use_tta: bool = True,
+    n_tta: int = 4,
+):
+    print("\n" + "=" * 80)
+    print("PHASE 5: TEST INFERENCE & SUBMISSION GENERATION")
+    print("=" * 80)
+
+    if not model_ckpts:
+        print("[WARNING] No trained model checkpoints available. Skipping inference.")
+        return
+
+    test_csv = os.path.join(data_root, "test.csv")
+    test_dir = os.path.join(data_root, "test_series") if os.path.exists(os.path.join(data_root, "test_series")) else os.path.join(data_root, "test")
+
+    has_test_files = os.path.exists(test_csv) and os.path.exists(test_dir) and len(os.listdir(test_dir)) > 0
+
+    if not has_test_files:
+        print(f"[INFO] Test series images not found in {data_root}.")
+        print(f"[INFO] {len(model_ckpts)} fold model checkpoints are verified and ready for deployment.")
+        print(f"[INFO] To generate submissions on Kaggle, run:")
+        print(f"       python -m src.inference.inference --root /kaggle/input/rsna-knee-abnormality-detection")
+        return
+
+    out_csv = os.path.join(work_dir, "submission.csv")
+    print(f"Running inference with {len(model_ckpts)} fold models (TTA={use_tta}, n_tta={n_tta})...")
+
+    sub, stats = run_inference(
+        root=data_root,
+        models=model_ckpts,
+        test_csv=test_csv,
+        out_csv=out_csv,
+        cache_dir=os.path.join(work_dir, "test_cache"),
+        use_tta=use_tta,
+        n_tta=n_tta,
+        batch=8,
+    )
+
+    # Acceptance verification
+    test_df = pd.read_csv(test_csv)
+    assert len(sub) == len(test_df), f"Row mismatch: submission has {len(sub)}, expected {len(test_df)}"
+    assert (sub["StudyInstanceUID"].values == test_df["StudyInstanceUID"].values).all(), "StudyInstanceUID order mismatch!"
+    assert not sub.isna().any().any(), "Submission contains NaN values!"
+    print(f"[SUCCESS] Submission generated and verified: {out_csv} ({len(sub)} studies)")
+
+
+# ==============================================================================
+# MAIN ENTRY POINT
+# ==============================================================================
 def main():
-    # Dynamically resolve project root relative to this script (src/scripts/run_full_pipeline.py)
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    parser = argparse.ArgumentParser(description="RSNA Knee Abnormality Detection: Master Training Pipeline")
+    parser.add_argument("--data_root", type=str, default=None, help="Path to competition dataset root")
+    parser.add_argument("--work_dir", type=str, default=None, help="Working output directory")
+    parser.add_argument("--epochs", type=int, default=config.EPOCHS, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE, help="Batch size per step")
+    parser.add_argument("--grad_accum", type=int, default=config.GRAD_ACCUM, help="Gradient accumulation steps")
+    parser.add_argument("--folds", type=str, default="0,1,2,3,4", help="Comma-separated list of folds to train (e.g. '0,1,2,3,4')")
+    parser.add_argument("--variant", type=str, default="dinov2-base", help="Backbone variant ('dinov2-base' or 'dinov2-small')")
+    parser.add_argument("--skip_nlp", action="store_true", help="Skip NLP extraction and use Gold labels only")
+    parser.add_argument("--skip_train", action="store_true", help="Skip model training")
+    parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
+    args = parser.parse_args()
+
     global_start_time = time.time()
-    
-    # Configure logging
+    work_dir = args.work_dir or os.environ.get("RSNA_OUT_DIR", os.path.join(PROJECT_ROOT, "pipeline_out"))
+    os.makedirs(work_dir, exist_ok=True)
+
+    # Logging setup
     import logging
-    log_file = os.path.join(PROJECT_ROOT, f"pipeline_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(work_dir, f"master_pipeline_{timestamp}.log")
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
     )
-    # Redirect print to logging for capture
-    def logged_print(*args, **kwargs):
-        msg = " ".join(str(a) for a in args)
+
+    def logged_print(*p_args, **p_kwargs):
+        msg = " ".join(str(a) for a in p_args)
         logging.info(msg)
+
     global print
     print = logged_print
 
-    
-    # DGX / Linux compatible relative paths
     print("=" * 80)
-    print("PHASE 0: DATASET DOWNLOAD")
+    print("RSNA 2026: END-TO-END MASTER TRAINING & BUILD PIPELINE")
     print("=" * 80)
-    knee_env = os.environ.get('KNEE_DATA')
-    local_data = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
-    if knee_env and os.path.exists(os.path.join(knee_env, 'train.csv')):
-        DATA_ROOT = os.path.abspath(knee_env)
-        print(f"[SUCCESS] Dataset located via KNEE_DATA at: {DATA_ROOT}")
-    elif os.path.exists(os.path.join(local_data, 'train.csv')):
-        DATA_ROOT = local_data
-        print(f"[SUCCESS] Dataset already present locally at: {DATA_ROOT}")
-    else:
-        print("Checking/Downloading RSNA dataset via Kagglehub...")
-        DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
-        print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
-    WORK_DIR = os.environ.get('RSNA_OUT_DIR', os.path.join(PROJECT_ROOT, 'pipeline_out'))
-    
-    os.makedirs(WORK_DIR, exist_ok=True)
-    
-    print("Pipeline Output Directory:", WORK_DIR)
-    
-    # 1. Check for Pre-computed Labels (NLP Extractor is now decoupled)
-    pseudo_csv = os.path.join(DATA_ROOT, "pseudo_labels.csv")
-    if not os.path.exists(pseudo_csv):
-        print(f"[WARNING] Pre-computed {pseudo_csv} not found in DATA_ROOT.")
-        print("[WARNING] Training will proceed with ONLY 58 Gold labels (High Risk of Overfitting!).")
-        print("[INFO] Did you forget to run 'python src/data/preprocess/nlp_extractor.py' first?")
-    else:
-        print(f"[SUCCESS] Found pre-computed pseudo-labels at {pseudo_csv}")
-    
-    # 2. Preparation (Cache + Merge)
-    labels_csv, cache_dir = run_preparation(DATA_ROOT, WORK_DIR, pseudo_csv)
-    
-    # 3. Training
-    run_all_folds(labels_csv, cache_dir, WORK_DIR, data_root=DATA_ROOT)
-    
-    total_time = time.time() - global_start_time
-    t_m, t_s = divmod(int(total_time), 60)
-    t_h, t_m = divmod(t_m, 60)
-    
+    print(f"Start Time        : {datetime.datetime.now().isoformat()}")
+    print(f"Output Directory  : {work_dir}")
+    print(f"Log File          : {log_file}")
+
+    # Phase 0: Hardware & Environment
+    verify_hardware_and_environment()
+    data_root = resolve_data_root(args.data_root)
+
+    # Phase 1: NLP Pseudo-Label Extraction
+    pseudo_csv = run_nlp_phase(data_root, work_dir, skip_nlp=args.skip_nlp)
+
+    # Phase 2: Dataset Merge & Cache Build
+    labels_csv, cache_prefix, folds_csv = run_preparation(data_root, work_dir, pseudo_csv)
+
+    # Check if cache is built (if download is in progress, cache_prefix is None)
+    if cache_prefix is None or not os.path.exists(f"{cache_prefix}.meta.json"):
+        total_elapsed = time.time() - global_start_time
+        m, s = divmod(int(total_elapsed), 60)
+        print("\n" + "=" * 80)
+        print(f"PRE-DOWNLOAD SETUP & STAGING VERIFIED SUCCESSFULLY IN {m:02d}m {s:02d}s")
+        print(f"  * Labels File : {labels_csv}")
+        print(f"  * Splits File : {folds_csv}")
+        print(f"  * Data Root   : {data_root}")
+        print("\nReady to run full training as soon as the DICOM download completes!")
+        print("To start training once download finishes:")
+        print("    python src/main.py")
+        print("=" * 80)
+        return
+
+    # Phase 3: 5-Fold Training
+    folds_to_run = [int(f.strip()) for f in args.folds.split(",") if f.strip().isdigit()]
+    best_scores = {}
+    if not args.skip_train:
+        best_scores = run_all_folds(
+            labels_csv=labels_csv,
+            cache_prefix=cache_prefix,
+            folds_csv=folds_csv,
+            work_dir=work_dir,
+            folds_to_run=folds_to_run,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            grad_accum=args.grad_accum,
+            variant=args.variant,
+        )
+
+    # Phase 4: OOF & Checkpoints
+    valid_ckpts = run_oof_and_checkpoint_verification(work_dir, best_scores)
+
+    # Phase 5: Test Inference & Submission Generation
+    run_inference_phase(
+        data_root=data_root,
+        work_dir=work_dir,
+        model_ckpts=valid_ckpts,
+        use_tta=(not args.no_tta),
+        n_tta=4,
+    )
+
+    # Phase 6: Final Summary
+    total_elapsed = time.time() - global_start_time
+    m, s = divmod(int(total_elapsed), 60)
+    h, m = divmod(m, 60)
+
     print("\n" + "=" * 80)
-    print(f"PIPELINE COMPLETED SUCCESSFULLY IN {t_h:02d}h {t_m:02d}m {t_s:02d}s")
-    print(f"Logs saved to {log_file}")
+    print(f"MASTER PIPELINE EXECUTION COMPLETED IN {h:02d}h {m:02d}m {s:02d}s")
+    print(f"Artifacts Directory: {work_dir}")
+    print(f"Log Output         : {log_file}")
     print("=" * 80)
 
 

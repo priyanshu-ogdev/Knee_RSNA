@@ -17,6 +17,8 @@ def index_to_records(df):
 
 def study_sides(index_df):
     """{study: laterality dict} using the DICOM tag first, patient-x geometry second."""
+    if index_df.empty or 'StudyInstanceUID' not in index_df.columns:
+        return {}
     out = {}
     cols = [c for c in ('StudyInstanceUID', 'Laterality', 'ImageLaterality', 'center_x') if c in index_df.columns]
     for st, g in index_df[cols].groupby('StudyInstanceUID', sort=False):

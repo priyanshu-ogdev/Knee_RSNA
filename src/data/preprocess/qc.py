@@ -44,8 +44,11 @@ def cache_sanity(cache, n_sample=200, seed=0):
 
 
 def laterality_report(sides):
+    if not sides:
+        return dict(studies=0, by_side={}, by_source={}, tag_geometry_disagree=0, unresolved_frac=0.0)
     df = pd.DataFrame(sides).T
-    rep = dict(studies=len(df), by_side=df['side'].value_counts().to_dict(), by_source=df['source'].value_counts().to_dict(),
-               tag_geometry_disagree=int(df['disagree'].sum()))
-    rep['unresolved_frac'] = float((df['side'] == 'U').mean())
+    rep = dict(studies=len(df), by_side=df['side'].value_counts().to_dict() if 'side' in df else {},
+               by_source=df['source'].value_counts().to_dict() if 'source' in df else {},
+               tag_geometry_disagree=int(df['disagree'].sum()) if 'disagree' in df else 0)
+    rep['unresolved_frac'] = float((df['side'] == 'U').mean()) if 'side' in df else 0.0
     return rep

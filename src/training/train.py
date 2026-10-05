@@ -60,7 +60,7 @@ import src.core.config as config
 from src.modeling.losses import build_loss
 from src.modeling.model import build_model
 from src.data.dataset import RSNADataset
-from .preprocess.cache import cfg_of as cache_cfg
+from src.data.preprocess.cache import cfg_of as cache_cfg
 
 
 # ─────────────────────────────────────── autocast helper ─────────────────────

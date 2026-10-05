@@ -29,3 +29,6 @@ scikit-learn
 kagglehub
 python-dotenv
 tqdm
+
+pydicom
+tenacity

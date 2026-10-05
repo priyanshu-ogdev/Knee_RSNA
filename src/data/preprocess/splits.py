@@ -92,7 +92,7 @@ def make_study_meta(index_df, train_csv=None, labels_df=None):
         lang = train_csv.set_index('StudyInstanceUID')['Report'].map(guess_lang)
         sm['lang'] = sm['StudyInstanceUID'].map(lang).fillna('?')
     if labels_df is not None:
-        from .. import config
+        import src.core.config as config
         if 'source' in labels_df.columns:                       # build_labels() marks gold / extra / none
             has = labels_df['source'] == 'gold'
         else:

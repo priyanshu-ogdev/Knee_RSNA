@@ -31,8 +31,6 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 # Add project root to path (2 levels up from src/scripts/)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from google import genai
-from google.genai import types
 
 import src.core.config as config
 from src.data.labels import build_labels
@@ -54,6 +52,8 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     # Merge gold + pseudo labels
     final_labels_csv = os.path.join(work_dir, "train_labels_v2.csv")
     print("Merging gold and pseudo labels...")
+    if not os.path.exists(pseudo_csv):
+        raise FileNotFoundError(f"[FATAL] Pseudo-labels not found at {pseudo_csv}. You MUST run nlp_extractor.py first!")
     build_labels(data_root, extra_csv=pseudo_csv, extra_weight=1.0, out_csv=final_labels_csv)
     
     # Build cache
@@ -64,11 +64,7 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     cache_dir = os.path.join(work_dir, 'cache_v2')
     os.makedirs(cache_dir, exist_ok=True)
     
-    # Proper Idempotency: Check for the exact completion marker, not just a partially created dir
-    marker = os.path.join(cache_dir, "train.meta.json")
-    if os.path.exists(marker):
-        print(f"[INFO] Verified cache completion marker at {marker}. Skipping cache build.")
-        return final_labels_csv, cache_dir
+
     
     print("Building Memmap Cache (this takes time but drastically speeds up training)...")
     train_studies = sorted(index_out['ann'][index_out['ann']['split'] == 'train']['StudyInstanceUID'].unique())
@@ -98,7 +94,7 @@ def run_all_folds(labels_csv: str, cache_dir: str, work_dir: str):
     folds_csv = os.path.join(work_dir, "folds.csv")
     if not os.path.exists(folds_csv):
         print("Generating 5-fold stratification splits...")
-        splits.make_folds(labels_csv, folds_csv, config.TARGETS, folds=5, seed=config.SEED)
+        splits.group_folds(labels_csv, folds_csv, config.TARGETS, folds=5, seed=config.SEED, group_col='site')
     
     cache_prefix = os.path.join(cache_dir, "train")
     

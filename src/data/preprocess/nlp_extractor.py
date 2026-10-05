@@ -89,9 +89,20 @@ def parse_json_response(raw_text: str, uid: str) -> dict:
     try:
         data = json.loads(clean_json)
         out = {"StudyInstanceUID": uid}
+        
+        # Normalize keys for Baker's cyst (curly quotes)
+        normalized_data = {}
+        for k, v in data.items():
+            norm_k = k.replace("’", "'")
+            normalized_data[norm_k] = v
+            
         for t in TARGETS:
-            if t in data and "state" in data[t]:
-                state = data[t]["state"].lower()
+            val = normalized_data.get(t, {})
+            # Ensure state is a string to prevent AttributeError on .lower() if state is null/None
+            raw_state = val.get("state")
+            if isinstance(raw_state, str):
+                # Clean punctuation and whitespace
+                state = re.sub(r'[^a-z_]', '', raw_state.lower().strip())
                 if state == "present":
                     out[t], out[f"{t}_weight"] = 1.0, 0.5
                 elif state == "absent":
@@ -104,7 +115,7 @@ def parse_json_response(raw_text: str, uid: str) -> dict:
             else:
                 out[t], out[f"{t}_weight"] = 0.0, 0.0 # Fallback Mask
         return out
-    except json.JSONDecodeError:
+    except Exception as e:
         print(f"[ERROR] Failed to parse JSON for {uid}")
         return None
 

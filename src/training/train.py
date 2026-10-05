@@ -40,6 +40,8 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import cv2
 cv2.setNumThreads(0)

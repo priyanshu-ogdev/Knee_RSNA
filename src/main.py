@@ -10,6 +10,8 @@ Executes the entire SOTA pipeline in one shot:
 import os
 # Force kagglehub to download directly into our root data/ directory instead of C:\Users\...
 os.environ['KAGGLEHUB_CACHE'] = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data'))
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True" 
 
 import kagglehub
 from dotenv import load_dotenv

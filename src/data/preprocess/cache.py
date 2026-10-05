@@ -168,7 +168,13 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
                     on_ready(cache, a, min(a + chunk, len(studies)))
                 pending.pop(a)
         if progress and (k + 1) % 200 == 0:
-            print(f'  cache {k + 1}/{len(todo)}  {(k + 1) / (time.time() - t0):.1f} studies/s', flush=True)
+                        elapsed = time.time() - t0
+            throughput = (k + 1) / elapsed
+            left = len(todo) - (k + 1)
+            eta = left / throughput if throughput > 0 else 0
+            eta_m, eta_s = divmod(int(eta), 60)
+            eta_h, eta_m = divmod(eta_m, 60)
+            print(f'  cache {k + 1}/{len(todo)} | {throughput:.1f} studies/s | ETA: {eta_h:02d}:{eta_m:02d}:{eta_s:02d}', flush=True)
     ex.shutdown()
     cache.flush()
     stats['seconds'] = time.time() - t0

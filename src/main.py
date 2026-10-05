@@ -116,9 +116,27 @@ def run_all_folds(labels_csv: str, cache_dir: str, work_dir: str):
 # ==============================================================================
 # MAIN ENTRY
 # ==============================================================================
+import datetime
 def main():
     # Dynamically resolve project root relative to this script (src/scripts/run_full_pipeline.py)
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    global_start_time = time.time()
+    
+    # Configure logging
+    import logging
+    log_file = os.path.join(PROJECT_ROOT, f"pipeline_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
+    )
+    # Redirect print to logging for capture
+    def logged_print(*args, **kwargs):
+        msg = " ".join(str(a) for a in args)
+        logging.info(msg)
+    global print
+    print = logged_print
+
     
     # DGX / Linux compatible relative paths
     print("=" * 80)
@@ -149,8 +167,13 @@ def main():
     # 3. Training
     run_all_folds(labels_csv, cache_dir, WORK_DIR)
     
+    total_time = time.time() - global_start_time
+    t_m, t_s = divmod(int(total_time), 60)
+    t_h, t_m = divmod(t_m, 60)
+    
     print("\n" + "=" * 80)
-    print("PIPELINE COMPLETED SUCCESSFULLY!")
+    print(f"PIPELINE COMPLETED SUCCESSFULLY IN {t_h:02d}h {t_m:02d}m {t_s:02d}s")
+    print(f"Logs saved to {log_file}")
     print("=" * 80)
 
 

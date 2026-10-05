@@ -146,22 +146,35 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 is_absent = (raw_state == 0)
             elif isinstance(raw_state, str):
                 s_low = raw_state.lower().strip()
-                # Multi-lingual absent tokens
-                absent_tokens = [
-                    "absent", "normal", "intact", "unremarkable", "no tear", "no fracture", 
-                    "not present", "not seen", "negative", "negativo", "negatief", "no", 
-                    "ausente", "afwezig", "unauffällig", "regelrecht", "intakt", "conservado", 
-                    "íntegro", "integro", "χωρίς"
-                ]
-                # Multi-lingual present tokens
-                present_tokens = [
+                # Priority 1: Check for explicit not_stated / none / missing to avoid substring false positives
+                if any(ns in s_low for ns in ["not_stated", "not stated", "none", "unknown", "unclear", "missing", "n/a"]):
+                    is_present = False
+                    is_absent = False
+                # Priority 2: Exact matching for single status tokens
+                elif s_low in [
+                    "absent", "normal", "intact", "unremarkable", "negative", "negativo", 
+                    "negatief", "no", "ausente", "afwezig", "unauffällig", "unauffaellig", 
+                    "regelrecht", "intakt", "conservado", "conservada", "íntegro", "integro", "χωρίς"
+                ]:
+                    is_absent = True
+                elif s_low in [
                     "present", "torn", "tear", "fracture", "positive", "positivo", 
                     "positief", "presente", "vorhanden", "anwesend", "ρήξη"
-                ]
-                if any(x in s_low for x in absent_tokens):
-                    is_absent = True
-                elif any(x in s_low for x in present_tokens):
+                ]:
                     is_present = True
+                # Priority 3: Multi-word phrase matching
+                else:
+                    absent_phrases = [
+                        "no tear", "no fracture", "not present", "not seen", "without tear", 
+                        "within normal limits", "sin rotura", "geen scheur", "keine ruptur"
+                    ]
+                    present_phrases = [
+                        "present", "torn", "tear", "fracture", "positive", "mild", "moderate", "severe"
+                    ]
+                    if any(x in s_low for x in absent_phrases):
+                        is_absent = True
+                    elif any(x in s_low for x in present_phrases):
+                        is_present = True
             
             # =========================================================================
             # QUADRUPLE-LAYER CLINICAL HALLUCINATION SHIELD

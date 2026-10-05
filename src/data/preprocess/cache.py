@@ -168,7 +168,7 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
                     on_ready(cache, a, min(a + chunk, len(studies)))
                 pending.pop(a)
         if progress and (k + 1) % 200 == 0:
-                        elapsed = time.time() - t0
+            elapsed = time.time() - t0
             throughput = (k + 1) / elapsed
             left = len(todo) - (k + 1)
             eta = left / throughput if throughput > 0 else 0

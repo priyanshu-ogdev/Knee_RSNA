@@ -19,6 +19,7 @@ load_dotenv()
 
 import os
 import sys
+import shutil
 import time
 import json
 import traceback
@@ -64,12 +65,26 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     cache_dir = os.path.join(work_dir, 'cache_v2')
     os.makedirs(cache_dir, exist_ok=True)
     
-
-    
     print("Building Memmap Cache (this takes time but drastically speeds up training)...")
     train_studies = sorted(index_out['ann'][index_out['ann']['split'] == 'train']['StudyInstanceUID'].unique())
     cfg = config.get_cfg("v2")
     cpu_cores = max(2, os.cpu_count() or 2)
+    
+    # SOTA Fix: Adaptive resolution & disk-space protection
+    free_gb = shutil.disk_usage(cache_dir).free / 1e9
+    img_override = os.environ.get("CACHE_IMG_SIZE")
+    depth_override = os.environ.get("CACHE_STACK_DEPTH")
+    if img_override or depth_override:
+        img_size = int(img_override) if img_override else cfg.img_size
+        stack_depth = int(depth_override) if depth_override else cfg.stack_depth
+        cfg = config.get_cfg("v2", img_size=img_size, stack_depth=stack_depth)
+        print(f"[CONFIG] Cache resolution overridden by environment: img_size={img_size}, stack_depth={stack_depth}")
+    elif runner.estimate_cache_gb(len(train_studies), cfg) > free_gb * 0.95:
+        print(f"[WARNING] 518px/32-depth cache needs {runner.estimate_cache_gb(len(train_studies), cfg):.1f} GB, but only {free_gb:.1f} GB free in {cache_dir}.")
+        cfg = runner.fit_cache_cfg(len(train_studies), free_gb, preset='v2')
+        print(f"[AUTO-FIT] Scaled cache configuration to fit available disk: img_size={cfg.img_size}, stack_depth={cfg.stack_depth} ({runner.estimate_cache_gb(len(train_studies), cfg):.1f} GB)")
+    else:
+        print(f"[CONFIG] Using standard v2 cache: img_size={cfg.img_size}, stack_depth={cfg.stack_depth} ({runner.estimate_cache_gb(len(train_studies), cfg):.1f} GB estimated)")
     
     # SOTA Fix: The prefix must be the file stem inside the cache_dir, not the cache_dir itself!
     cache_prefix = os.path.join(cache_dir, "train")
@@ -79,12 +94,16 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str):
     )
     print(f"[SUCCESS] Cache ready. Stats: {stats}")
     
+    # Run acceptance QC gate
+    qc_dir = os.path.join(work_dir, 'qc')
+    runner.run_qc(cache_prefix, out_dir=qc_dir, n=min(100, len(train_studies)), montage=False)
+    
     return final_labels_csv, cache_dir
 
 # ==============================================================================
 # PHASE 3: 5-FOLD MODEL TRAINING
 # ==============================================================================
-def run_all_folds(labels_csv: str, cache_dir: str, work_dir: str):
+def run_all_folds(labels_csv: str, cache_dir: str, work_dir: str, data_root: str = None):
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
     print("=" * 80)
@@ -94,7 +113,25 @@ def run_all_folds(labels_csv: str, cache_dir: str, work_dir: str):
     folds_csv = os.path.join(work_dir, "folds.csv")
     if not os.path.exists(folds_csv):
         print("Generating 5-fold stratification splits...")
-        splits.group_folds(labels_csv, folds_csv, config.TARGETS, folds=5, seed=config.SEED, group_col='site')
+        labels_df = pd.read_csv(labels_csv)
+        idx_dir = os.path.join(work_dir, 'idx')
+        index_pkl = os.path.join(idx_dir, 'index.pkl')
+        if os.path.exists(index_pkl):
+            index_df = pd.read_pickle(index_pkl)
+            train_raw = pd.read_csv(os.path.join(data_root or os.path.dirname(labels_csv), 'train.csv')) if data_root else None
+            study_meta = splits.make_study_meta(index_df, train_csv=train_raw, labels_df=labels_df)
+            folds_df = splits.group_folds(study_meta, n_splits=5, seed=config.SEED, scheme='site')
+        else:
+            from sklearn.model_selection import KFold
+            kf = KFold(n_splits=5, shuffle=True, random_state=config.SEED)
+            folds_df = pd.DataFrame({
+                'StudyInstanceUID': labels_df['StudyInstanceUID'],
+                'fold': -1
+            })
+            for f, (_, va_idx) in enumerate(kf.split(labels_df)):
+                folds_df.iloc[va_idx, folds_df.columns.get_loc('fold')] = f
+        folds_df.to_csv(folds_csv, index=False)
+        print(f"[SUCCESS] 5-fold splits saved to {folds_csv}")
     
     cache_prefix = os.path.join(cache_dir, "train")
     
@@ -169,7 +206,7 @@ def main():
     labels_csv, cache_dir = run_preparation(DATA_ROOT, WORK_DIR, pseudo_csv)
     
     # 3. Training
-    run_all_folds(labels_csv, cache_dir, WORK_DIR)
+    run_all_folds(labels_csv, cache_dir, WORK_DIR, data_root=DATA_ROOT)
     
     total_time = time.time() - global_start_time
     t_m, t_s = divmod(int(total_time), 60)

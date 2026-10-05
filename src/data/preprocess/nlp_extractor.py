@@ -90,14 +90,26 @@ def parse_json_response(raw_text: str, uid: str) -> dict:
         return None
         
     try:
-        data = json.loads(clean_json)
+        try:
+            data = json.loads(clean_json)
+        except Exception:
+            import ast
+            data = ast.literal_eval(clean_json)
+            
         out = {"StudyInstanceUID": uid}
         
-        # Normalize keys for Baker's cyst (curly quotes)
+        # SOTA Fix: Aggressive alphanumeric key normalization to completely eliminate 
+        # missing keys due to LLM hallucinating curly quotes (Baker’s vs Baker's) or extra spaces.
+        def normalize_key(k):
+            return re.sub(r'[^a-zA-Z0-9]', '', str(k)).lower()
+            
+        target_map = {normalize_key(t): t for t in TARGETS}
+        
         normalized_data = {}
         for k, v in data.items():
-            norm_k = k.replace("’", "'")
-            normalized_data[norm_k] = v
+            norm_k = normalize_key(k)
+            if norm_k in target_map:
+                normalized_data[target_map[norm_k]] = v
             
         for t in TARGETS:
             val = normalized_data.get(t, {})

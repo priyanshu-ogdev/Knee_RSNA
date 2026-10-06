@@ -266,6 +266,7 @@ def run_training(
     seed: int = config.SEED,
     # model
     variant: str = "dinov2-base",         # Upgrade A: default to Base
+    unfreeze_last: int = config.UNFREEZE_LAST,
     use_cross_slot: bool = True,          # Upgrade C
     lora_rank: int = config.LORA_RANK,    # Upgrade B
     lora_alpha: int = config.LORA_ALPHA,
@@ -280,6 +281,7 @@ def run_training(
     grad_accum: int = config.GRAD_ACCUM,
     mixup_alpha: float = config.MIXUP_ALPHA,  # Upgrade I
     swa_epochs: int = config.SWA_EPOCHS,       # Upgrade E
+    early_stop_patience: int = config.EARLY_STOP_PATIENCE,
 ) -> float:
     """Train one fold and save the best checkpoint + optional SWA checkpoint.
 
@@ -312,6 +314,7 @@ def run_training(
     # ── Model ────────────────────────────────────────────────────────────────
     model = build_model(
         variant=variant,
+        unfreeze_last=unfreeze_last,
         use_cross_slot=use_cross_slot,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
@@ -432,6 +435,7 @@ def run_training(
 
     os.makedirs(out_dir, exist_ok=True)
     best, t0 = -1.0, time.time()
+    epochs_no_improve = 0
 
     for ep in range(n_ep):
         ds_tr.set_epoch(ep)
@@ -470,16 +474,23 @@ def run_training(
         save = (dl_va is None) or (np.isfinite(score) and score > best)
         if save:
             best = score if dl_va is not None else best
+            epochs_no_improve = 0
             ckpt_file = os.path.join(out_dir, f"fold{fold}_best.pt")
             torch.save(
                 dict(model=inner_model.state_dict(),
                      cfg=dataclasses.asdict(cfg),
-                     fold=fold, epoch=ep, val=score,
+                     fold=fold, epoch=ep + 1, val=score,
                      variant=variant,
                      use_cross_slot=use_cross_slot),
                 ckpt_file,
             )
             print(f"  [CHECKPOINT] New best validation AUC: {best:.4f} -> Saved {ckpt_file}", flush=True)
+        else:
+            epochs_no_improve += 1
+            print(f"  [EARLY STOP] No validation AUC improvement for {epochs_no_improve}/{early_stop_patience} epochs (best: {best:.4f})", flush=True)
+            if dl_va is not None and epochs_no_improve >= early_stop_patience:
+                print(f"  [EARLY STOP] Validation AUC did not improve for {early_stop_patience} consecutive epochs. Stopping early at epoch {ep + 1}/{n_ep} to prevent overfitting.", flush=True)
+                break
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -514,13 +525,13 @@ def run_training(
             bn_module.momentum = momenta[bn_module]
         model.train(was_training)
 
-    if swa_model is not None and swa_epochs > 0:
+    if swa_model is not None and swa_epochs > 0 and (ep >= swa_start):
         print("Updating SWA batch-norm statistics …")
         safe_update_bn(dl_tr, swa_model, device=device)
         torch.save(
             dict(model=swa_model.module.state_dict(),
                  cfg=dataclasses.asdict(cfg),
-                 fold=fold, epoch=n_ep, val=best,
+                 fold=fold, epoch=ep + 1, val=best,
                  swa=True, variant=variant,
                  use_cross_slot=use_cross_slot),
             os.path.join(out_dir, f"fold{fold}_swa.pt"),
@@ -532,7 +543,7 @@ def run_training(
     torch.save(
         dict(model=ema_model.module.state_dict(),
              cfg=dataclasses.asdict(cfg),
-             fold=fold, epoch=n_ep, val=best,
+             fold=fold, epoch=ep + 1, val=best,
              ema=True, variant=variant,
              use_cross_slot=use_cross_slot),
         os.path.join(out_dir, f"fold{fold}_ema.pt"),

@@ -356,6 +356,11 @@ def run_all_folds(
         except Exception as e:
             print(f"[ERROR] Error during training Fold {fold}: {e}")
             traceback.print_exc()
+        finally:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     return best_scores
 

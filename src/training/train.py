@@ -522,7 +522,6 @@ def run_training(
         for module in momenta:
             module.momentum = None
         with torch.no_grad():
-            with torch.no_grad():
             for batch in loader:
                 if isinstance(batch, (list, tuple)):
                     imgs = batch[0].to(device)

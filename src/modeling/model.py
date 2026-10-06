@@ -247,11 +247,16 @@ class Model(nn.Module):
             if torch.cuda.is_available():
                 try:
                     gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                    self._cached_chunk_size = 108 if gb >= 24.0 else 64
+                    if gb >= 80.0:
+                        self._cached_chunk_size = 144  # 130GB GB10 / 80GB A100: exactly 2 balanced chunks for batch of 16
+                    elif gb >= 24.0:
+                        self._cached_chunk_size = 96   # 24-48GB GPUs (RTX 3090/4090, A5000/A6000)
+                    else:
+                        self._cached_chunk_size = 48   # 16GB Kaggle T4 / P100
                 except Exception:
-                    self._cached_chunk_size = 64
+                    self._cached_chunk_size = 48
             else:
-                self._cached_chunk_size = 64
+                self._cached_chunk_size = 48
         return self._cached_chunk_size
 
     # ------------------------------------------------------------------

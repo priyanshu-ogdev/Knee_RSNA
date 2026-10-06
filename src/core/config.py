@@ -21,8 +21,8 @@ from dataclasses import dataclass, replace
 # ─────────────────────────────────────────── legacy training constants ────────
 SEED             = 2026
 EPOCHS           = 20          # ↑ from 15 — DGX has no 9-hr Kaggle cap; full cosine
-BATCH_SIZE       = 8           # Optimal micro-batch for rapid step cadence and low memory pressure
-GRAD_ACCUM       = 2           # Effective batch = 16 studies per optimizer step
+BATCH_SIZE       = 16          # Default to 16 studies per step (220 steps/epoch on Blackwell)
+GRAD_ACCUM       = 1           # Effective batch = 16 studies per optimizer step (~14 min/epoch)
 N_WINDOWS_TRAIN  = 6           # 6 windows covers ~65% continuous depth with stratified jitter (no focal tear blind spots)
 LR_HEAD          = 2e-3
 LR_BACKBONE      = 1e-5        # Scaled for effective batch=16

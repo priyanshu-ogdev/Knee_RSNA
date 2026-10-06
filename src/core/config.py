@@ -23,11 +23,11 @@ SEED             = 2026
 EPOCHS           = 10          # Optimized: peak validation AUC converges by epoch 6-8; 10 avoids label-noise overfitting
 BATCH_SIZE       = 16          # Default to 16 studies per step (220 steps/epoch on Blackwell)
 GRAD_ACCUM       = 1           # Effective batch = 16 studies per optimizer step
-N_WINDOWS_TRAIN  = 4           # 4 stratified windows with z-jitter gives complete coverage and cuts FLOPs by 33%
+N_WINDOWS_TRAIN  = 5           # 5 stratified windows: 75% articular coverage (prevents MIL focal tear dilution)
 LR_HEAD          = 2e-3
 LR_BACKBONE      = 1e-5        # Scaled for effective batch=16
 WEIGHT_DECAY     = 0.05        # Standard ViT recipe
-UNFREEZE_LAST    = 6           # Top 6 blocks fine-tuned with LLRD; bottom 6 frozen to preserve primitives & cut backprop 50%
+UNFREEZE_LAST    = 8           # Top 8 blocks fine-tuned with LLRD; blocks 0-3 frozen (preserves 2.5D MRI adaptation)
 LORA_RANK        = 0          # Upgrade B — rank for QV LoRA adapters
 LORA_ALPHA       = 32          # LoRA scaling: scale = LORA_ALPHA / LORA_RANK = 2
 TIME_BUDGET_HOURS = 9999.0     # DGX Spark: no Kaggle time cap — disabled

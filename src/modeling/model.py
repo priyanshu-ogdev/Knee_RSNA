@@ -187,69 +187,28 @@ class SlotHead(nn.Module):
 
 # ─────────────────────────────────────────────────────────── WindowPool ───────
 class WindowPool(nn.Module):
-    """Class-Group Window Pooling with 4 Anatomical Heads + Learnable Depth Embedding + Focal Residual.
+    """Masked attention pooling over 2.5D windows within one slot.
 
-    Addresses 'Attention Collapse & Target Entanglement' in multi-label MIL (IEEE TMI 2025).
-    Anatomical Groups:
-      Head 0: Ligaments (ACL, MCL)
-      Head 1: Menisci (Medial Meniscus, Lateral Meniscus)
-      Head 2: Degenerative & Bone (Medial OA, Lateral OA, PF OA, Contusion, Fracture)
-      Head 3: Fluid & Soft Tissue (Effusion, Synovitis, Baker's Cyst)
-
-    [B, S, W, dim] → [B, S, dim].
+    [B, S, W, dim] → [B, S, dim].  Unchanged from baseline.
     """
 
-    def __init__(self, dim: int, max_windows: int = 16, n_heads: int = 4):
+    def __init__(self, dim: int):
         super().__init__()
-        self.dim = dim
-        self.n_heads = n_heads
-        mid_dim = max(dim // 4, 64)
+        mid_dim = max(dim // 4, 64)   # smaller mid dim; LayerNorm handles scale
+        # LayerNorm before gating: DINOv2 features have large dynamic range.
+        # Without normalization, Tanh saturates → zero gradients → dead gate.
         self.norm = nn.LayerNorm(dim)
-
-        # Learnable 1D through-plane depth positional embedding (Z-axis spatial awareness)
-        self.depth_emb = nn.Parameter(torch.randn(max_windows, dim) * 0.02)
-
-        # Gated attention mechanism with n_heads heads
         self.attention_V = nn.Sequential(nn.Linear(dim, mid_dim), nn.Tanh())
         self.attention_U = nn.Sequential(nn.Linear(dim, mid_dim), nn.Sigmoid())
-        self.attention_weights = nn.Linear(mid_dim, n_heads)
-
-        # Multi-head projection back to feature dim
-        self.fusion = nn.Linear(dim * n_heads, dim)
-        # Learnable focal residual gate
-        self.focal_gate = nn.Parameter(torch.zeros(1))
+        self.attention_weights = nn.Linear(mid_dim, 1)
 
     def forward(self, feat: torch.Tensor, wmask: torch.Tensor) -> torch.Tensor:
-        B, S, W, D = feat.shape
-        # Add through-plane depth positional embedding
-        feat = feat + self.depth_emb[:W].view(1, 1, W, D)
-        norm_feat = self.norm(feat)
-
-        # Compute gated attention scores for each of the 4 heads
-        A_V = self.attention_V(norm_feat)                          # [B, S, W, mid_dim]
-        A_U = self.attention_U(norm_feat)                          # [B, S, W, mid_dim]
-        logits = self.attention_weights(A_V * A_U)                 # [B, S, W, n_heads]
-
-        # Mask padded windows: [B, S, W, n_heads]
-        mask_expanded = wmask.unsqueeze(-1).expand(-1, -1, -1, self.n_heads)
-        masked_logits = logits.masked_fill(mask_expanded < 0.5, -10000.0)
-
-        # Softmax over windows (dim=2): [B, S, W, n_heads]
-        attn = torch.softmax(masked_logits, dim=2)
-
-        # Weighted sum per head: [B, S, n_heads, D]
-        head_feats = torch.einsum("bswh,bswd->bshd", attn, feat)
-
-        # Concatenate heads along feature dim and fuse: [B, S, n_heads * D] -> [B, S, D]
-        fused = self.fusion(head_feats.reshape(B, S, self.n_heads * D))
-
-        # Top-salience focal residual: captures sharp micro-tears without dilution
-        top_w_idx = attn.mean(dim=-1).argmax(dim=-1, keepdim=True)  # [B, S, 1]
-        top_feat = feat.gather(2, top_w_idx.unsqueeze(-1).expand(-1, -1, -1, D)).squeeze(2)
-
-        gate = torch.sigmoid(self.focal_gate)
-        slot_valid = (wmask.sum(-1, keepdim=True) > 0).float()
-        return (fused + gate * top_feat) * slot_valid
+        feat = self.norm(feat)         # normalize before gating (prevents Tanh saturation)
+        A_V = self.attention_V(feat)
+        A_U = self.attention_U(feat)
+        a = self.attention_weights(A_V * A_U).squeeze(-1)  # [B, S, W]
+        a = a.masked_fill(wmask < 0.5, -10000.0).softmax(-1)
+        return (a.unsqueeze(-1) * feat).sum(2)             # [B, S, 3*dim]
 
 
 # ─────────────────────────────────────────────────────────── Main Model ───────

@@ -416,7 +416,7 @@ def run_inference_phase(
     work_dir: str,
     model_ckpts: list[str],
     use_tta: bool = True,
-    n_tta: int = 4,
+    n_tta: int = 2,
 ):
     print("\n" + "=" * 80)
     print("PHASE 5: TEST INFERENCE & SUBMISSION GENERATION")
@@ -569,7 +569,7 @@ def main():
         work_dir=work_dir,
         model_ckpts=valid_ckpts,
         use_tta=(not args.no_tta),
-        n_tta=4,
+        n_tta=2,
     )
 
     # Phase 6: Final Summary

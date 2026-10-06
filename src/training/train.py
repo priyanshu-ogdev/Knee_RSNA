@@ -356,11 +356,15 @@ def run_training(
     dl_va = None
     if len(va):
         ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False)
+        # CRITICAL OOM FIX: Validation evaluates all 15 windows (2.5x more data than training).
+        # A batch size of 16 with 16 workers and prefetch 4 buffered 74 GB of locked, pinned RAM!
+        # This exhausted the 121 GB DGX memory + 32 GB swap. 
+        # Fix: Throttle validation workers and prefetch to cap RAM at ~5 GB.
         dl_va = DataLoader(
-            ds_va, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+            ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
+            num_workers=min(4, num_workers), pin_memory=(device.type == "cuda"),
             persistent_workers=False,
-            prefetch_factor=4 if num_workers > 0 else None,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────
@@ -459,6 +463,10 @@ def run_training(
         msg = f"epoch {ep + 1}/{n_ep}  loss {loss_val:.4f}"
         score = float("nan")
 
+        # Force garbage collection to purge train DataLoader zombie workers before validation
+        import gc
+        gc.collect()
+        
         if dl_va is not None:
             score, per = evaluate(model, dl_va, device)
             msg += f"  val macro-AUC {score:.4f}"
@@ -513,14 +521,16 @@ def run_training(
         model.train()
         for module in momenta:
             module.momentum = None
-        for batch in loader:
-            if isinstance(batch, (list, tuple)):
-                imgs = batch[0].to(device)
-                mask = batch[1].to(device) if len(batch) > 1 else None
-                wmask = batch[2].to(device) if len(batch) > 2 else None
-                model(imgs, mask, wmask)
-            else:
-                model(batch.to(device))
+        with torch.no_grad():
+            with torch.no_grad():
+            for batch in loader:
+                if isinstance(batch, (list, tuple)):
+                    imgs = batch[0].to(device)
+                    mask = batch[1].to(device) if len(batch) > 1 else None
+                    wmask = batch[2].to(device) if len(batch) > 2 else None
+                    model(imgs, mask, wmask)
+                else:
+                    model(batch.to(device))
         for bn_module in momenta:
             bn_module.momentum = momenta[bn_module]
         model.train(was_training)

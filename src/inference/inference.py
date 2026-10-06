@@ -21,10 +21,33 @@ no usable slot fall back to median prediction. Submission is ALWAYS written.
 from __future__ import annotations
 
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+import cv2
+cv2.setNumThreads(0)
 import tempfile
 import numpy as np
 import pandas as pd
 import torch
+
+import queue
+import threading
+
+def prefetch_generator(cache, rows, cfg, n_use, batch_size):
+    q = queue.Queue(maxsize=3)
+    def worker():
+        for lo in range(0, len(rows), batch_size):
+            batch_rows = rows[lo:lo + batch_size]
+            with ThreadPoolExecutor(max_workers=len(batch_rows)) as ex:
+                smp = list(ex.map(lambda i: loader.make_sample(cache, i, cfg, train=False, n_use=n_use), batch_rows))
+            q.put((batch_rows, smp))
+        q.put(None)
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    while True:
+        res = q.get()
+        if res is None: break
+        yield res
 from concurrent.futures import ThreadPoolExecutor
 
 import src.core.config as config
@@ -126,7 +149,7 @@ def predict_chunk_tta(
                 return loader.make_sample(
                     cache, i, cfg,
                     train=False,          # always use eval-mode window selection (evenly spaced)
-                    n_use=n_use,
+                    n_use=n_use,          # DO NOT sub-sample. Use full density to prevent recall degradation.
                     rng=row_rng,
                     aug=use_aug,          # augmentation applied only for TTA passes 1+
                 )
@@ -137,7 +160,12 @@ def predict_chunk_tta(
             imgs = torch.from_numpy(np.stack([s[0] for s in smp]))
             slot = torch.from_numpy(np.stack([s[1] for s in smp])).float()
             wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float()
+            
             if device.type == "cuda":
+                # T4 GPU (Turing) Efficiency Fixes
+                torch.backends.cuda.enable_flash_sdp(False)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                # torch.backends.cuda.enable_math_sdp(False) # Removed to prevent hard crashes
                 imgs = imgs.pin_memory()
                 slot = slot.pin_memory()
                 wm = wm.pin_memory()
@@ -205,13 +233,11 @@ def predict_chunk(
         imgs = torch.from_numpy(np.stack([s[0] for s in smp]))
         slot = torch.from_numpy(np.stack([s[1] for s in smp])).float()
         wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float()
-        if device.type == "cuda":
-            imgs = imgs.pin_memory()
-            slot = slot.pin_memory()
-            wm = wm.pin_memory()
-        imgs = imgs.to(device, non_blocking=True)
-        slot = slot.to(device, non_blocking=True)
-        wm   = wm.to(device, non_blocking=True)
+
+        # Keep a pinned CPU copy for the background threads to stream to their specific GPUs
+        imgs_cpu = imgs.pin_memory() if device.type == "cuda" else imgs
+        slot_cpu = slot.pin_memory() if device.type == "cuda" else slot
+        wm_cpu   = wm.pin_memory() if device.type == "cuda" else wm
 
         ps = []
         for m, t_val in zip(models, T):
@@ -282,8 +308,20 @@ def run_inference(
     def on_ready(cache: pcache.StudyCache, a: int, b: int):
         # Workers were forked at the first submit, i.e., before any CUDA call in this process.
         if not state["moved"]:
-            for i, m in enumerate(loaded_models):
-                m.eval().to(device, non_blocking=True)
+for i, m in enumerate(loaded_models):
+                # 1. Native FP16 Casting (Faster than autocast overhead)
+                m = m.eval().half().to(device, non_blocking=True)
+                
+                # 2. PyTorch 2.x Compiler with CUDA Graphs
+                try:
+                    import torch._dynamo
+                    torch._dynamo.config.suppress_errors = True
+                    m = torch.compile(m, mode="reduce-overhead", fullgraph=False)
+                    print(f"[OPTIMIZE] Model {i} successfully compiled with reduce-overhead.")
+                except Exception as e:
+                    print(f"[OPTIMIZE] Compiler bypassed: {e}")
+                
+                loaded_models[i] = m
                 # Multi-GPU check: only wrap in DataParallel if batch size is large enough to divide evenly
                 if device.type == "cuda" and torch.cuda.device_count() > 1 and batch >= torch.cuda.device_count() * 2:
                     loaded_models[i] = torch.nn.DataParallel(m)

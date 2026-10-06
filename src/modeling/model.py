@@ -266,39 +266,25 @@ class Model(nn.Module):
         if len(valid_idx) > 0:
             flat_imgs = imgs.reshape(B * S * W, *imgs.shape[3:])
             x_valid = flat_imgs[valid_idx].to(dtype=torch.float32).div_(255.0)
-            x_valid = (x_valid - self.mean) / self.std
+            x_valid.sub_(self.mean).div_(self.std)
 
-            # SOTA TILING: Process large batches in micro-chunks of 64 images.
+            # SOTA TILING: Process batches in micro-chunks of 64 images.
             # Avoids peak VRAM spikes, eliminates allocator fragmentation, and maximizes Tensor Core cache hits.
             chunk_size = 64
-            if len(x_valid) <= chunk_size:
-                out = self.backbone(pixel_values=x_valid).last_hidden_state
-                cls_tok  = out[:, 0]            # [N, dim]  global context
-                patches  = out[:, 1:]           # [N, P, dim]
-                mean_tok = patches.mean(1)      # [N, dim]  global spatial mean
-                k = max(1, patches.shape[1] // 8)  # 12.5% of patches = top 72 of 576
-                patch_norms = patches.pow(2).sum(dim=-1)        # [N, P]
-                top_idx = patch_norms.topk(k, dim=1).indices    # [N, k]
-                gathered = patches.gather(                       # [N, k, dim]
-                    1, top_idx.unsqueeze(-1).expand(-1, -1, patches.size(-1))
-                )
-                focal_tok = gathered.mean(1)                     # [N, dim]
-                valid_feats = torch.cat([cls_tok, mean_tok, focal_tok], dim=1)
-            else:
-                f_list = []
-                for c_start in range(0, len(x_valid), chunk_size):
-                    c_x = x_valid[c_start:c_start + chunk_size]
-                    c_out = self.backbone(pixel_values=c_x).last_hidden_state
-                    c_cls = c_out[:, 0]
-                    c_patches = c_out[:, 1:]
-                    c_mean = c_patches.mean(1)
-                    k = max(1, c_patches.shape[1] // 8)
-                    c_norms = c_patches.pow(2).sum(dim=-1)
-                    c_top = c_norms.topk(k, dim=1).indices
-                    c_gathered = c_patches.gather(1, c_top.unsqueeze(-1).expand(-1, -1, c_patches.size(-1)))
-                    c_focal = c_gathered.mean(1)
-                    f_list.append(torch.cat([c_cls, c_mean, c_focal], dim=1))
-                valid_feats = torch.cat(f_list, dim=0)
+            f_list = []
+            for c_start in range(0, len(x_valid), chunk_size):
+                c_x = x_valid[c_start:c_start + chunk_size]
+                c_out = self.backbone(pixel_values=c_x).last_hidden_state
+                c_cls = c_out[:, 0]
+                c_patches = c_out[:, 1:]
+                c_mean = c_patches.mean(1)
+                k = max(1, c_patches.shape[1] // 8)
+                c_norms = c_patches.pow(2).sum(dim=-1)
+                c_top = c_norms.topk(k, dim=1).indices
+                c_gathered = c_patches.gather(1, c_top.unsqueeze(-1).expand(-1, -1, c_patches.size(-1)))
+                c_focal = c_gathered.mean(1)
+                f_list.append(torch.cat([c_cls, c_mean, c_focal], dim=1))
+            valid_feats = torch.cat(f_list, dim=0) if len(f_list) > 1 else f_list[0]
             # ANTI-DEGRADATION FIX: Match feat dtype to valid_feats so downstream attention stays in native Tensor Core BF16
             feat = torch.zeros(B * S * W, dim * 3, device=imgs.device, dtype=valid_feats.dtype)
             feat[valid_idx] = valid_feats

@@ -140,6 +140,8 @@ def train_epoch(
     _rare_mults = [config.RARE_TARGET_WEIGHTS.get(t, 1.0) for t in config.TARGETS]
     _rare_vec = torch.tensor(_rare_mults, device=device).unsqueeze(0)  # [1, C]
 
+    step_t0 = time.time()
+    total_batches = len(dataloader)
     for micro_step, batch in enumerate(dataloader):
         imgs, masks, wmasks, targets, weights = batch
         imgs    = imgs.to(device, non_blocking=True)
@@ -191,6 +193,14 @@ def train_epoch(
 
         total_loss_tensor += loss.detach() * grad_accum  # Fully async logging
         n += 1
+
+        if (micro_step + 1) % 25 == 0 or (micro_step + 1) == total_batches:
+            dt = time.time() - step_t0
+            sec_per_step = dt / 25 if (micro_step + 1) % 25 == 0 else dt / max(1, (micro_step + 1) % 25)
+            rem_sec = (total_batches - (micro_step + 1)) * sec_per_step
+            avg_loss = (total_loss_tensor.item()) / max(n, 1)
+            print(f"  [Step {micro_step + 1:3d}/{total_batches:3d}] Loss: {avg_loss:.4f} | {sec_per_step:.2f}s/step | ETA: {rem_sec/60:.1f}m", flush=True)
+            step_t0 = time.time()
 
     return float(total_loss_tensor.item()) / max(n, 1)
 
@@ -310,12 +320,12 @@ def run_training(
 
     # ── Data ─────────────────────────────────────────────────────────────────
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
+    # DEADLOCK FIX: persistent_workers=False prevents inter-epoch worker queue freeze
     dl_tr = DataLoader(
         ds_tr, batch_size=batch_size, shuffle=True,
         drop_last=len(tr) > batch_size, num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=(2 if num_workers > 0 else None),
+        persistent_workers=False,
     )
     dl_va = None
     if len(va):
@@ -323,6 +333,7 @@ def run_training(
         dl_va = DataLoader(
             ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
             num_workers=num_workers, pin_memory=(device.type == "cuda"),
+            persistent_workers=False,
         )
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────
@@ -433,14 +444,19 @@ def run_training(
         save = (dl_va is None) or (np.isfinite(score) and score > best)
         if save:
             best = score if dl_va is not None else best
+            ckpt_file = os.path.join(out_dir, f"fold{fold}_best.pt")
             torch.save(
                 dict(model=inner_model.state_dict(),
                      cfg=dataclasses.asdict(cfg),
                      fold=fold, epoch=ep, val=score,
                      variant=variant,
                      use_cross_slot=use_cross_slot),
-                os.path.join(out_dir, f"fold{fold}_best.pt"),
+                ckpt_file,
             )
+            print(f"  [CHECKPOINT] New best validation AUC: {best:.4f} -> Saved {ckpt_file}", flush=True)
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # ── Time-budget guard ─────────────────────────────────────────────────
         if time.time() - t0 > config.TIME_BUDGET_HOURS * 3600:

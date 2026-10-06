@@ -52,6 +52,10 @@ torch.set_float32_matmul_precision('high')
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+    torch.backends.cuda.enable_flash_sdp(True)
+if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -253,7 +257,7 @@ def run_training(
     out_dir: str = ".",
     epochs: int | None = None,
     n_windows_train: int = config.N_WINDOWS_TRAIN,  # 6 windows covers ~65% continuous volume
-    num_workers: int = 8, # Safe feed rate for 16 studies per step
+    num_workers: int = 10, # Utilize half of the 20 DGX CPU cores
     seed: int = config.SEED,
     # model
     variant: str = "dinov2-base",         # Upgrade A: default to Base
@@ -339,6 +343,7 @@ def run_training(
         drop_last=len(tr) > batch_size, num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=False,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     dl_va = None
     if len(va):
@@ -347,6 +352,7 @@ def run_training(
             ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
             num_workers=num_workers, pin_memory=(device.type == "cuda"),
             persistent_workers=False,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────

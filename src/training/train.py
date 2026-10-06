@@ -124,6 +124,8 @@ def train_epoch(
     scheduler,
     device: torch.device,
     criterion: nn.Module,
+    epoch: int = 1,
+    total_epochs: int = 20,
     label_smoothing: float = 0.0,
     mixup_alpha: float = 0.0,
     grad_accum: int = 1,
@@ -188,18 +190,20 @@ def train_epoch(
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             if ema_model is not None:
-                ema_model.update_parameters(model)
+                base_m = model.module if isinstance(model, nn.DataParallel) else model
+                ema_model.update_parameters(base_m)
             opt_step += 1
 
         total_loss_tensor += loss.detach() * grad_accum  # Fully async logging
         n += 1
 
-        if (micro_step + 1) % 25 == 0 or (micro_step + 1) == total_batches:
+        if (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:
             dt = time.time() - step_t0
-            sec_per_step = dt / 25 if (micro_step + 1) % 25 == 0 else dt / max(1, (micro_step + 1) % 25)
+            n_step_win = 10 if (micro_step + 1) % 10 == 0 else max(1, (micro_step + 1) % 10)
+            sec_per_step = dt / n_step_win
             rem_sec = (total_batches - (micro_step + 1)) * sec_per_step
             avg_loss = (total_loss_tensor.item()) / max(n, 1)
-            print(f"  [Step {micro_step + 1:3d}/{total_batches:3d}] Loss: {avg_loss:.4f} | {sec_per_step:.2f}s/step | ETA: {rem_sec/60:.1f}m", flush=True)
+            print(f"  [Epoch {epoch:2d}/{total_epochs:2d} | Step {micro_step + 1:3d}/{total_batches:3d}] Loss: {avg_loss:.4f} | {sec_per_step:.2f}s/step | ETA: {rem_sec/60:.1f}m", flush=True)
             step_t0 = time.time()
 
     return float(total_loss_tensor.item()) / max(n, 1)
@@ -247,7 +251,7 @@ def run_training(
     fold: int = 0,
     out_dir: str = ".",
     epochs: int | None = None,
-    n_windows_train: int = 4,  # FIX 3: 8 windows covers 73% of the 24-depth stack vs 35% at 4
+    n_windows_train: int = config.N_WINDOWS_TRAIN,  # 6 windows covers ~65% continuous volume
     num_workers: int = 8, # Safe feed rate for 16 studies per step
     seed: int = config.SEED,
     # model
@@ -302,6 +306,14 @@ def run_training(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
     ).to(device)
+
+    # Multi-GPU DataParallel for extreme throughput on DGX systems
+    num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    if num_gpus > 1:
+        print(f"  [HARDWARE] DGX Multi-GPU detected: Enabling DataParallel across {num_gpus} GPUs!", flush=True)
+        model_train = nn.DataParallel(model)
+    else:
+        model_train = model
 
     # ── Loss (Upgrade B) ─────────────────────────────────────────────────────
     # Use per-target gamma_neg if configured; fall back to scalar if run_training
@@ -417,8 +429,10 @@ def run_training(
         # hard weight-schedule flips mid-training. 1.5× is moderate enough not
         # to overfit to the small gold set, but enough to prioritize verified labels.
         loss_val = train_epoch(
-            model, dl_tr, optimizer, scaler, scheduler, device,
+            model_train, dl_tr, optimizer, scaler, scheduler, device,
             criterion,
+            epoch=ep + 1,
+            total_epochs=n_ep,
             label_smoothing=label_smoothing,
             mixup_alpha=mixup_alpha,
             grad_accum=grad_accum,

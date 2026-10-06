@@ -21,12 +21,13 @@ from dataclasses import dataclass, replace
 # ─────────────────────────────────────────── legacy training constants ────────
 SEED             = 2026
 EPOCHS           = 20          # ↑ from 15 — DGX has no 9-hr Kaggle cap; full cosine
-BATCH_SIZE       = 16          # Safe scale for 128GB DGX (consumes ~48GB VRAM)
-GRAD_ACCUM       = 2           # effective batch is natively 32
+BATCH_SIZE       = 8           # Optimal micro-batch for rapid step cadence and low memory pressure
+GRAD_ACCUM       = 2           # Effective batch = 16 studies per optimizer step
+N_WINDOWS_TRAIN  = 6           # 6 windows covers ~65% continuous depth with stratified jitter (no focal tear blind spots)
 LR_HEAD          = 2e-3
-LR_BACKBONE      = 1e-5        # Scaled up for BATCH=4x8 accum
-WEIGHT_DECAY     = 0.05        # ↑ from 0.02 — standard ViT recipe
-UNFREEZE_LAST    = 4           # fully-unfrozen final blocks (others get LoRA)
+LR_BACKBONE      = 1e-5        # Scaled for effective batch=16
+WEIGHT_DECAY     = 0.05        # Standard ViT recipe
+UNFREEZE_LAST    = 999         # Full fine-tuning of all 12 blocks with Layer-Wise Learning Rate Decay (LLRD)
 LORA_RANK        = 0          # Upgrade B — rank for QV LoRA adapters
 LORA_ALPHA       = 32          # LoRA scaling: scale = LORA_ALPHA / LORA_RANK = 2
 TIME_BUDGET_HOURS = 9999.0     # DGX Spark: no Kaggle time cap — disabled

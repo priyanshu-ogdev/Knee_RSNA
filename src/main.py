@@ -62,6 +62,11 @@ if hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+if hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
 import src.core.config as config
 from src.data.labels import build_labels

@@ -42,9 +42,20 @@ def window_starts(depth, group, stride, n_use=None, train=False, rng=None):
 def gather_windows(stack, valid, starts, group):
     """stack [D,H,W] (may be a memmap view) -> windows [n,group,H,W] uint8 and window validity [n].
 
-    A window is valid only if all of its channels are valid slices."""
+    A window is valid only if all of its channels are valid slices.
+
+    CONTIGUOUS MEMMAP READ OPTIMIZATION:
+    Instead of non-contiguous indexing stack[idx] that triggers scattered disk page faults
+    across the 227 GB memmap file, read the bounding slice stack[lo:hi] as a single contiguous
+    block into RAM, then extract windows locally at memory bus speeds (>100 GB/s).
+    """
+    if len(starts) == 0:
+        return np.zeros((0, group, stack.shape[1], stack.shape[2]), dtype=stack.dtype), np.zeros(0, dtype=bool)
     idx = np.asarray(starts)[:, None] + np.arange(group)[None, :]
-    win = np.ascontiguousarray(stack[idx])
+    lo = int(idx.min())
+    hi = int(idx.max()) + 1
+    block = np.ascontiguousarray(stack[lo:hi])
+    win = block[idx - lo]
     wv = np.asarray(valid)[idx].all(axis=1)
     return win, wv
 

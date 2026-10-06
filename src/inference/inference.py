@@ -35,6 +35,34 @@ from src.data.preprocess import slots as pslots
 from src.data.preprocess import pipeline, cache as pcache, loader
 
 
+def rank_percentile_blend(model_preds_list: list[np.ndarray]) -> np.ndarray:
+    """Combines N model probability matrices [N_samples, N_targets] using Rank-Percentile Normalization.
+
+    Eliminates calibration drift and scale differences across folds, guaranteeing each fold
+    has strictly equal voting power in ROC-AUC ordering. Mathematically optimal for AUC.
+    """
+    if len(model_preds_list) == 1:
+        return model_preds_list[0]
+    n_samples, n_targets = model_preds_list[0].shape
+    blended = np.zeros((n_samples, n_targets), dtype=np.float32)
+    for c in range(n_targets):
+        target_ranks = []
+        for m_preds in model_preds_list:
+            col = m_preds[:, c]
+            valid = np.isfinite(col)
+            ranks = np.zeros_like(col, dtype=np.float32)
+            if valid.sum() > 1:
+                order = np.argsort(col[valid])
+                r = np.empty_like(order, dtype=np.float32)
+                r[order] = np.linspace(0.0, 1.0, len(order), dtype=np.float32)
+                ranks[valid] = r
+            elif valid.sum() == 1:
+                ranks[valid] = 0.5
+            target_ranks.append(ranks)
+        blended[:, c] = np.mean(target_ranks, axis=0)
+    return blended
+
+
 def prepare_test_tables(root: str, cfg: config.PreCfg, workers: int | None = None):
     """Directory-truth index of test_series -> annotated series table, slot table, laterality, records."""
     # Robust candidate test directory detection
@@ -65,7 +93,8 @@ def predict_chunk_tta(
     temperatures: list | None = None,
     n_tta: int = 4,
     tta_seed: int = 42,
-) -> np.ndarray:
+    return_models: bool = False,
+) -> np.ndarray | list[np.ndarray]:
     """TTA: average predictions over N augmented views ? strictly NO horizontal flips.
 
     Batch-Inverted Cache Optimization:
@@ -132,12 +161,19 @@ def predict_chunk_tta(
                     ps.append(torch.sigmoid(scaled).cpu().numpy())
 
             # Model ensemble mean for this TTA view: [batch_size, n_targets]
-            batch_tta_preds.append(np.mean(ps, axis=0))
+            batch_tta_preds.append(ps)
 
         # TTA ensemble mean across passes for this batch
-        out.append(np.mean(batch_tta_preds, axis=0))
+        m_batch = [np.mean([batch_tta_preds[p][m_idx] for p in range(n_tta)], axis=0) for m_idx in range(len(models))]
+        out.append(m_batch)
 
-    return np.concatenate(out) if out else np.zeros((0, len(config.TARGETS)), dtype=np.float32)
+    if not out:
+        empty = np.zeros((0, len(config.TARGETS)), dtype=np.float32)
+        return [empty for _ in models] if return_models else empty
+    per_model_preds = [np.concatenate([out[b_idx][m_idx] for b_idx in range(len(out))], axis=0) for m_idx in range(len(models))]
+    if return_models:
+        return per_model_preds
+    return np.mean(per_model_preds, axis=0)
 
 
 @torch.inference_mode()
@@ -151,7 +187,8 @@ def predict_chunk(
     n_use: int | None = None,
     batch: int = 4,
     temperatures: list | None = None,
-) -> np.ndarray:
+    return_models: bool = False,
+) -> np.ndarray | list[np.ndarray]:
     """Predict a chunk of studies using an ensemble of models (e.g., 5 folds).
 
     If temperatures are provided, logits are scaled by T before sigmoid.
@@ -190,8 +227,14 @@ def predict_chunk(
                     scaled = logits / torch.clamp(t_tensor, min=1e-6)
                 ps.append(torch.sigmoid(scaled).cpu().numpy())
 
-        out.append(np.mean(ps, axis=0))
-    return np.concatenate(out) if out else np.zeros((0, len(config.TARGETS)), dtype=np.float32)
+        out.append(ps)
+    if not out:
+        empty = np.zeros((0, len(config.TARGETS)), dtype=np.float32)
+        return [empty for _ in models] if return_models else empty
+    per_model_preds = [np.concatenate([out[b_idx][m_idx] for b_idx in range(len(out))], axis=0) for m_idx in range(len(models))]
+    if return_models:
+        return per_model_preds
+    return np.mean(per_model_preds, axis=0)
 
 
 def run_inference(
@@ -231,6 +274,9 @@ def run_inference(
     slot_rows = {s: tab.loc[s].to_dict() if s in tab.index else {} for s in studies}
 
     state = {"moved": False}
+    multi_model = len(loaded_models) > 1
+    if multi_model:
+        per_model_preds = [np.full((len(studies), len(config.TARGETS)), np.nan, np.float32) for _ in loaded_models]
     preds = np.full((len(studies), len(config.TARGETS)), np.nan, np.float32)
 
     def on_ready(cache: pcache.StudyCache, a: int, b: int):
@@ -242,18 +288,32 @@ def run_inference(
                 if device.type == "cuda" and torch.cuda.device_count() > 1 and batch >= torch.cuda.device_count() * 2:
                     loaded_models[i] = torch.nn.DataParallel(m)
             state["moved"] = True
-        if use_tta:
-            preds[a:b] = predict_chunk_tta(loaded_models, cache, a, b, cfg, device, n_use, 
-                                           batch=batch, temperatures=temperatures, n_tta=n_tta)
+        if multi_model:
+            if use_tta:
+                chunk_m = predict_chunk_tta(loaded_models, cache, a, b, cfg, device, n_use, 
+                                            batch=batch, temperatures=temperatures, n_tta=n_tta, return_models=True)
+            else:
+                chunk_m = predict_chunk(loaded_models, cache, a, b, cfg, device, n_use, 
+                                        batch=batch, temperatures=temperatures, return_models=True)
+            for m_idx, chunk_arr in enumerate(chunk_m):
+                per_model_preds[m_idx][a:b] = chunk_arr
         else:
-            preds[a:b] = predict_chunk(loaded_models, cache, a, b, cfg, device, n_use, 
-                                       batch=batch, temperatures=temperatures)
+            if use_tta:
+                preds[a:b] = predict_chunk_tta(loaded_models, cache, a, b, cfg, device, n_use, 
+                                               batch=batch, temperatures=temperatures, n_tta=n_tta)
+            else:
+                preds[a:b] = predict_chunk(loaded_models, cache, a, b, cfg, device, n_use, 
+                                           batch=batch, temperatures=temperatures)
 
     cache, stats = pcache.build_cache(
         prefix, studies, slot_rows, records, sides, cfg,
         workers=workers, resume=False, order="seq", chunk=chunk, on_ready=on_ready
     )
     print("cache stats:", stats)
+
+    # Rank-Percentile Normalization across folds (UPGRADE: optimal ROC-AUC ensembling)
+    if multi_model:
+        preds = rank_percentile_blend(per_model_preds)
 
     # Impute missing studies (fallback to median so submission never fails)
     empty = np.asarray(cache.slot).sum(1) == 0

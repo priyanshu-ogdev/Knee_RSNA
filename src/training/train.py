@@ -247,7 +247,7 @@ def run_training(
     fold: int = 0,
     out_dir: str = ".",
     epochs: int | None = None,
-    n_windows_train: int = 8,  # FIX 3: 8 windows covers 73% of the 24-depth stack vs 35% at 4
+    n_windows_train: int = 4,  # FIX 3: 8 windows covers 73% of the 24-depth stack vs 35% at 4
     num_workers: int = 8, # Safe feed rate for 16 studies per step
     seed: int = config.SEED,
     # model

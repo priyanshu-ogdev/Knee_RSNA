@@ -308,7 +308,7 @@ def run_inference(
     def on_ready(cache: pcache.StudyCache, a: int, b: int):
         # Workers were forked at the first submit, i.e., before any CUDA call in this process.
         if not state["moved"]:
-for i, m in enumerate(loaded_models):
+            for i, m in enumerate(loaded_models):
                 # 1. Native FP16 Casting (Faster than autocast overhead)
                 m = m.eval().half().to(device, non_blocking=True)
                 

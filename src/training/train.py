@@ -189,7 +189,7 @@ def train_epoch(
         is_last = (micro_step + 1) == len(dataloader)
         if (micro_step + 1) % grad_accum == 0 or is_last:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 0.5, foreach=True)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)

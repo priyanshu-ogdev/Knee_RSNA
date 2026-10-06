@@ -247,7 +247,7 @@ class Model(nn.Module):
             if torch.cuda.is_available():
                 try:
                     gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                    self._cached_chunk_size = 256 if gb >= 24.0 else 64
+                    self._cached_chunk_size = 108 if gb >= 24.0 else 64
                 except Exception:
                     self._cached_chunk_size = 64
             else:
@@ -277,8 +277,10 @@ class Model(nn.Module):
 
         if len(valid_idx) > 0:
             flat_imgs = imgs.reshape(B * S * W, *imgs.shape[3:])
-            x_valid = flat_imgs[valid_idx].to(dtype=torch.float32).div_(255.0)
-            x_valid.sub_(self.mean).div_(self.std)
+            # Native BF16 normalization if CUDA BF16 supported: cuts bandwidth by 2x
+            dtype = torch.bfloat16 if (imgs.is_cuda and torch.cuda.is_bf16_supported()) else torch.float32
+            x_valid = flat_imgs[valid_idx].to(dtype=dtype).div_(255.0)
+            x_valid.sub_(self.mean.to(dtype=dtype)).div_(self.std.to(dtype=dtype))
 
             # Hardware-adaptive chunk size: 256 on 130GB Blackwell GB10 / A100, 64 on 16GB Kaggle T4
             chunk_size = self._get_chunk_size()

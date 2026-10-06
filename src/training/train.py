@@ -262,7 +262,7 @@ def run_training(
     out_dir: str = ".",
     epochs: int | None = None,
     n_windows_train: int = config.N_WINDOWS_TRAIN,  # 6 windows covers ~65% continuous volume
-    num_workers: int = 10, # Utilize half of the 20 DGX CPU cores
+    num_workers: int = 14, # Utilize 14 of 20 DGX CPU cores, buffering ~35GB RAM
     seed: int = config.SEED,
     # model
     variant: str = "dinov2-base",         # Upgrade A: default to Base
@@ -348,7 +348,7 @@ def run_training(
         drop_last=len(tr) > batch_size, num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=False,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=3 if num_workers > 0 else None,
     )
     dl_va = None
     if len(va):
@@ -357,7 +357,7 @@ def run_training(
             ds_va, batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=(device.type == "cuda"),
             persistent_workers=False,
-            prefetch_factor=2 if num_workers > 0 else None,
+            prefetch_factor=3 if num_workers > 0 else None,
         )
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────

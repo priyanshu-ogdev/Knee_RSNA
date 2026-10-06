@@ -248,7 +248,7 @@ class Model(nn.Module):
                 try:
                     gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                     if gb >= 80.0:
-                        self._cached_chunk_size = 144  # 130GB GB10 / 80GB A100: exactly 2 balanced chunks for batch of 16
+                        self._cached_chunk_size = 288  # 130GB GB10: single fused chunk for entire batch of 16 (max Tensor Core throughput)
                     elif gb >= 24.0:
                         self._cached_chunk_size = 96   # 24-48GB GPUs (RTX 3090/4090, A5000/A6000)
                     else:

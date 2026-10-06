@@ -212,7 +212,8 @@ def train_epoch(
             sec_per_step = dt / n_step_win
             rem_sec = (total_batches - (micro_step + 1)) * sec_per_step
             avg_loss = (total_loss_tensor.item()) / max(n, 1)
-            print(f"  [Epoch {epoch:2d}/{total_epochs:2d} | Step {micro_step + 1:3d}/{total_batches:3d}] Loss: {avg_loss:.4f} | {sec_per_step:.2f}s/step | ETA: {rem_sec/60:.1f}m", flush=True)
+            vram_str = f" | VRAM: {torch.cuda.memory_allocated() / 1e9:.1f}/{torch.cuda.memory_reserved() / 1e9:.1f}GB" if device.type == "cuda" else ""
+            print(f"  [Epoch {epoch:2d}/{total_epochs:2d} | Step {micro_step + 1:3d}/{total_batches:3d}] Loss: {avg_loss:.4f} | {sec_per_step:.2f}s/step | ETA: {rem_sec/60:.1f}m{vram_str}", flush=True)
             step_t0 = time.time()
 
     return float(total_loss_tensor.item()) / max(n, 1)

@@ -349,7 +349,7 @@ def run_training(
     if len(va):
         ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False)
         dl_va = DataLoader(
-            ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
+            ds_va, batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=(device.type == "cuda"),
             persistent_workers=False,
             prefetch_factor=2 if num_workers > 0 else None,

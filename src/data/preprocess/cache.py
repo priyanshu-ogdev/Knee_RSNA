@@ -47,14 +47,14 @@ class StudyCache:
         self.slot = np.memmap(p['slot'], np.uint8, m, shape=(N, S))
         self.done = np.memmap(p['done'], np.uint8, m, shape=(N,))
         self.index = {s: i for i, s in enumerate(self.studies)}
-        # LINUX / GB10 SPEEDUP: Hint kernel for random page access on NVMe SSD
+        # LINUX / GB10 SPEEDUP: Hint kernel for standard cached access so RAM buffers active studies
         try:
             import mmap as _py_mmap
-            if hasattr(_py_mmap, 'MADV_RANDOM'):
+            if hasattr(_py_mmap, 'MADV_NORMAL'):
                 for a in (self.images, self.valid, self.slot, self.done):
                     mm = getattr(a, '_mmap', None) or getattr(getattr(a, 'base', None), '_mmap', None)
                     if mm:
-                        mm.madvise(_py_mmap.MADV_RANDOM)
+                        mm.madvise(_py_mmap.MADV_NORMAL)
         except Exception:
             pass
 

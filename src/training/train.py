@@ -452,8 +452,8 @@ def run_training(
     cfg    = cache_cfg(cache_prefix)   # config the cache was BUILT with — never re-derive
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df     = pd.read_csv(labels_csv)
-    model_type = model_type or ("coatnet_mil" if variant.startswith("coatnet") else "dinov2")
-    if model_type not in {"dinov2", "coatnet_mil"}:
+    model_type = model_type or ("coatnet_mil" if variant.startswith("coatnet") else ("timm_mil" if not variant.startswith("dinov2") else "dinov2"))
+    if model_type not in {"dinov2", "coatnet_mil", "timm_mil"}:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
     if folds_csv:
@@ -483,7 +483,7 @@ def run_training(
         encode_chunk_size=encode_chunk_size,
         pretrained=pretrained,
     ).to(device)
-    if model_type == "coatnet_mil":
+    if model_type in ("coatnet_mil", "timm_mil"):
         model_config = {
             "model_type": model_type,
             "variant": variant,
@@ -528,7 +528,7 @@ def run_training(
     # ── Datasets ─────────────────────────────────────────────────────────────
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
     ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
-    eval_batch_size = 1 if model_type == "coatnet_mil" else batch_size * 2
+    eval_batch_size = 1 if model_type in ("coatnet_mil", "timm_mil") else batch_size * 2
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────
     # IMPROVEMENT 3: WD=0 for biases and norm layers (standard ViT recipe).
@@ -540,7 +540,7 @@ def run_training(
     inner_model = model  # alias for clarity in checkpoint saving below
     backbone_params = []
     head_params = []
-    if model_type == "coatnet_mil":
+    if model_type in ("coatnet_mil", "timm_mil"):
         named_groups = [
             (
                 [(f"backbone.{name}", parameter)
@@ -615,7 +615,7 @@ def run_training(
         )
     optimizer_groups = (
         head_params + backbone_params
-        if model_type == "coatnet_mil"
+        if model_type in ("coatnet_mil", "timm_mil")
         else [{"params": head_params, "lr": config.LR_HEAD, "weight_decay": 0.0}]
         + backbone_params
     )

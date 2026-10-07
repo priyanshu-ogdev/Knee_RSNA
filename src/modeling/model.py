@@ -250,7 +250,7 @@ class Model(nn.Module):
                     if gb >= 80.0:
                         self._cached_chunk_size = 512  # 130GB GB10: Safe high-parallelism
                     elif gb >= 24.0:
-                        self._cached_chunk_size = 256  # 24-48GB GPUs: Saturates Tensor Cores perfectly without triggering Unified Memory swap hangs
+                        self._cached_chunk_size = 96  # 24-48GB GPUs: Strictly bounds VRAM < 41GB to prevent NVLink swap lag
                     else:
                         self._cached_chunk_size = 48   # 16GB Kaggle T4 / P100
                 except Exception:

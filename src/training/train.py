@@ -590,7 +590,6 @@ def run_training(
                 pin_memory=(device.type == "cuda"),
                 persistent_workers=False,
                 prefetch_factor=2 if num_workers > 0 else None,
-                multiprocessing_context="forkserver" if num_workers > 0 and hasattr(torch.multiprocessing, "get_context") else None,
             )
             active_loaders = [dl_tr]
 
@@ -627,7 +626,6 @@ def run_training(
                     num_workers=num_workers, pin_memory=(device.type == "cuda"),
                     persistent_workers=False,
                     prefetch_factor=2 if num_workers > 0 else None,
-                    multiprocessing_context="forkserver" if num_workers > 0 and hasattr(torch.multiprocessing, "get_context") else None,
                 )
                 active_loaders = [dl_va]
                 score, per = evaluate(model, dl_va, device)

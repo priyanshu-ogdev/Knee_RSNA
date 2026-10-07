@@ -282,6 +282,8 @@ def train_epoch(
     step_t0 = time.time()
     total_batches = len(dataloader)
     for micro_step, batch in enumerate(dataloader):
+        if micro_step == 0:
+            step_t0 = time.time()  # Reset timer AFTER the massive 3-minute DataLoader prefetch penalty!
         # ── HARD UNIFIED MEMORY CIRCUIT BREAKER (CHECKED EVERY MICRO-STEP) ──
         check_memory_circuit_breaker(
             stage=f"Training Epoch {epoch}/{total_epochs} Step {micro_step + 1}/{total_batches}"

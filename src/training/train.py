@@ -435,6 +435,12 @@ def run_training(
     ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.9998))
 
     os.makedirs(out_dir, exist_ok=True)
+    fold_log_file = os.path.join(out_dir, f"fold{fold}_training.log")
+    try:
+        with open(fold_log_file, "a", encoding="utf-8") as f_log:
+            f_log.write(f"=== Starting Fold {fold} Training | Total Epochs: {n_ep} | Batch Size: {batch_size} | Time: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    except Exception:
+        pass
     best, t0 = -1.0, time.time()
     epochs_no_improve = 0
 
@@ -492,6 +498,11 @@ def run_training(
                 torch.cuda.empty_cache()
 
         print(msg, flush=True)
+        try:
+            with open(fold_log_file, "a", encoding="utf-8") as f_log:
+                f_log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
 
         # ── SWA weight accumulation ───────────────────────────────────────────
         if swa_model is not None and ep >= swa_start:

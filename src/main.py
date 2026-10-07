@@ -498,22 +498,52 @@ def main():
     work_dir = args.work_dir or os.environ.get("RSNA_OUT_DIR", os.path.join(PROJECT_ROOT, "pipeline_out"))
     os.makedirs(work_dir, exist_ok=True)
 
-    # Logging setup
+    # Logging setup: Master dual-channel logging (Terminal + File)
     import logging
+    import builtins
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(work_dir, f"master_pipeline_{timestamp}.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
-    )
+    
+    # Configure root logger with unified formatting
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers = []  # Clear any default handlers
+    
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
 
-    def logged_print(*p_args, **p_kwargs):
-        msg = " ".join(str(a) for a in p_args)
-        logging.info(msg)
+    _orig_print = builtins.print
 
-    global print
-    print = logged_print
+    def global_logged_print(*p_args, **p_kwargs):
+        target_file = p_kwargs.get("file", None)
+        if target_file is not None and target_file not in (sys.stdout, sys.stderr):
+            return _orig_print(*p_args, **p_kwargs)
+        sep = p_kwargs.get("sep", " ")
+        msg = sep.join(str(a) for a in p_args)
+        if target_file == sys.stderr:
+            logging.error(msg)
+        else:
+            logging.info(msg)
+
+    # Universal monkey-patch of builtins.print so EVERY module (train.py, runner.py, etc.)
+    # automatically routes all print statements into master_pipeline_*.log
+    builtins.print = global_logged_print
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logging.critical("Uncaught Exception encountered in master pipeline:", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = handle_exception
 
     print("=" * 80)
     print("RSNA 2026: END-TO-END MASTER TRAINING & BUILD PIPELINE")

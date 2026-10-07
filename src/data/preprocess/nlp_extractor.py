@@ -520,7 +520,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
             "quantization": use_quant,
         }
     
-    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.85"))
+    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
     enforce_eager_flag = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
     
     llm = LLM(
@@ -974,7 +974,7 @@ def auto_complete_extraction(
         try:
             print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
             model_to_use = model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
-            gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.85"))
+            gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
             enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
             use_quant = os.environ.get("VLLM_QUANTIZATION", "none").lower()
 

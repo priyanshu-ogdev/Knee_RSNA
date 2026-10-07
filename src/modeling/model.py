@@ -126,7 +126,7 @@ class CrossSlotTransformer(nn.Module):
             batch_first=True,
             norm_first=True,           # pre-norm = more stable
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers, enable_nested_tensor=False)
         self.out_drop = nn.Dropout(p=0.1)  # prevents SlotHead memorising scanner-specific slot interaction patterns
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

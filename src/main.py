@@ -62,7 +62,7 @@ if hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 if hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
@@ -550,8 +550,8 @@ def main():
         msg = " ".join(str(a) for a in p_args)
         logging.info(msg)
 
-    global print
-    print = logged_print
+    import builtins
+    builtins.print = logged_print
 
     print("=" * 80)
     print("RSNA 2026: END-TO-END MASTER TRAINING & BUILD PIPELINE")

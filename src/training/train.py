@@ -620,8 +620,8 @@ def run_training(
             # Instantiated ONLY during validation with throttled workers & batch size, bounding pinned memory to ~4.6 GB.
             if ds_va is not None:
                 dl_va = DataLoader(
-                    ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
-                    num_workers=min(4, num_workers), pin_memory=(device.type == "cuda"),
+                    ds_va, batch_size=batch_size * 2, shuffle=False,
+                    num_workers=num_workers, pin_memory=(device.type == "cuda"),
                     persistent_workers=False,
                     prefetch_factor=2 if num_workers > 0 else None,
                 )

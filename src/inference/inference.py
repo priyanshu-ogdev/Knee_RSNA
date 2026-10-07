@@ -370,7 +370,7 @@ def run_inference(
         getattr(model, "_rsna_model_type", getattr(model, "model_type", "dinov2"))
         for model in loaded_models
     ]
-    unknown_types = set(model_types) - {"dinov2", "coatnet_mil"}
+    unknown_types = set(model_types) - {"dinov2", "coatnet_mil", "timm_mil"}
     if unknown_types:
         raise ValueError(f"Unsupported model families in inference ensemble: {sorted(unknown_types)}")
     cfg = resolve_preprocessing_config(loaded_models, cfg)

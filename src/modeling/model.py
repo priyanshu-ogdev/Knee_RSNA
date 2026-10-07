@@ -371,16 +371,16 @@ def build_model(
         Whether to include the CrossSlotTransformer between WindowPool and
         SlotHead.  Set False for ablation comparison with baseline head.
     """
-    model_type = model_type or ("coatnet_mil" if variant.startswith("coatnet") else "dinov2")
-    if model_type == "coatnet_mil":
+    model_type = model_type or ("coatnet_mil" if variant.startswith("coatnet") else ("timm_mil" if not variant.startswith("dinov2") else "dinov2"))
+    if model_type in ("coatnet_mil", "timm_mil"):
         return build_timm_attention_mil(
             variant,
             pretrained=pretrained,
             input_size=input_size,
             encode_chunk_size=encode_chunk_size,
         )
-    if model_type != "dinov2":
-        raise ValueError(f"Unknown model_type {model_type!r}; expected 'dinov2' or 'coatnet_mil'")
+    if model_type not in ("dinov2", "coatnet_mil", "timm_mil"):
+        raise ValueError(f"Unknown model_type {model_type!r}; expected 'dinov2', 'coatnet_mil', or 'timm_mil'")
 
     src = variant if os.path.isdir(variant) else f"facebook/{variant}"
     try:
@@ -456,7 +456,7 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
     model_config.setdefault("variant", ckpt.get("variant", "dinov2-base"))
     model_config.setdefault(
         "model_type",
-        ckpt.get("model_type", "coatnet_mil" if model_config["variant"].startswith("coatnet") else "dinov2"),
+        ckpt.get("model_type", "coatnet_mil" if model_config["variant"].startswith("coatnet") else ("timm_mil" if not model_config["variant"].startswith("dinov2") else "dinov2")),
     )
     model_config.setdefault("use_cross_slot", ckpt.get("use_cross_slot", True))
     if "lora_rank" not in model_config:

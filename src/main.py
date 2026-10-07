@@ -556,7 +556,7 @@ def main():
     parser.add_argument("--grad_accum", type=int, default=config.GRAD_ACCUM, help="Gradient accumulation steps")
     parser.add_argument("--n_windows_train", type=int, default=config.N_WINDOWS_TRAIN, help="Windows sampled per anatomical slot during training")
     parser.add_argument("--folds", type=str, default="0,1,2,3,4", help="Comma-separated list of folds to train (e.g. '0,1,2,3,4')")
-    parser.add_argument("--model_type", choices=["dinov2", "coatnet_mil"], default="dinov2", help="Training architecture family")
+    parser.add_argument("--model_type", choices=["dinov2", "coatnet_mil", "timm_mil"], default="dinov2", help="Training architecture family")
     parser.add_argument("--variant", type=str, default=None, help="Backbone variant or timm architecture name (defaults by model family)")
     parser.add_argument("--random_init", action="store_true", help="Do not load timm pretrained weights (CoAtNet MIL only)")
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
@@ -573,7 +573,7 @@ def main():
     if args.variant is None:
         args.variant = (
             "coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k"
-            if args.model_type == "coatnet_mil"
+            if args.model_type in ("coatnet_mil", "timm_mil")
             else "dinov2-base"
         )
     if args.ensemble_checkpoints:

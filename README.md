@@ -4,9 +4,9 @@ This guide covers the deployment of the RSNA Knee Abnormality Detection pipeline
 
 ## 1. System Requirements
 - **OS:** Linux (Ubuntu 20.04/22.04 recommended for DGX)
-- **RAM:** 64GB+ (128GB+ Unified Memory or GPU memory for `Nemotron-70B` NLP Extraction)
-- **Storage:** ~700GB NVMe SSD (570GB for Kaggle Dataset + 70GB for Memmap Cache + 50GB for weights/logs)
-- **GPUs:** Multi-GPU supported (e.g., 4x T4, A100, H100). The NLP Extractor and Training engines will automatically utilize all available GPUs via Tensor Parallelism and Distributed Data Parallelism where applicable.
+- **Memory:** 128GB unified memory is suitable for the DGX Spark workflow. NLP model memory depends on the selected engine/model and its quantization; the pipeline does not assume multi-GPU availability.
+- **Storage:** Provision space for the competition DICOMs plus the selected cache. The default cache is approximately **227 GB decimal** for 4,407 studies at 518×518×32×6, before metadata and scratch space. Keep at least 1 TB free for the full dataset, cache, checkpoints, and logs.
+- **Hardware:** DGX Spark / GB10 is supported through the regular PyTorch CUDA path. DICOM/cache work is CPU- and NVMe-intensive; it does not use unified memory as a substitute for disk capacity.
 
 ---
 
@@ -56,33 +56,29 @@ KAGGLE_KEY=your_kaggle_api_key
 
 ## 4. Execution Pipeline
 
-### Phase 1: NLP Pseudo-Label Extraction
-Before running the main pipeline, you **must** extract the pseudo-labels from the radiology reports. The script will automatically use `kagglehub` to download the competition dataset (~570GB) and then boot up the `vLLM` engine to process the 4,349 reports.
+### Phase 1: Prepare and validate the complete dataset
+Use the competition data directory containing `train.csv`, `train_series.csv`, and the complete `train_series/` DICOM tree. Run preparation separately before launching training:
 
 ```bash
-python src/data/preprocess/nlp_extractor.py
+python src/main.py --data_root /path/to/competition --work_dir /path/to/rsna_run --fresh_preprocessing --prepare_only
 ```
-**What happens here:**
-1. The 570GB dataset is downloaded to `Knee_RSNA/data/competitions/rsna-knee-abnormality-detection`.
-2. `vLLM` loads the 70B model across your GPUs.
-3. The hardened Chain-of-Thought (CoT) engine extracts the states.
-4. It outputs `pseudo_labels.csv` directly into the Kaggle data directory.
 
----
+`--fresh_preprocessing` deliberately rebuilds the DICOM index and cache at the selected dimensions; it also forces fresh NLP extraction. This overwrites generated artifacts in `work_dir`, so use it only when a from-scratch run is intended. The default NLP engine is `auto`: it selects vLLM only when available with CUDA, otherwise the explicit clinical-rules extractor. Set `--nlp_engine vllm` or `--nlp_engine rules` to choose directly. Runtime failures do not switch engines mid-run. Each pseudo-label file has a provenance manifest; the label merge preserves gold values per target and uses report-derived values only where gold is missing.
 
-### Phases 2 & 3: Master Training Pipeline
-Once `pseudo_labels.csv` exists, you can launch the master orchestrator.
+Preparation checks:
+1. NLP outputs are bound to the exact `train.csv`, extractor/prompt version, model, report hashes, and label-engine choice.
+2. DICOM series are indexed and compared against both competition CSVs; study/series coverage, geometry, laterality, and selected-slot decode failures are checked.
+3. Five folds are regenerated from current data. The compact EDA dHash is used only for cross-study pairs sharing at least two distinct series hashes; single-hash collisions are not treated as confirmed duplicates.
+4. The cache shape and source signature are recorded. It does not silently reduce resolution when disk is short; configure `CACHE_IMG_SIZE` / `CACHE_STACK_DEPTH` explicitly if needed.
+5. Machine-readable reports are written to `dataset_preparation_manifest.json`, `folds_manifest.json`, `idx/report.json`, and `qc/cache_sanity.json`. Training is not allowed unless the preparation manifest reaches `status: complete` and the full-cache QC gate passes.
+
+If DICOM download is incomplete, the run emits `status: awaiting_dicom` and does not proceed to training. Once preparation passes, launch the ordinary pipeline to resume the validated cache and train:
 
 ```bash
-python src/main.py
+python src/main.py --data_root /path/to/competition --work_dir /path/to/rsna_run
 ```
-**What happens here:**
-1. **Idempotency Check:** It verifies the NLP labels exist.
-2. **Cache Build (Phase 2):** It parses the DICOMs, applies the mathematically correct single-rescale pixel pipeline, and builds a massive 60GB memory-mapped `cache_v2/` binary array. 
-   - *Note: You will see a live ETA in your terminal (e.g., `45.3 studies/s | ETA: 00:01:35`).*
-3. **Training (Phase 3):** It initiates the 5-Fold DINOv2 3D Transformer training loop.
-4. **Logging:** Everything you see in the terminal is permanently saved to `pipeline_run_YYYYMMDD_HHMMSS.log`.
-5. **Output:** Superior Exponential Moving Average (EMA) checkpoints are saved to `pipeline_out/models_foldX/foldX_ema.pt`.
+
+Without `--prepare_only`, the same pipeline performs the preparation gates first and then proceeds directly to the configured training run. Training logs and checkpoints are saved under `work_dir`.
 
 ---
 

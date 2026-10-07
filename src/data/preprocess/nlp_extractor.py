@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import hashlib
 import pandas as pd
 import torch
 import time
@@ -23,10 +24,67 @@ TARGETS = [
     "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"
 ]
 
+EXTRACTOR_VERSION = "clinical-report-labels-v2"
 
-def _validated_extraction_rows(frame: pd.DataFrame, expected_uids: set[str]) -> pd.DataFrame:
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_json(path: str, payload: dict) -> None:
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _atomic_csv(frame: pd.DataFrame, path: str) -> None:
+    temporary = f"{path}.tmp"
+    frame.to_csv(temporary, index=False)
+    os.replace(temporary, path)
+
+
+def _report_sha256(report: str) -> str:
+    return hashlib.sha256(str(report).encode("utf-8")).hexdigest()
+
+
+def _empty_extraction_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "StudyInstanceUID",
+            *TARGETS,
+            *(f"{target}_weight" for target in TARGETS),
+            "report_sha256",
+            "extractor_version",
+            "engine",
+            "model_id",
+            "prompt_sha256",
+        ]
+    )
+
+
+def _validated_extraction_rows(
+    frame: pd.DataFrame,
+    expected_uids: set[str],
+    expected_report_hashes: dict[str, str] | None = None,
+    expected_provenance: dict[str, str] | None = None,
+) -> pd.DataFrame:
     """Keep only complete, in-range extraction rows for the requested studies."""
-    required = {"StudyInstanceUID", *TARGETS}
+    required = {
+        "StudyInstanceUID",
+        *TARGETS,
+        *(f"{target}_weight" for target in TARGETS),
+    }
+    if expected_report_hashes is not None:
+        required.add("report_sha256")
+    if expected_provenance:
+        required.update(expected_provenance)
     if not required.issubset(frame.columns):
         return frame.iloc[0:0].copy()
 
@@ -39,10 +97,14 @@ def _validated_extraction_rows(frame: pd.DataFrame, expected_uids: set[str]) -> 
         valid &= values.notna() & values.between(0.0, 1.0)
         clean[target] = values
         weight_column = f"{target}_weight"
-        if weight_column in clean.columns:
-            weights = pd.to_numeric(clean[weight_column], errors="coerce")
-            valid &= weights.notna() & weights.ge(0.0) & weights.le(1.0)
-            clean[weight_column] = weights
+        weights = pd.to_numeric(clean[weight_column], errors="coerce")
+        valid &= weights.notna() & weights.ge(0.0) & weights.le(1.0)
+        clean[weight_column] = weights
+    if expected_report_hashes is not None:
+        expected_hash = clean["StudyInstanceUID"].map(expected_report_hashes)
+        valid &= clean["report_sha256"].astype(str).eq(expected_hash.astype(str))
+    for column, expected in (expected_provenance or {}).items():
+        valid &= clean[column].astype(str).eq(str(expected))
     return clean.loc[valid].drop_duplicates("StudyInstanceUID", keep="last")
 
 
@@ -379,6 +441,11 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         return None
 
 def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"):
+    """Compatibility entry point using the provenance-checked, strict vLLM path."""
+    return auto_complete_extraction(data_root, out_csv, model_id=model_id, engine="vllm")
+
+
+def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"):
     print("=" * 80)
     print("PHASE 1: OFFLINE MASS-BATCH NLP EXTRACTION (vLLM)")
     print("=" * 80)
@@ -735,12 +802,11 @@ def auto_complete_extraction(
 ) -> tuple[str, dict]:
     """Unified Auto-Detection & Completion Engine for NLP Pseudo-Labels.
     
-    1. Scans train.csv to identify all non-gold studies requiring extraction.
+    1. Scans train.csv to identify studies with a report and at least one missing target.
     2. Inspects out_csv to determine already completed studies.
-    3. If 100% complete (4,349 studies), immediately returns out_csv.
-    4. If incomplete or missing, auto-selects engine (vLLM if available/requested, else Clinical Shield rules)
-       and resumes extraction from the exact missing UIDs without repeating work.
-    5. Saves checkpoints atomically to prevent file corruption.
+    3. Reuses rows only when the run manifest, source report hash, prompt, engine, and model match.
+    4. Selects one engine for the run and never changes labeling methodology after a runtime failure.
+    5. Saves rows and provenance checkpoints atomically.
     
     Returns:
         (out_csv_path, stats_dict)
@@ -754,136 +820,245 @@ def auto_complete_extraction(
         raise FileNotFoundError(f"train.csv not found at {train_path}")
         
     train_df = pd.read_csv(train_path)
+    for target in TARGETS:
+        if target not in train_df.columns:
+            train_df[target] = pd.NA
     if train_df['StudyInstanceUID'].isna().any():
         raise ValueError("train.csv contains a missing StudyInstanceUID")
     train_df['StudyInstanceUID'] = train_df['StudyInstanceUID'].astype(str).str.strip()
     if train_df['StudyInstanceUID'].eq("").any() or train_df['StudyInstanceUID'].duplicated().any():
         raise ValueError("train.csv must have non-empty, unique StudyInstanceUID values")
     gold_mask = train_df[TARGETS].notna().any(axis=1)
+    fully_labeled_mask = train_df[TARGETS].notna().all(axis=1)
     
     report_col = 'Report' if 'Report' in train_df.columns else ('report' if 'report' in train_df.columns else None)
     if report_col is None:
         raise KeyError("Could not find 'Report' or 'report' column in train.csv")
         
-    needed_df = train_df[~gold_mask & train_df[report_col].notna() & (train_df[report_col].astype(str).str.strip() != '')].copy()
+    reports = train_df[report_col].fillna("").astype(str)
+    report_present = reports.str.strip().ne("")
+    needed_df = train_df[~fully_labeled_mask & report_present].copy()
+    needed_df["_report_text"] = reports.loc[needed_df.index]
     total_needed = len(needed_df)
     needed_uids = set(needed_df['StudyInstanceUID'])
+    report_hashes = dict(
+        zip(
+            needed_df["StudyInstanceUID"],
+            needed_df["_report_text"].map(_report_sha256),
+        )
+    )
     
-    print(f"[STATUS] Dataset Studies: {len(train_df)} total | Gold Labeled: {int(gold_mask.sum())} | Requiring NLP Extraction: {total_needed}")
+    print(
+        f"[STATUS] Dataset Studies: {len(train_df)} total | "
+        f"Gold-labeled: {int(gold_mask.sum())} | Fully labeled: {int(fully_labeled_mask.sum())} | "
+        f"Reports requiring missing-target completion: {total_needed}"
+    )
     
-    # 1. Check existing out_csv
+    # Resolve the engine once per run. A runtime failure must not silently switch
+    # labeling methodology part-way through the dataset.
+    selected_engine = engine.lower()
+    if selected_engine == "auto":
+        selected_engine = "vllm" if LLM is not None and torch.cuda.is_available() else "rules"
+    if selected_engine not in {"vllm", "rules"}:
+        raise ValueError(f"Unsupported NLP extraction engine: {engine!r}")
+    if selected_engine == "vllm" and LLM is None:
+        raise ImportError("vLLM was requested but is not installed; refusing to switch to rules labels")
+
+    resolved_model = (
+        model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
+        if selected_engine == "vllm"
+        else "clinical-rules-v1"
+    )
+    prompt_sha256 = hashlib.sha256(build_prompt("__REPORT_TEXT__").encode("utf-8")).hexdigest()
+    train_sha256 = _sha256_file(train_path)
+    contract = {
+        "extractor_version": EXTRACTOR_VERSION,
+        "train_csv_sha256": train_sha256,
+        "engine": selected_engine,
+        "model_id": resolved_model,
+        "prompt_sha256": prompt_sha256,
+        "required_studies": len(needed_uids),
+    }
+    manifest_path = f"{out_csv}.manifest.json"
+    output_dir = os.path.dirname(os.path.abspath(out_csv))
+    os.makedirs(output_dir, exist_ok=True)
+    if force:
+        _atomic_csv(_empty_extraction_frame(), out_csv)
+
+    # 1. Reuse only artifacts generated from this exact input/engine contract.
     existing_results = []
     done_uids = set()
-    if os.path.exists(out_csv) and not force:
+    manifest_matches = False
+    if os.path.exists(manifest_path) and not force:
+        try:
+            with open(manifest_path, encoding="utf-8") as stream:
+                old_manifest = json.load(stream)
+            manifest_matches = all(old_manifest.get(k) == v for k, v in contract.items())
+        except Exception as e:
+            print(f"[WARNING] Could not validate NLP manifest ({e}); cached labels will be regenerated.")
+    if os.path.exists(out_csv) and not force and manifest_matches:
         try:
             existing_df = pd.read_csv(out_csv)
-            valid_existing = _validated_extraction_rows(existing_df, needed_uids)
+            valid_existing = _validated_extraction_rows(
+                existing_df,
+                needed_uids,
+                report_hashes,
+                {
+                    "extractor_version": EXTRACTOR_VERSION,
+                    "engine": selected_engine,
+                    "model_id": resolved_model,
+                    "prompt_sha256": prompt_sha256,
+                },
+            )
             done_uids = set(valid_existing['StudyInstanceUID'])
             existing_results = valid_existing.to_dict('records')
             print(
                 f"[AUTO-DETECT] Valid cached extractions: {len(done_uids)} / "
-                f"{total_needed}; incomplete or invalid rows will be regenerated."
+                f"{total_needed}; incomplete, stale, or invalid rows will be regenerated."
             )
         except Exception as e:
-            print(f"[WARNING] Could not parse existing {out_csv} ({e}). Starting fresh.")
+            print(f"[WARNING] Could not validate cached labels ({e}). Starting fresh.")
             existing_results = []
             done_uids = set()
+    elif os.path.exists(out_csv):
+        print("[INFO] Cached NLP labels do not match the current input/engine contract; rebuilding them.")
             
     # 2. Check for completion
     if len(done_uids) >= total_needed:
-        if existing_results:
-            df_out = pd.DataFrame(existing_results)
-            tmp_csv = f"{out_csv}.tmp"
-            df_out.to_csv(tmp_csv, index=False)
-            os.replace(tmp_csv, out_csv)
+        _atomic_csv(
+            pd.DataFrame(existing_results) if existing_results else _empty_extraction_frame(),
+            out_csv,
+        )
+        _atomic_json(
+            manifest_path,
+            {
+                **contract,
+                "status": "complete",
+                "completed_studies": len(done_uids),
+                "pseudo_csv_sha256": _sha256_file(out_csv),
+                "gold_studies": int(gold_mask.sum()),
+                "fully_labeled_studies": int(fully_labeled_mask.sum()),
+                "target_values_pending": int(train_df[TARGETS].isna().sum().sum()),
+                "blank_report_studies": int((~report_present).sum()),
+            },
+        )
         print(f"[SUCCESS] Pseudo-labels are 100% COMPLETE ({len(done_uids)} / {total_needed} studies verified).")
         print(f"[SUCCESS] File ready at: {out_csv}")
-        return out_csv, {"status": "complete", "total": len(done_uids), "new": 0, "engine": "cached"}
+        return out_csv, {
+            "status": "complete",
+            "total": len(done_uids),
+            "new": 0,
+            "engine": selected_engine,
+            "model_id": resolved_model,
+        }
         
     remaining_df = needed_df[~needed_df['StudyInstanceUID'].isin(done_uids)].copy()
     print(f"[AUTO-DETECT] Remaining to extract: {len(remaining_df)} studies ({len(done_uids)/max(1, total_needed)*100:.1f}% previously done).")
     
-    # 3. Engine Selection
-    selected_engine = engine.lower()
-    if selected_engine == "auto":
-        if LLM is not None and torch.cuda.is_available():
-            selected_engine = "vllm"
-        else:
-            selected_engine = "rules"
-            
     print(f"[CONFIG] NLP Extraction Engine Selected: '{selected_engine.upper()}'")
+    print(f"[CONFIG] NLP source model/engine revision: {resolved_model}")
     
     # 4. Execution
     start_time = time.time()
     out_dir = os.path.dirname(out_csv)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+    _atomic_json(
+        manifest_path,
+        {**contract, "status": "in_progress", "completed_studies": len(done_uids)},
+    )
         
     results = existing_results
     
     if selected_engine == "vllm":
-        if LLM is None:
-            print("[WARNING] vLLM not available in this environment. Falling back to Clinical Shield Rules engine.")
-            selected_engine = "rules"
-        else:
-            try:
-                print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
-                # Run vLLM chunk processing
-                model_to_use = model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
-                gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
-                enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
-                use_quant = os.environ.get("VLLM_QUANTIZATION", "none").lower()
-                
-                llm_kwargs = {}
-                if use_quant in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
-                    llm_kwargs = {"quantization": "fp8"}
-                elif use_quant in ["bitsandbytes", "bnb"]:
-                    print("[INFO] Note: bitsandbytes quantization is not supported in vLLM v1 engine. Running unquantized native precision.")
-                elif use_quant not in ["none", "null", "false", "fp16", "bf16"]:
-                    llm_kwargs = {"quantization": use_quant}
-                    
-                llm = LLM(
-                    model=model_to_use,
-                    enforce_eager=enforce_eager,
-                    max_model_len=4096,
-                    tensor_parallel_size=1,
-                    gpu_memory_utilization=gpu_util,
-                    **llm_kwargs
+        try:
+            print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
+            model_to_use = model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
+            gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
+            enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
+            use_quant = os.environ.get("VLLM_QUANTIZATION", "none").lower()
+
+            llm_kwargs = {}
+            if use_quant in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
+                llm_kwargs = {"quantization": "fp8"}
+            elif use_quant in ["bitsandbytes", "bnb"]:
+                print("[INFO] Note: bitsandbytes quantization is not supported in vLLM v1 engine. Running unquantized native precision.")
+            elif use_quant not in ["none", "null", "false", "fp16", "bf16"]:
+                llm_kwargs = {"quantization": use_quant}
+
+            llm = LLM(
+                model=model_to_use,
+                enforce_eager=enforce_eager,
+                max_model_len=4096,
+                tensor_parallel_size=1,
+                gpu_memory_utilization=gpu_util,
+                **llm_kwargs
+            )
+            sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
+
+            for i in range(0, len(remaining_df), chunk_size):
+                chunk = remaining_df.iloc[i:i+chunk_size]
+                full_reports = chunk["_report_text"].astype(str).tolist()
+                raw_reports = [report[:12000] for report in full_reports]
+                messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
+                uids_chunk = chunk['StudyInstanceUID'].tolist()
+
+                print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
+                outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
+
+                for output, uid, report_str, full_report in zip(outputs, uids_chunk, raw_reports, full_reports):
+                    text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                    res = parse_json_response(text, uid, original_report=report_str)
+                    if res:
+                        res.update(
+                            report_sha256=_report_sha256(full_report),
+                            extractor_version=EXTRACTOR_VERSION,
+                            engine=selected_engine,
+                            model_id=resolved_model,
+                            prompt_sha256=prompt_sha256,
+                        )
+                        results.append(res)
+
+                # Atomic checkpoint writes make both rows and provenance restart-safe.
+                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                _atomic_csv(df_out, out_csv)
+                saved_rows = _validated_extraction_rows(
+                    df_out,
+                    needed_uids,
+                    report_hashes,
+                    {
+                        "extractor_version": EXTRACTOR_VERSION,
+                        "engine": selected_engine,
+                        "model_id": resolved_model,
+                        "prompt_sha256": prompt_sha256,
+                    },
                 )
-                sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
-                
-                for i in range(0, len(remaining_df), chunk_size):
-                    chunk = remaining_df.iloc[i:i+chunk_size]
-                    raw_reports = [str(r)[:12000] for r in chunk[report_col]]
-                    messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
-                    uids_chunk = chunk['StudyInstanceUID'].tolist()
-                    
-                    print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
-                    outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
-                    
-                    for output, uid, report_str in zip(outputs, uids_chunk, raw_reports):
-                        text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
-                        res = parse_json_response(text, uid, original_report=report_str)
-                        if res:
-                            results.append(res)
-                            
-                    # Atomic checkpoint write
-                    df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
-                    tmp_csv = f"{out_csv}.tmp"
-                    df_out.to_csv(tmp_csv, index=False)
-                    os.replace(tmp_csv, out_csv)
-                    print(f"[CHECKPOINT] Saved {len(df_out)} studies to {out_csv}")
-            except Exception as vllm_err:
-                print(f"[WARNING] vLLM execution encountered an issue: {vllm_err}")
-                print("[FALLBACK] Automatically switching to Clinical Shield Rules engine to guarantee complete extraction...")
-                selected_engine = "rules"
-            finally:
-                if 'llm' in locals():
-                    del llm
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                _atomic_json(
+                    manifest_path,
+                    {**contract, "status": "in_progress", "completed_studies": len(saved_rows)},
+                )
+                print(f"[CHECKPOINT] Saved {len(df_out)} studies to {out_csv}")
+        except Exception as vllm_err:
+            _atomic_json(
+                manifest_path,
+                {
+                    **contract,
+                    "status": "failed",
+                    "completed_studies": len(done_uids),
+                    "error": f"{type(vllm_err).__name__}: {vllm_err}",
+                },
+            )
+            raise RuntimeError(
+                "vLLM extraction failed. Partial rows were checkpointed; rerun with the same "
+                "engine/model to resume, or explicitly start a separate rules-label run."
+            ) from vllm_err
+        finally:
+            if 'llm' in locals():
+                del llm
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 
     if selected_engine == "rules":
         completed_uids = {r['StudyInstanceUID'] for r in results if isinstance(r, dict) and 'StudyInstanceUID' in r}
@@ -892,33 +1067,101 @@ def auto_complete_extraction(
         n_processed = 0
         for i, (_, row) in enumerate(rules_df.iterrows()):
             uid = str(row['StudyInstanceUID']).strip()
-            rep = str(row[report_col])
+            rep = str(row["_report_text"])
             res = extract_by_rules(rep, uid)
+            res.update(
+                report_sha256=_report_sha256(rep),
+                extractor_version=EXTRACTOR_VERSION,
+                engine=selected_engine,
+                model_id=resolved_model,
+                prompt_sha256=prompt_sha256,
+            )
             results.append(res)
             n_processed += 1
             
             if n_processed % 500 == 0 or n_processed == len(rules_df):
                 df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
-                tmp_csv = f"{out_csv}.tmp"
-                df_out.to_csv(tmp_csv, index=False)
-                os.replace(tmp_csv, out_csv)
+                _atomic_csv(df_out, out_csv)
+                saved_rows = _validated_extraction_rows(
+                    df_out,
+                    needed_uids,
+                    report_hashes,
+                    {
+                        "extractor_version": EXTRACTOR_VERSION,
+                        "engine": selected_engine,
+                        "model_id": resolved_model,
+                        "prompt_sha256": prompt_sha256,
+                    },
+                )
+                _atomic_json(
+                    manifest_path,
+                    {**contract, "status": "in_progress", "completed_studies": len(saved_rows)},
+                )
                 pct = (len(df_out) / total_needed) * 100
                 print(f"[CHECKPOINT] Extracted {len(df_out)} / {total_needed} ({pct:.1f}%) -> {out_csv}")
                 
-    final_df = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
-    final_df = _validated_extraction_rows(final_df, needed_uids)
+    final_df = (
+        pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+        if results
+        else _empty_extraction_frame()
+    )
+    final_df = _validated_extraction_rows(
+        final_df,
+        needed_uids,
+        report_hashes,
+        {
+            "extractor_version": EXTRACTOR_VERSION,
+            "engine": selected_engine,
+            "model_id": resolved_model,
+            "prompt_sha256": prompt_sha256,
+        },
+    )
     missing_uids = needed_uids - set(final_df['StudyInstanceUID'])
     if missing_uids:
+        _atomic_json(
+            manifest_path,
+            {
+                **contract,
+                "status": "failed",
+                "completed_studies": len(final_df),
+                "missing_studies": len(missing_uids),
+            },
+        )
         raise RuntimeError(
             f"NLP extraction is incomplete: {len(missing_uids)} / {total_needed} "
             "required studies have no complete, in-range labels"
         )
-    tmp_csv = f"{out_csv}.tmp"
-    final_df.to_csv(tmp_csv, index=False)
-    os.replace(tmp_csv, out_csv)
+    _atomic_csv(final_df, out_csv)
+    _atomic_json(
+        manifest_path,
+        {
+            **contract,
+            "status": "complete",
+            "completed_studies": len(final_df),
+            "pseudo_csv_sha256": _sha256_file(out_csv),
+            "gold_studies": int(gold_mask.sum()),
+            "fully_labeled_studies": int(fully_labeled_mask.sum()),
+            "target_values_pending": int(train_df[TARGETS].isna().sum().sum()),
+            "blank_report_studies": int((~report_present).sum()),
+            "label_counts": {
+                target: {
+                    "positive": int((final_df[target] == 1).sum()),
+                    "negative": int((final_df[target] == 0).sum()),
+                    "soft": int(final_df[target].between(0, 1, inclusive="neither").sum()),
+                }
+                for target in TARGETS
+            },
+        },
+    )
     elapsed = time.time() - start_time
     print(f"[SUCCESS] NLP extraction completed in {elapsed:.1f}s. Total valid studies in {out_csv}: {len(final_df)}.")
-    return out_csv, {"status": "complete", "total": len(final_df), "new": len(remaining_df), "engine": selected_engine}
+    return out_csv, {
+        "status": "complete",
+        "total": len(final_df),
+        "new": len(remaining_df),
+        "engine": selected_engine,
+        "model_id": resolved_model,
+    }
 
 
 if __name__ == "__main__":
@@ -947,4 +1190,10 @@ if __name__ == "__main__":
         print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
     
     OUT = os.path.join(DATA_ROOT, "pseudo_labels.csv")
-    run_offline_extraction(DATA_ROOT, OUT)
+    auto_complete_extraction(
+        DATA_ROOT,
+        OUT,
+        model_id=os.environ.get("LLM_MODEL_ID"),
+        engine=os.environ.get("NLP_ENGINE", "auto"),
+        force=os.environ.get("FORCE_NLP", "0").lower() in {"1", "true", "yes"},
+    )

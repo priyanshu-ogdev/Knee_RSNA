@@ -30,7 +30,9 @@ _G = {}
 
 def _paths(prefix):
     return {k: f'{prefix}.{v}' for k, v in dict(images='images.u8', valid='valid.u1', slot='slot.u1',
-                                                 done='done.u1', meta='meta.json', csv='meta.csv').items()}
+                                                 done='done.u1', errors='errors.u4', failed='failed.u1',
+                                                 padded='padded.u1', ps_missing='ps_missing.u1',
+                                                 meta='meta.json', csv='meta.csv').items()}
 
 
 class StudyCache:
@@ -39,13 +41,38 @@ class StudyCache:
         p = _paths(prefix)
         with open(p['meta']) as fh:
             self.meta = json.load(fh)
+        if self.meta.get("schema_version") != "preprocess-cache-v2":
+            raise ValueError(
+                f"Unsupported or legacy cache metadata at {p['meta']}; rebuild with --fresh_preprocessing"
+            )
         self.studies = self.meta['studies']
         N, S, D, H = self.meta['N'], self.meta['S'], self.meta['D'], self.meta['H']
+        expected_sizes = {
+            'images': N * S * D * H * H,
+            'valid': N * S * D,
+            'slot': N * S,
+            'done': N,
+            'errors': N * 4,
+            'failed': N * S,
+            'padded': N * S,
+            'ps_missing': N * S,
+        }
+        for key, expected_size in expected_sizes.items():
+            actual_size = os.path.getsize(p[key]) if os.path.exists(p[key]) else -1
+            if actual_size != expected_size:
+                raise ValueError(
+                    f"Cache storage mismatch for {p[key]}: expected {expected_size} bytes, "
+                    f"found {actual_size}; rebuild with --fresh_preprocessing"
+                )
         m = 'r+' if mode == 'r+' else 'r'
         self.images = np.memmap(p['images'], np.uint8, m, shape=(N, S, D, H, H))
         self.valid = np.memmap(p['valid'], np.uint8, m, shape=(N, S, D))
         self.slot = np.memmap(p['slot'], np.uint8, m, shape=(N, S))
         self.done = np.memmap(p['done'], np.uint8, m, shape=(N,))
+        self.errors = np.memmap(p['errors'], np.uint32, m, shape=(N,))
+        self.failed = np.memmap(p['failed'], np.uint8, m, shape=(N, S))
+        self.padded = np.memmap(p['padded'], np.uint8, m, shape=(N, S))
+        self.ps_missing = np.memmap(p['ps_missing'], np.uint8, m, shape=(N, S))
         self.index = {s: i for i, s in enumerate(self.studies)}
         # LINUX / GB10 SPEEDUP: Hint kernel for standard cached access so RAM buffers active studies
         try:
@@ -65,9 +92,12 @@ class StudyCache:
         return len(self.studies)
 
     @staticmethod
-    def create(prefix, studies, cfg):
+    def create(prefix, studies, cfg, source_signature=None):
+        studies = list(studies)
+        if not studies or len(studies) != len(set(studies)):
+            raise ValueError("Cache studies must be a non-empty list of unique StudyInstanceUID values")
         N, S, D, H = len(studies), config.N_SLOTS, cfg.stack_depth, cfg.img_size
-        need = N * S * D * H * H
+        need = N * S * D * H * H + N * S * D + N * S + N + 4 * N + 3 * N * S
         d = os.path.dirname(os.path.abspath(prefix))
         os.makedirs(d, exist_ok=True)
         free = shutil.disk_usage(d).free
@@ -78,15 +108,36 @@ class StudyCache:
         np.memmap(p['valid'], np.uint8, 'w+', shape=(N, S, D)).flush()
         np.memmap(p['slot'], np.uint8, 'w+', shape=(N, S)).flush()
         np.memmap(p['done'], np.uint8, 'w+', shape=(N,)).flush()
-        with open(p['meta'], 'w') as fh:
-            json.dump(dict(studies=list(studies), N=N, S=S, D=D, H=H, cfg=asdict(cfg)), fh)
+        np.memmap(p['errors'], np.uint32, 'w+', shape=(N,)).flush()
+        np.memmap(p['failed'], np.uint8, 'w+', shape=(N, S)).flush()
+        np.memmap(p['padded'], np.uint8, 'w+', shape=(N, S)).flush()
+        np.memmap(p['ps_missing'], np.uint8, 'w+', shape=(N, S)).flush()
+        meta = dict(
+            schema_version="preprocess-cache-v2",
+            studies=studies,
+            N=N,
+            S=S,
+            D=D,
+            H=H,
+            cfg=asdict(cfg),
+            source_signature=source_signature,
+        )
+        temporary = f"{p['meta']}.tmp"
+        with open(temporary, 'w', encoding="utf-8") as fh:
+            json.dump(meta, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, p['meta'])
         return StudyCache(prefix, 'r+')
 
     def slot_stack(self, i, s):
         return self.images[i, s]
 
     def flush(self):
-        for a in (self.images, self.valid, self.slot, self.done):
+        for a in (
+            self.images, self.valid, self.slot, self.done, self.errors,
+            self.failed, self.padded, self.ps_missing,
+        ):
             a.flush()
 
 
@@ -104,11 +155,30 @@ def _work(i):
     c.images[i] = res['stack']
     c.valid[i] = res['valid']
     c.slot[i] = res['slot_mask']
-    c.done[i] = 1
+    expected = np.array(
+        [bool(g['slot_rows'].get(st, {}).get(name)) for name, _, _, _ in config.SLOTS],
+        dtype=bool,
+    )
+    slot_errors = np.array(
+        [bool(res['info'].get(name, {}).get('errors')) for name, _, _, _ in config.SLOTS],
+        dtype=bool,
+    )
+    failed = expected & ((res['slot_mask'] == 0) | slot_errors)
     errs = sum(len(v.get('errors', [])) for v in res['info'].values())
+    c.errors[i] = errs
+    c.failed[i] = failed.astype(np.uint8)
+    c.padded[i] = np.array(
+        [bool(res['info'].get(name, {}).get('padded')) for name, _, _, _ in config.SLOTS],
+        dtype=np.uint8,
+    )
+    c.ps_missing[i] = np.array(
+        [bool(res['info'].get(name, {}).get('ps_missing')) for name, _, _, _ in config.SLOTS],
+        dtype=np.uint8,
+    )
+    c.done[i] = 1
     pad = sum(bool(v.get('padded')) for v in res['info'].values())
     miss = sum(bool(v.get('ps_missing')) for v in res['info'].values())
-    return i, int(res['slot_mask'].sum()), errs, pad, miss
+    return i, int(res['slot_mask'].sum()), errs, pad, miss, int(failed.sum())
 
 
 def _cost(study, slot_rows, records):
@@ -127,19 +197,36 @@ def _init_worker(studies, slot_rows, records, sides, cfg, prefix):
 
 
 def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, resume=True, order='lpt',
-                chunk=64, on_ready=None, progress=True):
+                chunk=64, on_ready=None, progress=True, source_signature=None):
     """Build (or resume) the cache. Returns the open StudyCache (mode r+) and a stats dict.
 
     studies: ordered list of StudyInstanceUID. slot_rows: {study: {slot: series uid|None}}.
     on_ready(cache, a, b): called in the main thread whenever studies [a,b) are all done (use order='seq')."""
     workers = workers or max(2, os.cpu_count() or 2)
     p = _paths(prefix)
+    if source_signature is None:
+        import hashlib
+        import json as _json
+        selection = {
+            study: slot_rows.get(study, {})
+            for study in studies
+        }
+        source_signature = hashlib.sha256(
+            _json.dumps(selection, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
     if resume and os.path.exists(p['meta']):
         cache = StudyCache(prefix, 'r+')
-        if cache.studies != list(studies) or cache.meta['cfg'] != json.loads(json.dumps(asdict(cfg))):
-            raise ValueError('existing cache was built for different studies/cfg; use resume=False or another prefix')
+        if (
+            cache.studies != list(studies)
+            or cache.meta['cfg'] != json.loads(json.dumps(asdict(cfg)))
+            or cache.meta.get("source_signature") != source_signature
+        ):
+            raise ValueError(
+                "existing cache was built from different studies, slots, DICOMs, or preprocessing config; "
+                "use --fresh_preprocessing or another cache prefix"
+            )
     else:
-        cache = StudyCache.create(prefix, studies, cfg)
+        cache = StudyCache.create(prefix, studies, cfg, source_signature)
     todo = [i for i in range(len(studies)) if not cache.done[i]]
     if order == 'lpt':
         todo.sort(key=lambda i: -_cost(studies[i], slot_rows, records))
@@ -155,45 +242,70 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
             initargs=(list(studies), slot_rows, records, sides, cfg, prefix)
         )
     t0 = time.time()
-    stats = dict(studies=len(studies), built=0, resumed=len(studies) - len(todo), decode_errors=0, padded=0, ps_missing=0,
-                 empty_studies=0)
-    futs = {ex.submit(_work, i): i for i in todo}
-    pending = {}
-    for a in range(0, len(studies), chunk):
-        pending[a] = sum(1 for i in range(a, min(a + chunk, len(studies))) if not cache.done[i])
-    for a, left in list(pending.items()):
-        if left == 0 and on_ready:
-            on_ready(cache, a, min(a + chunk, len(studies)))
-        if left == 0:
-            pending.pop(a)
-    for k, f in enumerate(as_completed(futs)):
-        i, nslot, errs, pad, miss = f.result()
-        stats['built'] += 1
-        stats['decode_errors'] += errs
-        stats['padded'] += pad
-        stats['ps_missing'] += miss
-        stats['empty_studies'] += int(nslot == 0)
-        a = (i // chunk) * chunk
-        if a in pending:
-            pending[a] -= 1
-            if pending[a] == 0:
-                if on_ready:
-                    on_ready(cache, a, min(a + chunk, len(studies)))
+    stats = dict(studies=len(studies), built=0, resumed=len(studies) - len(todo))
+    try:
+        futs = {ex.submit(_work, i): i for i in todo}
+        pending = {}
+        for a in range(0, len(studies), chunk):
+            pending[a] = sum(1 for i in range(a, min(a + chunk, len(studies))) if not cache.done[i])
+        for a, left in list(pending.items()):
+            if left == 0 and on_ready:
+                on_ready(cache, a, min(a + chunk, len(studies)))
+            if left == 0:
                 pending.pop(a)
-        if progress and (k + 1) % 200 == 0:
-            elapsed = time.time() - t0
-            throughput = (k + 1) / elapsed
-            left = len(todo) - (k + 1)
-            eta = left / throughput if throughput > 0 else 0
-            eta_m, eta_s = divmod(int(eta), 60)
-            eta_h, eta_m = divmod(eta_m, 60)
-            print(f'  cache {k + 1}/{len(todo)} | {throughput:.1f} studies/s | ETA: {eta_h:02d}:{eta_m:02d}:{eta_s:02d}', flush=True)
-    ex.shutdown()
+        for k, f in enumerate(as_completed(futs)):
+            i, _, _, _, _, _ = f.result()
+            stats['built'] += 1
+            a = (i // chunk) * chunk
+            if a in pending:
+                pending[a] -= 1
+                if pending[a] == 0:
+                    if on_ready:
+                        on_ready(cache, a, min(a + chunk, len(studies)))
+                    pending.pop(a)
+            if progress and (k + 1) % 200 == 0:
+                elapsed = time.time() - t0
+                throughput = (k + 1) / elapsed
+                left = len(todo) - (k + 1)
+                eta = left / throughput if throughput > 0 else 0
+                eta_m, eta_s = divmod(int(eta), 60)
+                eta_h, eta_m = divmod(eta_m, 60)
+                print(
+                    f'  cache {k + 1}/{len(todo)} | {throughput:.1f} studies/s | '
+                    f'ETA: {eta_h:02d}:{eta_m:02d}:{eta_s:02d}',
+                    flush=True,
+                )
+    except Exception:
+        ex.shutdown(wait=True)
+        cache.flush()
+        _G.clear()
+        raise
+    else:
+        ex.shutdown(wait=True)
     cache.flush()
+    stats.update(
+        decode_errors=int(np.asarray(cache.errors).sum()),
+        failed_selected_slots=int(np.asarray(cache.failed).sum()),
+        padded=int(np.asarray(cache.padded).sum()),
+        ps_missing=int(np.asarray(cache.ps_missing).sum()),
+        empty_studies=int((np.asarray(cache.slot).sum(axis=1) == 0).sum()),
+        incomplete_studies=int((np.asarray(cache.done) != 1).sum()),
+        source_signature=source_signature,
+    )
     stats['seconds'] = time.time() - t0
-    pd.DataFrame(dict(StudyInstanceUID=studies, side=[sides.get(s, {}).get('side', 'U') for s in studies],
-                      side_source=[sides.get(s, {}).get('source', 'none') for s in studies],
-                      n_slots=np.asarray(cache.slot).sum(1))).to_csv(p['csv'], index=False)
+    meta_frame = pd.DataFrame(dict(
+        StudyInstanceUID=studies,
+        side=[sides.get(s, {}).get('side', 'U') for s in studies],
+        side_source=[sides.get(s, {}).get('source', 'none') for s in studies],
+        n_slots=np.asarray(cache.slot).sum(1),
+        decode_errors=np.asarray(cache.errors),
+        failed_selected_slots=np.asarray(cache.failed).sum(1),
+        padded=np.asarray(cache.padded).sum(1),
+        ps_missing=np.asarray(cache.ps_missing).sum(1),
+    ))
+    meta_tmp = f"{p['csv']}.tmp"
+    meta_frame.to_csv(meta_tmp, index=False)
+    os.replace(meta_tmp, p['csv'])
     # MEMORY AUDIT FIX: Purge module-level global dict to release all records and series metadata
     _G.clear()
     import gc

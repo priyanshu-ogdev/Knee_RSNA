@@ -24,7 +24,7 @@ This report establishes the foundational engineering constraints, edge cases, fa
 | **In-Plane LPS Orientation** | LPS row/column vectors are 100% uniform: Axial is always `LP`, Coronal is always `LI`, Sagittal is always `PI`. | **Zero flip or orientation mismatch within planes.** No canonical rotation matrix alignment is required across series. |
 | **Contrast & Flags** | `Fluid_Sensitive == Fat_Suppression` in **100.00% of series** in `train_series.csv`. 26.1% of physical PD/T2/STIR series have flag=0 because they lack fat suppression. | The competition flag tracks **Fat Suppression**, not pure T2 fluid contrast. Do not treat them as independent features in training, but do not hardcode equality (test set may differ). |
 | **Metadata-Poor Cohort** | **238 studies (5.4%, 1,206 series)** have completely missing TR, TE, MagneticFieldStrength, and ScanOptions (Canon Vantage, GE Optima). | **DO NOT route series using DICOM header physics tags (TR/TE).** Route series strictly using the provided CSV flags (`Anatomical_Plane`, `Fluid_Sensitive`) + image heuristics. |
-| **Cross-Study Duplicates** | **57 perceptual hash groups (246 series)** span multiple distinct `StudyInstanceUID`s. | **Severe data leakage hazard.** Validation splits must use **GroupKFold** clustering connected duplicate study IDs together. |
+| **Cross-Study Hash Candidates** | **57 exact dHash groups (246 series)** span multiple distinct `StudyInstanceUID`s, but the 64-bit central-slice hash is collision-prone: across the groups, thousands of study pairs share a hash and only one pair shares five distinct series hashes. | Treat exact dHash matches as candidates, not proof of duplicate exams. Current folds keep only pairs corroborated by at least two distinct shared series hashes together; single-hash matches are excluded. |
 | **Study Recipes & Coverage** | Dominant recipe is 5 series (`AFx1 Cnx1 CFx1 Snx1 SFx1`, 40%). 3.6% miss Coronal Fluid; 5.8% miss Sagittal Fluid. 1,166 studies have $\ge 2$ fluid series in the same plane. | 6-slot architectures must implement deterministic multi-series arbitration (preferring standard 2D over 3D) and missing-slot masking. |
 | **Report Label Noise** | 46 duplicate report templates cover 177 studies. Negative studies mention target terms 76%–91% of the time (e.g. "no effusion"). | Ground-truth labels are NLP-derived and subject to negation extraction noise. Models require label smoothing and robust loss formulations. |
 | **Inference Budget** | Median slice decode is 12.0 ms. Test set (~1,000 studies $\times$ 96 slices) decodes in ~19.2 minutes on 4 CPU cores. | No need to pre-cache test DICOMs to disk. Dynamic in-memory decoding and tensor batching easily completes within the 9-hour limit. |
@@ -183,27 +183,19 @@ $$\text{Pad value} = \text{Median of outer border pixels (or reflect edge)}$$
 
 ## 5. Duplicate Exams & Cross-Study Contamination (A4 Breakdown)
 
-Perceptual differential hashing (`dhash`) of central slices revealed cross-study duplication that poses a massive risk to validation integrity:
+Perceptual differential hashing (`dhash`) of central slices is useful for candidate discovery, but is not by itself a reliable duplicate-exam detector. The 64-bit hash compresses image morphology aggressively and creates many cross-study collisions:
 
 ### Duplication Statistics
-- **57 distinct `dhash` groups span across multiple `StudyInstanceUID`s**, encompassing **246 series**.
-- Examples from audit:
-  - Hash `70e0f0d4b4f4f070`: Study `...450724` (Axial, Ingenia) and Study `...35293` (Axial, Achieva) share identical central slice morphology.
-  - Hash `8ab2f2d8f4e4b4b4`: Study `...31613209` (Coronal, Aera) and Study `...3376711` (Coronal, Aera) are identical scans re-registered under different IDs.
-  - Hash `9e9cdcdce48ccc94`, `9fcc9ade8ececcec`, `aba3e6e28ae1e5e5`: Same pairs across multiple planes!
+- **57 distinct exact-hash groups cover 246 series** with hashes appearing in more than one study.
+- Pairwise expansion of those groups yields **3,401 candidate study pairs** sharing at least one hash; some single hashes occur in as many as 78 studies. A one-hash match must not automatically join folds.
+- **Only one cross-study pair shares five distinct series hashes** in the EDA metadata. This is the high-confidence pair already recorded in `KNOWN_DUP_PAIRS`; the other pairs have only one shared hash and remain unconfirmed.
+- Repeated/related series within a study are common and are not cross-study evidence.
 - **Within-Study Duplicates:** 118 hash groups repeated within the same study (derived series, repeat scans, localizers).
 
-### Cross-Validation Leakage Vector
-If a standard random K-Fold split is performed across `StudyInstanceUID`:
-1. Study A is placed in Fold 1 (Train).
-2. Study B (which is an identical or duplicate exam of Study A) is placed in Fold 2 (Validation).
-3. The model achieves artificially inflated validation metrics on Fold 2 by memorizing patient-specific anatomy.
-4. Test set generalization drops sharply.
+### Cross-Validation Handling
+The preprocessing pipeline builds connected components only from corroborated pairs (at least two distinct shared series hashes), then assigns each component wholly to one fold. Site/scanner stratification remains the primary competition-like validation design; an indiscriminate graph over all exact dHash matches would merge unrelated studies and is not a valid leakage-control strategy. `folds_manifest.json` records the hash-candidate count, acceptance threshold, accepted edges, and index fingerprint.
 
-### Mandatory Cross-Validation Protocol
-Build an undirected graph where vertices are `StudyInstanceUID`s and edges connect studies that share matching image hashes. Compute connected components to form **Leakage Clusters**:
-$$\text{Cluster ID} = \text{ConnectedComponent}(\text{StudyInstanceUID}, \text{Shared Hashes})$$
-Perform **GroupKFold** stratified by target abnormality prevalence on `Cluster ID`.
+This hash evidence is not a definitive patient identity or proof of duplicated examinations. A future stronger audit should compare multiple decoded series or DICOM identity metadata before expanding the accepted-pair set.
 
 ---
 

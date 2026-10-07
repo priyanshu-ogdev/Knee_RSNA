@@ -3,6 +3,7 @@
 Everything is checkpointed/resumable; every step prints the numbers that serve as acceptance gates."""
 import os
 import json
+import hashlib
 import time
 import shutil
 import tempfile
@@ -57,16 +58,61 @@ def fit_cache_cfg(n_studies, free_gb, preset='v2', margin=0.92):
 
 
 # ----------------------------------------------------------------------------- 1. index
-def run_index(root, out_dir, splits=('train', 'test'), workers=None, limit=0, preset='v2', progress=True):
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_json(path, payload):
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=1, sort_keys=True, default=str)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def run_index(root, out_dir, splits=('train', 'test'), workers=None, limit=0, preset='v2', progress=True, force=False):
     """Scan every series on disk, join CSV flags, assign slots, resolve laterality. Saves to out_dir:
     index.pkl, slots.pkl, sides.json, series_table.csv.gz, report.json. -> dict(ann, tab, sides, report)."""
     cfg = config.get_cfg(preset)
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
-    df = pix.build_index(root, tuple(splits), workers, 1000, os.path.join(out_dir, 'chunks'), limit, progress=progress)
+    df = pix.build_index(
+        root, tuple(splits), workers, 1000, os.path.join(out_dir, 'chunks'), limit,
+        force=force, progress=progress,
+    )
+    dicom_signature = df.attrs.get("source_signature")
     df = pix.attach_csv_flags(df, root)
+    relevant_csvs = [
+        os.path.join(root, name)
+        for name in ("train_series.csv", "test_series.csv")
+        if os.path.exists(os.path.join(root, name))
+        and (name.startswith("train") or "test" in splits)
+    ]
+    csv_signatures = {os.path.basename(path): _sha256_file(path) for path in relevant_csvs}
+    source_signature = hashlib.sha256(
+        json.dumps(
+            {
+                "dicom_signature": dicom_signature,
+                "csv_signatures": csv_signatures,
+                "preprocess_schema": "index-slots-v2",
+                "preset": cfg.name,
+                "slot_prefer_2d": cfg.slot_prefer_2d,
+                "slot_fs_priority": cfg.slot_fs_priority,
+                "slot_csv_fallback": cfg.slot_csv_fallback,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    df.attrs["source_signature"] = source_signature
     rep = pix.index_report(df)
     rep['scan_minutes'] = round((time.time() - t0) / 60, 2)
+    rep['source_signature'] = source_signature
+    rep['csv_signatures'] = csv_signatures
     ann, tab = pslots.assign_all(df, cfg.slot_prefer_2d, cfg.slot_fs_priority, cfg.slot_csv_fallback)
     sides = pipeline.study_sides(df)
     rep['slot_coverage_pct'] = (tab.notna().mean() * 100).round(1).to_dict()
@@ -74,10 +120,29 @@ def run_index(root, out_dir, splits=('train', 'test'), workers=None, limit=0, pr
     rep['laterality'] = qc.laterality_report(sides)
     rep['header_vs_csv_fatsat_conflicts'] = int(ann['fs_conflict'].sum()) if 'fs_conflict' in ann else 0
     pix.save_index(ann, os.path.join(out_dir, 'index.pkl'))
-    pd.to_pickle(tab, os.path.join(out_dir, 'slots.pkl'))
-    json.dump(sides, open(os.path.join(out_dir, 'sides.json'), 'w'))
-    ann.drop(columns=['ordered_files', 'positions'], errors='ignore').to_csv(os.path.join(out_dir, 'series_table.csv.gz'), index=False)
-    json.dump(rep, open(os.path.join(out_dir, 'report.json'), 'w'), indent=1, default=str)
+    slots_path = os.path.join(out_dir, 'slots.pkl')
+    pd.to_pickle(tab, f"{slots_path}.tmp")
+    os.replace(f"{slots_path}.tmp", slots_path)
+    _atomic_json(os.path.join(out_dir, 'sides.json'), sides)
+    ann.drop(columns=['ordered_files', 'positions'], errors='ignore').to_csv(
+        os.path.join(out_dir, 'series_table.csv.gz.tmp'), index=False, compression="gzip"
+    )
+    os.replace(
+        os.path.join(out_dir, 'series_table.csv.gz.tmp'),
+        os.path.join(out_dir, 'series_table.csv.gz'),
+    )
+    _atomic_json(os.path.join(out_dir, 'report.json'), rep)
+    _atomic_json(
+        os.path.join(out_dir, 'index_manifest.json'),
+        {
+            "schema_version": "index-v2",
+            "source_signature": source_signature,
+            "dicom_signature": dicom_signature,
+            "csv_signatures": csv_signatures,
+            "series": len(ann),
+            "studies": int(ann['StudyInstanceUID'].nunique()) if not ann.empty else 0,
+        },
+    )
     lat = rep['laterality']
     print(json.dumps(rep, indent=1, default=str))
     print('\nGATES (index):')
@@ -86,16 +151,12 @@ def run_index(root, out_dir, splits=('train', 'test'), workers=None, limit=0, pr
     print(f"  CSV plane vs DICOM geometry      : {rep.get('csv_plane_vs_geometry_mismatch')} mismatches (expect 0)")
     print(f"  laterality unresolved            : {lat['unresolved_frac']:.2%}  (gate < 1%)")
     print(f"  laterality tag-vs-geometry clash : {lat['tag_geometry_disagree']} studies  (gate < 1% of tagged)")
-    return dict(ann=ann, tab=tab, sides=sides, report=rep)
+    return dict(ann=ann, tab=tab, sides=sides, report=rep, source_signature=source_signature)
 
 
 def get_index(root, out_dir, splits=('train', 'test'), workers=None, force=False, **kw):
-    """Load the saved index if present (restart-friendly), else build it. -> dict(ann, tab, sides[, report])."""
-    if not force and os.path.exists(os.path.join(out_dir, 'index.pkl')) and os.path.exists(os.path.join(out_dir, 'slots.pkl')):
-        ann, tab, sides = load_index_dir(out_dir)
-        print(f'loaded existing index: {len(ann):,} series, {len(tab):,} studies  ({out_dir})')
-        return dict(ann=ann, tab=tab, sides=sides, report=json.load(open(os.path.join(out_dir, 'report.json'))))
-    return run_index(root, out_dir, splits, workers, **kw)
+    """Revalidate current DICOM/CSV fingerprints, then reuse only matching index chunks."""
+    return run_index(root, out_dir, splits, workers, force=force, **kw)
 
 
 def load_index_dir(out_dir):
@@ -108,7 +169,18 @@ def run_cache(index, split, prefix, preset='v2', workers=None, limit_studies=0, 
               **cfg_overrides):
     """Build/resume the memmap cache for a split. `index` is the run_index() dict or an index directory.
     -> (cache, stats)."""
-    ann, tab, sides = (index['ann'], index['tab'], index['sides']) if isinstance(index, dict) else load_index_dir(index)
+    if isinstance(index, dict):
+        ann, tab, sides = index['ann'], index['tab'], index['sides']
+        source_signature = index.get("source_signature")
+    else:
+        ann, tab, sides = load_index_dir(index)
+        manifest_path = os.path.join(index, "index_manifest.json")
+        if not os.path.exists(manifest_path):
+            raise ValueError(f"Missing index provenance manifest: {manifest_path}; rebuild the index")
+        with open(manifest_path, encoding="utf-8") as stream:
+            source_signature = json.load(stream).get("source_signature")
+        if not source_signature:
+            raise ValueError(f"Invalid index provenance manifest: {manifest_path}")
     cfg = cfg or config.get_cfg(preset, **cfg_overrides)
     if studies is None:
         studies = sorted(ann[ann['split'] == split]['StudyInstanceUID'].unique())
@@ -118,24 +190,48 @@ def run_cache(index, split, prefix, preset='v2', workers=None, limit_studies=0, 
     print(f'{len(studies)} studies -> cache {need:.1f} GB  (preset={cfg.name}, D={cfg.stack_depth}, {cfg.img_size}px) at {prefix}')
     sub = ann[ann['StudyInstanceUID'].isin(set(studies))] if ('StudyInstanceUID' in ann.columns) else ann
     records = pipeline.index_to_records(sub)
-    slot_rows = {s: tab.loc[s].to_dict() for s in studies if s in tab.index}
-    cache, stats = pcache.build_cache(prefix, studies, slot_rows, records, sides, cfg, workers, resume=not fresh)
+    slot_rows = {
+        s: {
+            name: (
+                str(value).strip()
+                if pd.notna(value) and str(value).strip()
+                else None
+            )
+            for name, value in tab.loc[s].to_dict().items()
+        }
+        for s in studies
+        if s in tab.index
+    }
+    cache, stats = pcache.build_cache(
+        prefix,
+        studies,
+        slot_rows,
+        records,
+        sides,
+        cfg,
+        workers,
+        resume=not fresh,
+        source_signature=source_signature,
+    )
     print(json.dumps(stats, indent=1))
     return cache, stats
 
 
 # ----------------------------------------------------------------------------- 3. QC
-def run_qc(prefix, out_dir=None, n=300, montage=True):
+def run_qc(prefix, out_dir=None, n=300, montage=True, expected_slot_mask=None, require_acceptance=True):
     """Acceptance gates on a built cache (+ optional montage PNG: one row per slot type)."""
     c = pcache.StudyCache(prefix)
-    rep = qc.cache_sanity(c, n)
+    rep = qc.cache_sanity(c, n, expected_slot_mask=expected_slot_mask)
+    rep["source_signature"] = c.meta.get("source_signature")
     print(json.dumps(rep, indent=1, default=str))
-    bad = sum(rep.get(k, 0) for k in ('constant_slot', 'flagged_but_blank', 'unflagged_but_filled'))
-    print(f"\nGATES (cache): constant/blank/unflagged slots = {bad} (expect 0); "
-          f"mean valid depth = {rep.get('mean_valid_depth', float('nan')):.2f} (expect > 0.8)")
+    print(f"\nGATES (cache): accepted={rep.get('accepted')} "
+          f"incomplete={rep.get('incomplete_studies')} decode_errors={rep.get('decode_errors')} "
+          f"failed_selected_slots={rep.get('failed_selected_slots')} "
+          f"missing_expected_slots={rep.get('missing_expected_slots')} "
+          f"mean_valid_depth={rep.get('mean_valid_depth', float('nan')):.2f}")
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-        json.dump(rep, open(os.path.join(out_dir, 'cache_sanity.json'), 'w'), indent=1, default=str)
+        _atomic_json(os.path.join(out_dir, 'cache_sanity.json'), rep)
     if montage and out_dir:
         try:
             import matplotlib
@@ -159,4 +255,9 @@ def run_qc(prefix, out_dir=None, n=300, montage=True):
             print('montage ->', path)
         except Exception as e:                                 # a plotting problem must never fail the pipeline
             print('montage skipped:', type(e).__name__, e)
+    if require_acceptance and not rep.get("accepted", False):
+        raise RuntimeError(
+            f"Preprocessing cache failed acceptance gates; see "
+            f"{os.path.join(out_dir, 'cache_sanity.json') if out_dir else prefix + '.meta.csv'}"
+        )
     return rep

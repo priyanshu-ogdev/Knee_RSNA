@@ -150,21 +150,12 @@ def run_nlp_phase(
     print("=" * 80)
 
     if skip_nlp:
-        print("[INFO] --skip_nlp specified. Skipping extraction and proceeding with 58 Gold labels only.")
+        print("[INFO] --skip_nlp specified. Skipping extraction and using labels present in train.csv only.")
         return None
 
-    # Candidate locations for pre-computed pseudo-labels
-    candidates = [
-        os.path.join(work_dir, "pseudo_labels.csv"),
-        os.path.join(data_root, "pseudo_labels.csv"),
-        os.path.join(PROJECT_ROOT, "data", "pseudo_labels.csv"),
-        os.path.join(data_root, "extra_labels.csv"),
-    ]
+    # Keep generated labels isolated to this run directory. External CSVs are
+    # never consumed without the extractor's matching provenance manifest.
     out_csv = os.path.join(work_dir, "pseudo_labels.csv")
-    for cand in candidates:
-        if os.path.exists(cand) and os.path.getsize(cand) > 1000:
-            out_csv = cand
-            break
 
     from src.data.preprocess.nlp_extractor import auto_complete_extraction
     pseudo_csv, stats = auto_complete_extraction(
@@ -184,7 +175,64 @@ def run_nlp_phase(
 # ==============================================================================
 # PHASE 2: DATASET MERGING, STRATIFICATION & CACHE BUILD
 # ==============================================================================
-def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None, force: bool = False) -> tuple[str, str | None, str]:
+def _sha256_file(path: str) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_json(path: str, payload: dict) -> None:
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True, default=str)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _write_folds(folds_df: pd.DataFrame, folds_csv: str) -> None:
+    temporary = f"{folds_csv}.tmp"
+    folds_df.to_csv(temporary, index=False)
+    os.replace(temporary, folds_csv)
+
+
+def _fold_contract(folds_df: pd.DataFrame, study_uids: set[str], duplicate_pairs) -> None:
+    if folds_df["StudyInstanceUID"].duplicated().any():
+        raise ValueError("folds.csv contains duplicate StudyInstanceUID values")
+    fold_uids = set(folds_df["StudyInstanceUID"].astype(str))
+    if fold_uids != study_uids:
+        missing = sorted(study_uids - fold_uids)
+        extra = sorted(fold_uids - study_uids)
+        raise ValueError(
+            f"folds.csv does not cover exactly the training studies "
+            f"(missing={missing[:5]}, extra={extra[:5]})"
+        )
+    folds = pd.to_numeric(folds_df["fold"], errors="coerce")
+    if (
+        folds.isna().any()
+        or not np.equal(folds, folds.astype(int)).all()
+        or set(folds.astype(int)) != set(range(5))
+    ):
+        raise ValueError("folds.csv must assign studies to all five folds (0..4)")
+    assigned = folds_df.assign(fold=folds.astype(int)).set_index("StudyInstanceUID")["fold"]
+    violations = [
+        (a, b)
+        for a, b in duplicate_pairs
+        if a in study_uids and b in study_uids and assigned[a] != assigned[b]
+    ]
+    if violations:
+        raise ValueError(f"Verified duplicate exams were split across folds: {violations[:5]}")
+
+
+def run_preparation(
+    data_root: str,
+    work_dir: str,
+    pseudo_csv: str | None,
+    force: bool = False,
+) -> tuple[str, str | None, str]:
     print("\n" + "=" * 80)
     print("PHASE 2: DATASET MERGE, STRATIFICATION & CACHE BUILD")
     print("=" * 80)
@@ -192,110 +240,278 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None, force
     final_labels_csv = os.path.join(work_dir, "train_labels_v2.csv")
     print(f"Merging Gold labels (weight 1.0) and pseudo-labels (weight 0.5) -> {final_labels_csv}...")
     labels_df = build_labels(data_root, extra_csv=pseudo_csv, extra_weight=0.5, out_csv=final_labels_csv)
-    n_gold = (labels_df["source"] == "gold").sum()
-    n_extra = (labels_df["source"] == "extra").sum()
-    print(f"[SUCCESS] Labels assembled: {len(labels_df)} total ({n_gold} Gold immutable, {n_extra} Extra pseudo-labels)")
+    target_coverage = {
+        target: {
+            "labeled": int(labels_df[target].notna().sum()),
+            "weighted": int((labels_df[f"{target}_weight"] > 0).sum()),
+            "positive": int((labels_df[target] > 0).sum()),
+        }
+        for target in config.TARGETS
+    }
+    print(
+        f"[SUCCESS] Labels assembled: {len(labels_df)} studies; "
+        f"source counts={labels_df['source'].value_counts().to_dict()}"
+    )
+    train_csv = os.path.join(data_root, "train.csv")
+    train_series_csv = os.path.join(data_root, "train_series.csv")
+    train_raw = pd.read_csv(train_csv)
+    if "Report" not in train_raw.columns:
+        raise ValueError("train.csv must include the radiology Report column for NLP label generation")
+    if not os.path.isfile(train_series_csv):
+        raise FileNotFoundError(f"Required competition series index is missing: {train_series_csv}")
+    series_csv = pd.read_csv(train_series_csv)
+    required_series_columns = {
+        "StudyInstanceUID",
+        "SeriesInstanceUID",
+        "Anatomical_Plane",
+        "Fluid_Sensitive",
+        "Fat_Suppression",
+    }
+    if not required_series_columns.issubset(series_csv.columns):
+        raise ValueError(f"train_series.csv must contain {sorted(required_series_columns)}")
+    if series_csv[list(required_series_columns)].isna().any().any():
+        raise ValueError("train_series.csv contains missing identifiers or acquisition flags")
+    series_csv["StudyInstanceUID"] = series_csv["StudyInstanceUID"].astype(str).str.strip()
+    series_csv["SeriesInstanceUID"] = series_csv["SeriesInstanceUID"].astype(str).str.strip()
+    if series_csv["SeriesInstanceUID"].eq("").any() or series_csv["SeriesInstanceUID"].duplicated().any():
+        raise ValueError("train_series.csv must have non-empty, unique SeriesInstanceUID values")
+    if not set(series_csv["Anatomical_Plane"].astype(str)).issubset({"Axial", "Coronal", "Sagittal"}):
+        raise ValueError("train_series.csv contains an unknown Anatomical_Plane value")
+    for flag in ("Fluid_Sensitive", "Fat_Suppression"):
+        if not series_csv[flag].isin([0, 1, False, True]).all():
+            raise ValueError(f"train_series.csv {flag} values must be binary")
 
-    # Check if train DICOM images exist on disk
-    train_dir_candidates = [
-        os.path.join(data_root, "train_series"),
-        os.path.join(data_root, "train"),
-    ]
-    train_dir = None
-    has_train_images = False
-    for candidate in train_dir_candidates:
-        if os.path.exists(candidate):
-            try:
-                entries = os.listdir(candidate)
-                if len(entries) > 0:
-                    train_dir = candidate
-                    has_train_images = True
-                    break
-            except Exception:
-                pass
-
+    train_studies = set(labels_df["StudyInstanceUID"].astype(str))
     folds_csv = os.path.join(work_dir, "folds.csv")
+    labels_manifest = f"{final_labels_csv}.manifest.json"
+    with open(labels_manifest, encoding="utf-8") as stream:
+        label_provenance = json.load(stream)
+    nlp_provenance = None
+    if pseudo_csv:
+        nlp_manifest = f"{pseudo_csv}.manifest.json"
+        if not os.path.isfile(nlp_manifest):
+            raise ValueError(f"Pseudo-label file has no provenance manifest: {nlp_manifest}")
+        with open(nlp_manifest, encoding="utf-8") as stream:
+            nlp_provenance = json.load(stream)
+        if nlp_provenance.get("status") != "complete":
+            raise ValueError(f"NLP extraction is incomplete: {nlp_manifest}")
+        if nlp_provenance.get("train_csv_sha256") != _sha256_file(train_csv):
+            raise ValueError("NLP labels were generated from a different train.csv")
+        if nlp_provenance.get("pseudo_csv_sha256") != _sha256_file(pseudo_csv):
+            raise ValueError("NLP pseudo-label CSV does not match its provenance manifest")
+        if int(nlp_provenance.get("completed_studies", -1)) != int(nlp_provenance.get("required_studies", -2)):
+            raise ValueError("NLP provenance reports an incomplete eligible-study set")
+        if int(nlp_provenance.get("completed_studies", -1)) != len(pd.read_csv(pseudo_csv)):
+            raise ValueError("Pseudo-label manifest row count does not match pseudo-label CSV")
 
-    if not has_train_images:
-        print("\n" + "!" * 80)
-        print("[STAGE 2 NOTICE: DICOM DOWNLOAD IN PROGRESS]")
-        print(f"  * Merged Labels : {final_labels_csv} ({len(labels_df)} studies)")
-        print(f"  * Status        : DICOM directory is currently empty or downloading into '{data_root}'.")
-        
-        # Build 5-fold splits safely from labels table
-        if not os.path.exists(folds_csv):
-            print("  * Generating 5-fold stratification splits from available study metadata...")
-            train_raw = pd.read_csv(os.path.join(data_root, "train.csv")) if os.path.exists(os.path.join(data_root, "train.csv")) else None
-            study_meta = splits.make_study_meta(None, train_csv=train_raw, labels_df=labels_df)
-            folds_df = splits.group_folds(study_meta, n_splits=5, seed=config.SEED, scheme="site")
-            folds_df.to_csv(folds_csv, index=False)
-            print(f"  * 5-Fold Splits : Saved to {folds_csv}")
-        else:
-            print(f"  * 5-Fold Splits : Found existing {folds_csv}")
+    preparation_manifest = os.path.join(work_dir, "dataset_preparation_manifest.json")
+    folds_manifest_path = os.path.join(work_dir, "folds_manifest.json")
+    initial_manifest = {
+        "schema_version": "dataset-preparation-v2",
+        "status": "in_progress",
+        "data_root": os.path.abspath(data_root),
+        "train_csv_sha256": _sha256_file(train_csv),
+        "train_series_csv_sha256": _sha256_file(train_series_csv),
+        "labels_csv_sha256": label_provenance["labels_csv_sha256"],
+        "nlp": nlp_provenance,
+        "target_coverage": target_coverage,
+        "cache_prefix": None,
+        "cache_cfg": None,
+    }
+    _atomic_json(preparation_manifest, initial_manifest)
 
-        print("\n  * Staging Complete. Ready for Full Training:")
-        print("    1. Let the dataset download complete.")
-        print("    2. Re-run:  python src/main.py")
-        print("    The pipeline will immediately detect all downloaded series, build the memmap cache,")
-        print("    and train the complete 5-fold DINOv2 + CrossSlotTransformer model!")
-        print("!" * 80 + "\n")
+    duplicate_path = os.path.join(PROJECT_ROOT, "eda", "series_meta.csv.gz")
+    duplicate_pairs, duplicate_report = splits.duplicate_pairs_from_series_meta(
+        duplicate_path, study_uids=train_studies, min_shared_hashes=2
+    )
+    print(f"[DUPLICATE HASH AUDIT] {duplicate_report}")
+
+    if not runner.pix.list_series_dirs(data_root, "train"):
+        study_meta = splits.make_study_meta(None, train_csv=train_raw, labels_df=labels_df)
+        folds_df = splits.group_folds(
+            study_meta, n_splits=5, seed=config.SEED, scheme="site", dup_pairs=duplicate_pairs
+        )
+        _fold_contract(folds_df, train_studies, duplicate_pairs)
+        _write_folds(folds_df, folds_csv)
+        fold_report = {
+            "schema_version": "folds-v2",
+            "source": "report-only-staging",
+            "study_count": len(folds_df),
+            "fold_counts": folds_df["fold"].value_counts().sort_index().to_dict(),
+            "duplicate_hash_audit": duplicate_report,
+            "source_signature": _sha256_file(train_csv) + ":" + _sha256_file(train_series_csv),
+        }
+        _atomic_json(folds_manifest_path, fold_report)
+        _atomic_json(
+            preparation_manifest,
+            {
+                **initial_manifest,
+                "status": "awaiting_dicom",
+                "folds_csv_sha256": _sha256_file(folds_csv),
+                "folds_manifest": fold_report,
+            },
+        )
+        print(f"[BLOCKED] Training handoff withheld: no train DICOM series found under {data_root}")
+        print(f"[INFO] Labels/folds staged; rerun after the complete DICOM tree is present. Manifest: {preparation_manifest}")
         return final_labels_csv, None, folds_csv
 
-    # 1. Build / Load Metadata Index
+    # Build an input-fingerprinted index for every train series.
     idx_dir = os.path.join(work_dir, "idx")
-    cpu_cores = max(2, os.cpu_count() or 2)
-    print("Building / verifying DICOM metadata index...")
-    index_out = runner.run_index(data_root, idx_dir, splits=("train",), workers=cpu_cores)
-    index_pkl = os.path.join(idx_dir, "index.pkl")
-    index_df = pd.read_pickle(index_pkl) if os.path.exists(index_pkl) else None
+    cpu_cores = max(2, os.cpu_count() or 1)
+    print("Indexing and validating every training DICOM series...")
+    index_out = runner.run_index(
+        data_root, idx_dir, splits=("train",), workers=cpu_cores, force=force
+    )
+    ann = index_out["ann"]
+    indexed_studies = set(ann["StudyInstanceUID"].astype(str))
+    indexed_series = set(ann["SeriesInstanceUID"].astype(str))
+    csv_studies = set(series_csv["StudyInstanceUID"])
+    csv_series = set(series_csv["SeriesInstanceUID"])
+    if indexed_studies != train_studies:
+        raise ValueError(
+            f"DICOM study coverage mismatch: missing={len(train_studies - indexed_studies)}, "
+            f"unexpected={len(indexed_studies - train_studies)}"
+        )
+    if indexed_studies != csv_studies:
+        raise ValueError(
+            f"train_series.csv study coverage mismatch: missing={len(train_studies - csv_studies)}, "
+            f"unexpected={len(csv_studies - train_studies)}"
+        )
+    if indexed_series != csv_series:
+        raise ValueError(
+            f"DICOM/CSV series mismatch: missing_on_disk={len(csv_series - indexed_series)}, "
+            f"not_in_train_series_csv={len(indexed_series - csv_series)}"
+        )
+    slot_studies = set(index_out["tab"].index.astype(str))
+    if slot_studies != train_studies:
+        raise ValueError(
+            f"Slot table study coverage mismatch: missing={len(train_studies - slot_studies)}, "
+            f"unexpected={len(slot_studies - train_studies)}"
+        )
+    if ann["err"].notna().any():
+        failures = ann.loc[ann["err"].notna(), ["StudyInstanceUID", "SeriesInstanceUID", "err"]].head(10)
+        raise RuntimeError(
+            f"DICOM metadata indexing failures ({int(ann['err'].notna().sum())} series):\n{failures}"
+        )
+    index_report = index_out["report"]
+    if index_report.get("empty_series", 0) != 0:
+        raise RuntimeError(f"Empty DICOM series gate failed: {index_report['empty_series']}")
+    if index_report.get("series_with_unreadable_slices", 0) != 0:
+        raise RuntimeError(
+            f"Unreadable DICOM slice-header gate failed: {index_report['series_with_unreadable_slices']}"
+        )
+    if index_report.get("series_with_mixed_shapes", 0) != 0:
+        raise RuntimeError(f"Mixed image-size gate failed: {index_report['series_with_mixed_shapes']}")
+    missing_geometry = ann["plane_geo"].isna() | ann["orient_code"].isna()
+    if missing_geometry.any():
+        raise RuntimeError(f"DICOM orientation/plane geometry is missing for {int(missing_geometry.sum())} series")
+    if index_report.get("non_canonical_orientation", 0) != 0:
+        raise RuntimeError(f"Noncanonical DICOM orientation gate failed: {index_report['non_canonical_orientation']}")
+    if index_report.get("csv_plane_vs_geometry_mismatch", 0) != 0:
+        raise RuntimeError(f"Series CSV plane conflicts with DICOM geometry: {index_report['csv_plane_vs_geometry_mismatch']}")
+    side_report = index_report.get("laterality", {})
+    if side_report.get("unresolved_frac", 1.0) >= 0.01:
+        raise RuntimeError(f"Laterality unresolved gate failed: {side_report.get('unresolved_frac'):.2%}")
+    tagged = sum(value.get("source") == "tag" for value in index_out["sides"].values())
+    clashes = side_report.get("tag_geometry_disagree", 0)
+    if tagged and clashes / tagged >= 0.01:
+        raise RuntimeError(f"DICOM laterality tag/geometry conflict gate failed: {clashes}/{tagged}")
 
-    # 2. Build 5-Fold Patient/Site Stratification Splits
-    if not os.path.exists(folds_csv):
-        print("Generating 5-fold site-stratified splits (leakage-safe)...")
-        train_raw = pd.read_csv(os.path.join(data_root, "train.csv")) if os.path.exists(os.path.join(data_root, "train.csv")) else None
-        study_meta = splits.make_study_meta(index_df, train_csv=train_raw, labels_df=labels_df)
-        folds_df = splits.group_folds(study_meta, n_splits=5, seed=config.SEED, scheme="site")
-        folds_df.to_csv(folds_csv, index=False)
-        print(f"[SUCCESS] 5-fold stratification splits saved to: {folds_csv}")
-    else:
-        print(f"[SUCCESS] Using existing 5-fold splits from: {folds_csv}")
+    # Regenerate folds from current index/labels; never silently reuse a stale split.
+    study_meta = splits.make_study_meta(ann, train_csv=train_raw, labels_df=labels_df)
+    folds_df = splits.group_folds(
+        study_meta, n_splits=5, seed=config.SEED, scheme="site", dup_pairs=duplicate_pairs
+    )
+    _fold_contract(folds_df, train_studies, duplicate_pairs)
+    _write_folds(folds_df, folds_csv)
+    fold_report = {
+        "schema_version": "folds-v2",
+        "source": "indexed-scanner-site",
+        "study_count": len(folds_df),
+        "fold_counts": folds_df["fold"].value_counts().sort_index().to_dict(),
+        "duplicate_hash_audit": duplicate_report,
+        "index_source_signature": index_out["source_signature"],
+        "train_csv_sha256": _sha256_file(train_csv),
+        "labels_csv_sha256": label_provenance["labels_csv_sha256"],
+    }
+    _atomic_json(folds_manifest_path, fold_report)
 
-    # 3. Build / Load Preprocessing Cache
-    train_studies = list(labels_df["StudyInstanceUID"])
-    indexed_studies = set(index_out["ann"]["StudyInstanceUID"].unique()) if ("ann" in index_out and not index_out["ann"].empty) else set()
-    studies_to_cache = [s for s in train_studies if s in indexed_studies] if indexed_studies else train_studies
-
+    # Fixed v2 dimensions are recorded; automatic disk-based shape changes are disabled.
+    studies_to_cache = labels_df["StudyInstanceUID"].astype(str).tolist()
     cache_dir = os.environ.get("CACHE_DIR", os.path.join(work_dir, "cache"))
     os.makedirs(cache_dir, exist_ok=True)
     cfg = config.get_cfg("v2")
-
-    free_gb = shutil.disk_usage(cache_dir).free / 1e9
     img_override = os.environ.get("CACHE_IMG_SIZE")
     depth_override = os.environ.get("CACHE_STACK_DEPTH")
-
     if img_override or depth_override:
         img_size = int(img_override) if img_override else cfg.img_size
         stack_depth = int(depth_override) if depth_override else cfg.stack_depth
         cfg = config.get_cfg("v2", img_size=img_size, stack_depth=stack_depth)
-        print(f"[CONFIG] Cache resolution overridden by environment: img_size={img_size}, stack_depth={stack_depth}")
-    elif runner.estimate_cache_gb(len(studies_to_cache), cfg) > free_gb * 0.95:
-        print(f"[WARNING] Standard cache needs {runner.estimate_cache_gb(len(studies_to_cache), cfg):.1f} GB, but only {free_gb:.1f} GB free.")
-        cfg = runner.fit_cache_cfg(len(studies_to_cache), free_gb, preset="v2")
-        print(f"[AUTO-FIT] Scaled cache configuration to fit disk: img_size={cfg.img_size}, stack_depth={cfg.stack_depth}")
-    else:
-        print(f"[CONFIG] Standard v2 cache: img_size={cfg.img_size}, stack_depth={cfg.stack_depth} ({runner.estimate_cache_gb(len(studies_to_cache), cfg):.1f} GB estimated)")
+        print(f"[CONFIG] Explicit cache override: img_size={img_size}, stack_depth={stack_depth}")
+    free_gb = shutil.disk_usage(cache_dir).free / 1e9
+    need_gb = runner.estimate_cache_gb(len(studies_to_cache), cfg)
+    print(
+        f"[CONFIG] Cache shape={cfg.img_size}x{cfg.img_size}x{cfg.stack_depth}x{config.N_SLOTS}; "
+        f"image bytes estimate={need_gb:.1f} GB; free={free_gb:.1f} GB"
+    )
+    if need_gb * 1.02 > free_gb:
+        raise OSError(
+            f"Selected cache needs at least {need_gb * 1.02:.1f} GB but only {free_gb:.1f} GB is free. "
+            "Mount/free sufficient NVMe space or explicitly configure CACHE_IMG_SIZE and "
+            "CACHE_STACK_DEPTH; preprocessing resolution will not be silently changed."
+        )
 
     cache_prefix = os.path.join(cache_dir, "train")
-    cache, stats = runner.run_cache(
-        index_out, "train", cache_prefix, cfg=cfg,
-        workers=cpu_cores, studies=studies_to_cache, fresh=False
+    _, cache_stats = runner.run_cache(
+        index_out,
+        "train",
+        cache_prefix,
+        cfg=cfg,
+        workers=cpu_cores,
+        studies=studies_to_cache,
+        fresh=force,
     )
-    print(f"[SUCCESS] Cache ready. Stats: {stats}")
-
-    # Run acceptance QC
+    tab = index_out["tab"]
+    expected_slot_mask = np.zeros((len(studies_to_cache), config.N_SLOTS), dtype=bool)
+    for row_idx, study in enumerate(studies_to_cache):
+        if study in tab.index:
+            slot_row = tab.loc[study]
+            expected_slot_mask[row_idx] = [
+                pd.notna(slot_row.get(slot_name)) and bool(str(slot_row.get(slot_name)).strip())
+                for slot_name, _, _, _ in config.SLOTS
+            ]
     qc_dir = os.path.join(work_dir, "qc")
-    runner.run_qc(cache_prefix, out_dir=qc_dir, n=min(50, len(studies_to_cache)), montage=False)
-
+    qc_report = runner.run_qc(
+        cache_prefix,
+        out_dir=qc_dir,
+        n=min(300, len(studies_to_cache)),
+        montage=False,
+        expected_slot_mask=expected_slot_mask,
+    )
+    final_manifest = {
+        **initial_manifest,
+        "status": "complete",
+        "index_source_signature": index_out["source_signature"],
+        "index_report": index_report,
+        "indexed_studies": len(indexed_studies),
+        "indexed_series": len(indexed_series),
+        "folds_csv_sha256": _sha256_file(folds_csv),
+        "folds_manifest": fold_report,
+        "duplicate_hash_audit": duplicate_report,
+        "cache_prefix": os.path.abspath(cache_prefix),
+        "cache_cfg": {
+            "name": cfg.name,
+            "img_size": cfg.img_size,
+            "stack_depth": cfg.stack_depth,
+            "slots": config.N_SLOTS,
+            "estimated_image_bytes_gb": need_gb,
+            "free_bytes_gb_before_build": free_gb,
+        },
+        "cache_stats": cache_stats,
+        "qc_report": qc_report,
+    }
+    _atomic_json(preparation_manifest, final_manifest)
+    print(f"[SUCCESS] Data preprocessing accepted; training handoff manifest: {preparation_manifest}")
     return final_labels_csv, cache_prefix, folds_csv
 
 
@@ -548,6 +764,11 @@ def main():
     parser.add_argument("--nlp_engine", type=str, default="auto", choices=["auto", "vllm", "rules"], help="NLP extraction engine: 'auto' (detects vLLM/CUDA, else rules), 'vllm', or 'rules'")
     parser.add_argument("--nlp_model", type=str, default="nvidia/Llama-3.1-Nemotron-70B-Instruct-HF", help="vLLM model ID for report extraction")
     parser.add_argument("--force_nlp", action="store_true", help="Force re-extraction of pseudo-labels from scratch")
+    parser.add_argument(
+        "--fresh_preprocessing",
+        action="store_true",
+        help="Rebuild DICOM index chunks and cache from scratch; existing generated cache files are overwritten",
+    )
     parser.add_argument("--skip_nlp", action="store_true", help="Skip NLP extraction entirely and train with Gold labels only")
 
     # Training Options
@@ -560,6 +781,11 @@ def main():
     parser.add_argument("--variant", type=str, default=None, help="Backbone variant or timm architecture name (defaults by model family)")
     parser.add_argument("--random_init", action="store_true", help="Do not load timm pretrained weights (CoAtNet MIL only)")
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
+    parser.add_argument(
+        "--prepare_only",
+        action="store_true",
+        help="Run the complete preprocessing/QC gates and exit before training",
+    )
     parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
     parser.add_argument(
         "--ensemble_checkpoints",
@@ -624,11 +850,13 @@ def main():
         skip_nlp=args.skip_nlp,
         engine=args.nlp_engine,
         model_id=args.nlp_model,
-        force=args.force_nlp,
+        force=(args.force_nlp or args.fresh_preprocessing),
     )
 
     # Phase 2: Dataset Merge & Cache Build
-    labels_csv, cache_prefix, folds_csv = run_preparation(data_root, work_dir, pseudo_csv, force=args.force_nlp)
+    labels_csv, cache_prefix, folds_csv = run_preparation(
+        data_root, work_dir, pseudo_csv, force=args.fresh_preprocessing
+    )
 
     # Check if cache is built (if download is in progress, cache_prefix is None)
     if cache_prefix is None or not os.path.exists(f"{cache_prefix}.meta.json"):
@@ -643,6 +871,10 @@ def main():
         print("To start training once download finishes:")
         print("    python src/main.py")
         print("=" * 80)
+        return
+
+    if args.prepare_only:
+        print("[SUCCESS] --prepare_only: data preparation passed; training was not started.")
         return
 
     # Phase 3: 5-Fold Training

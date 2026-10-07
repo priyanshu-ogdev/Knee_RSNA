@@ -9,6 +9,7 @@ Design rules (from the dataset audit + the hidden-rerun failures documented in t
 import os
 import time
 import pickle
+import hashlib
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
@@ -40,25 +41,25 @@ def discover_root(explicit=None):
 
 
 def list_series_dirs(root, split):
-    base = os.path.join(root, SPLIT_DIRS.get(split, split))
-    items = []
-    if not os.path.isdir(base):
-        for alt in (split, f"{split}_series", f"{split}_images"):
-            alt_path = os.path.join(root, alt)
-            if os.path.isdir(alt_path):
-                base = alt_path
-                break
-        else:
+    bases = dict.fromkeys(
+        os.path.join(root, name)
+        for name in (SPLIT_DIRS.get(split, split), split, f"{split}_series", f"{split}_images")
+    )
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        items = []
+        with os.scandir(base) as it:
+            studies = sorted(e.name for e in it if e.is_dir())
+        for st in studies:
+            sd = os.path.join(base, st)
+            with os.scandir(sd) as it2:
+                for e in sorted(it2, key=lambda x: x.name):
+                    if e.is_dir():
+                        items.append((split, st, e.name, e.path))
+        if items:
             return items
-    with os.scandir(base) as it:
-        studies = sorted(e.name for e in it if e.is_dir())
-    for st in studies:
-        sd = os.path.join(base, st)
-        with os.scandir(sd) as it2:
-            for e in sorted(it2, key=lambda x: x.name):
-                if e.is_dir():
-                    items.append((split, st, e.name, e.path))
-    return items
+    return []
 
 
 def scan_series(item):
@@ -100,6 +101,31 @@ def scan_series(item):
     return row
 
 
+def source_signature(items, chunk):
+    """Fingerprint the exact DICOM file set and mtimes used by resumable index chunks."""
+    digest = hashlib.sha256()
+    digest.update(f"chunk={chunk}\n".encode("utf-8"))
+    for split, study, series, directory in items:
+        digest.update(f"{split}\0{study}\0{series}\n".encode("utf-8"))
+        try:
+            entries = sorted(
+                (entry for entry in os.scandir(directory) if entry.is_file() and entry.name.lower().endswith(".dcm")),
+                key=lambda entry: entry.name,
+            )
+        except OSError as exc:
+            digest.update(f"ERROR\0{type(exc).__name__}\0{exc}\n".encode("utf-8"))
+            continue
+        for entry in entries:
+            try:
+                stat = entry.stat(follow_symlinks=False)
+                digest.update(
+                    f"{entry.name}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8")
+                )
+            except OSError as exc:
+                digest.update(f"{entry.name}\0ERROR\0{type(exc).__name__}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
 def build_index(root, splits=('train', 'test'), workers=None, chunk=1000, cache_dir=None, limit=0, force=False,
                 progress=True):
     """Scan every series on disk. Returns a DataFrame (object columns: ordered_files, positions)."""
@@ -110,16 +136,21 @@ def build_index(root, splits=('train', 'test'), workers=None, chunk=1000, cache_
     if limit:
         items = items[:limit]
     chunks = [items[i:i + chunk] for i in range(0, len(items), chunk)]
+    signature = source_signature(items, chunk)
     if cache_dir:                                    # stale-checkpoint guard: chunks are only valid for THIS item list
         import glob
-        import hashlib
-        sig = hashlib.md5(('|'.join(i[3] for i in items) + f'#{chunk}').encode()).hexdigest()
         sp = os.path.join(cache_dir, 'signature.txt')
         os.makedirs(cache_dir, exist_ok=True)
-        if not (os.path.exists(sp) and open(sp).read() == sig):
+        old_signature = open(sp).read().strip() if os.path.exists(sp) else None
+        if force or old_signature != signature:
             for f in glob.glob(os.path.join(cache_dir, 'index_*.pkl')):
                 os.remove(f)
-            open(sp, 'w').write(sig)
+            temporary = f"{sp}.tmp"
+            with open(temporary, "w", encoding="utf-8") as stream:
+                stream.write(signature)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, sp)
     parts, t0 = [], time.time()
     ex = None
     try:
@@ -134,12 +165,15 @@ def build_index(root, splits=('train', 'test'), workers=None, chunk=1000, cache_
         df = pd.DataFrame(list(ex.map(scan_series, ch, chunksize=8)))
         if p:
             os.makedirs(cache_dir, exist_ok=True)
-            df.to_pickle(p)
+            temporary = f"{p}.tmp"
+            df.to_pickle(temporary)
+            os.replace(temporary, p)
         parts.append(df)
         if progress:
             print(f'  index chunk {k + 1}/{len(chunks)}  {(k + 1) * chunk / max(time.time() - t0, 1e-9):.1f} series/s', flush=True)
     ex.shutdown()
     out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    out.attrs["source_signature"] = signature
     return out
 
 
@@ -169,8 +203,12 @@ def attach_csv_flags(index_df, root):
 
 
 def save_index(df, path):
-    with open(path, 'wb') as fh:
+    temporary = f"{path}.tmp"
+    with open(temporary, 'wb') as fh:
         pickle.dump(df, fh, protocol=4)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(temporary, path)
 
 
 def load_index(path):

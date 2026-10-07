@@ -66,7 +66,7 @@ def test_build_labels_rejects_out_of_range_extra_targets(tmp_path, bad_value):
         build_labels(str(data_root), str(extra_path))
 
 
-def test_extraction_repairs_cached_rows_with_missing_targets(tmp_path, monkeypatch):
+def test_extraction_completes_missing_targets_for_partially_gold_studies(tmp_path, monkeypatch):
     targets = nlp_extractor.TARGETS
     data_root = tmp_path / "data"
     data_root.mkdir()
@@ -106,6 +106,6 @@ def test_extraction_repairs_cached_rows_with_missing_targets(tmp_path, monkeypat
 
     result = pd.read_csv(output)
     assert stats["status"] == "complete"
-    assert stats["total"] == 1
-    assert set(result["StudyInstanceUID"]) == {"pseudo-study"}
+    assert stats["total"] == 2
+    assert set(result["StudyInstanceUID"]) == {"gold-study", "pseudo-study"}
     assert result[targets].notna().all().all()

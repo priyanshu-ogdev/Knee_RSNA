@@ -344,28 +344,13 @@ def run_training(
     ).to(device)
 
     # ── Data ─────────────────────────────────────────────────────────────────
+    # Dataset instantiation (DataLoaders will be created per-epoch to prevent pinned memory leaks)
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
-    # DEADLOCK FIX: persistent_workers=False prevents inter-epoch worker queue freeze
-    dl_tr = DataLoader(
-        ds_tr, batch_size=batch_size, shuffle=True,
-        drop_last=len(tr) > batch_size, num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=False,
-        prefetch_factor=4 if num_workers > 0 else None,
-    )
-    dl_va = None
+    dl_tr_len = (len(tr) // batch_size) if len(tr) > batch_size else max(1, len(tr) // batch_size)
+    
+    ds_va = None
     if len(va):
         ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False)
-        # CRITICAL OOM FIX: Validation evaluates all 15 windows (2.5x more data than training).
-        # A batch size of 16 with 16 workers and prefetch 4 buffered 74 GB of locked, pinned RAM!
-        # This exhausted the 121 GB DGX memory + 32 GB swap. 
-        # Fix: Throttle validation workers and prefetch to cap RAM at ~5 GB.
-        dl_va = DataLoader(
-            ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
-            num_workers=min(4, num_workers), pin_memory=(device.type == "cuda"),
-            persistent_workers=False,
-            prefetch_factor=2 if num_workers > 0 else None,
-        )
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────
     # IMPROVEMENT 3: WD=0 for biases and norm layers (standard ViT recipe).
@@ -417,7 +402,7 @@ def run_training(
     # ── LR Schedule (Upgrade J: cosine with warmup) ──────────────────────────
     # ANTI-DEGRADATION FIX: Count actual optimizer steps per epoch under grad_accum
     # so cosine decay reaches 100% completion rather than truncating at 50%
-    steps_per_epoch = math.ceil(len(dl_tr) / grad_accum) if dl_tr is not None else 1
+    steps_per_epoch = math.ceil(dl_tr_len / grad_accum) if dl_tr_len > 0 else 1
     total_steps = n_ep * max(steps_per_epoch, 1)
     scheduler = _build_schedule(optimizer, total_steps, warmup_frac=0.08)
 
@@ -443,6 +428,22 @@ def run_training(
 
     for ep in range(n_ep):
         ds_tr.set_epoch(ep)
+        
+        dl_tr = DataLoader(
+            ds_tr, batch_size=batch_size, shuffle=True,
+            drop_last=len(tr) > batch_size, num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=False,
+            prefetch_factor=4 if num_workers > 0 else None,
+        )
+        dl_va = None
+        if ds_va is not None:
+            dl_va = DataLoader(
+                ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
+                num_workers=min(4, num_workers), pin_memory=(device.type == "cuda"),
+                persistent_workers=False,
+                prefetch_factor=2 if num_workers > 0 else None,
+            )
 
         # Gold upweighting: constant 1.5× throughout training.
         # Constant (not curriculum) avoids Adam momentum destabilization from
@@ -502,6 +503,13 @@ def run_training(
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
+            
+        # OOM FIX: Explicitly destroy DataLoaders and run GC to free pinned memory
+        del dl_tr
+        if dl_va is not None:
+            del dl_va
+        import gc
+        gc.collect()
 
         # ── Time-budget guard ─────────────────────────────────────────────────
         if time.time() - t0 > config.TIME_BUDGET_HOURS * 3600:
@@ -536,6 +544,13 @@ def run_training(
 
     if swa_model is not None and swa_epochs > 0 and (ep >= swa_start):
         print("Updating SWA batch-norm statistics …")
+        dl_tr = DataLoader(
+            ds_tr, batch_size=batch_size, shuffle=True,
+            drop_last=len(tr) > batch_size, num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=False,
+            prefetch_factor=4 if num_workers > 0 else None,
+        )
         safe_update_bn(dl_tr, swa_model, device=device)
         torch.save(
             dict(model=swa_model.module.state_dict(),

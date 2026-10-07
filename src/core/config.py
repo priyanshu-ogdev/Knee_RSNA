@@ -21,7 +21,8 @@ from dataclasses import dataclass, replace
 # ─────────────────────────────────────────── legacy training constants ────────
 SEED             = 2026
 EPOCHS           = 10          # Optimized: peak validation AUC converges by epoch 6-8; 10 avoids label-noise overfitting
-BATCH_SIZE       = 16          # Default to 16 studies per step (220 steps/epoch on Blackwell)
+BATCH_SIZE       = 16
+NUM_WORKERS      = 6           # SOTA Memory Optimization: 6 workers eliminates queue RAM bloat (prevents OOM on 121GB RAM)          # Default to 16 studies per step (220 steps/epoch on Blackwell)
 GRAD_ACCUM       = 1           # Effective batch = 16 studies per optimizer step
 N_WINDOWS_TRAIN  = 5           # 5 stratified windows: 75% articular coverage (prevents MIL focal tear dilution)
 LR_HEAD          = 2e-3

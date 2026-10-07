@@ -50,11 +50,14 @@ class StudyCache:
         # LINUX / GB10 SPEEDUP: Hint kernel for standard cached access so RAM buffers active studies
         try:
             import mmap as _py_mmap
-            if hasattr(_py_mmap, 'MADV_NORMAL'):
+            # SOTA Memory Optimization: For read mode (training/workers), use MADV_RANDOM.
+            # This prevents the Linux kernel page-cache from locking 65GB of disk pages in RAM.
+            adv_flag = getattr(_py_mmap, 'MADV_RANDOM', getattr(_py_mmap, 'MADV_NORMAL', None)) if mode == 'r' else getattr(_py_mmap, 'MADV_NORMAL', None)
+            if adv_flag is not None:
                 for a in (self.images, self.valid, self.slot, self.done):
                     mm = getattr(a, '_mmap', None) or getattr(getattr(a, 'base', None), '_mmap', None)
-                    if mm:
-                        mm.madvise(_py_mmap.MADV_NORMAL)
+                    if mm and hasattr(mm, 'madvise'):
+                        mm.madvise(adv_flag)
         except Exception:
             pass
 
@@ -191,4 +194,8 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
     pd.DataFrame(dict(StudyInstanceUID=studies, side=[sides.get(s, {}).get('side', 'U') for s in studies],
                       side_source=[sides.get(s, {}).get('source', 'none') for s in studies],
                       n_slots=np.asarray(cache.slot).sum(1))).to_csv(p['csv'], index=False)
+    # MEMORY AUDIT FIX: Purge module-level global dict to release all records and series metadata
+    _G.clear()
+    import gc
+    gc.collect()
     return cache, stats

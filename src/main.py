@@ -314,6 +314,13 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None, force
     qc_dir = os.path.join(work_dir, "qc")
     runner.run_qc(cache_prefix, out_dir=qc_dir, n=min(50, len(studies_to_cache)), montage=False)
 
+    # MEMORY AUDIT FIX: Purge index DataFrames and cache handles before training starts
+    del index_out, cache, stats
+    if 'index_df' in locals() and index_df is not None:
+        del index_df
+    import gc
+    gc.collect()
+
     return final_labels_csv, cache_prefix, folds_csv
 
 
@@ -330,6 +337,7 @@ def run_all_folds(
     batch_size: int = config.BATCH_SIZE,
     grad_accum: int = config.GRAD_ACCUM,
     variant: str = "dinov2-base",
+    num_workers: int = config.NUM_WORKERS,
 ) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
@@ -350,6 +358,7 @@ def run_all_folds(
                 fold=fold,
                 out_dir=fold_out_dir,
                 epochs=epochs,
+                num_workers=num_workers,
                 batch_size=batch_size,
                 grad_accum=grad_accum,
                 variant=variant,
@@ -482,6 +491,7 @@ def main():
     parser.add_argument("--variant", type=str, default="dinov2-base", help="Backbone variant ('dinov2-base' or 'dinov2-small')")
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
     parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
+    parser.add_argument("--num_workers", type=int, default=config.NUM_WORKERS, help="DataLoader CPU worker count per epoch (default: 6)")
     args = parser.parse_args()
 
     global_start_time = time.time()
@@ -558,6 +568,7 @@ def main():
             batch_size=args.batch_size,
             grad_accum=args.grad_accum,
             variant=args.variant,
+            num_workers=args.num_workers,
         )
 
     # Phase 4: OOF & Checkpoints

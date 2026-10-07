@@ -216,7 +216,16 @@ def train_epoch(
             print(f"  [Epoch {epoch:2d}/{total_epochs:2d} | Step {micro_step + 1:3d}/{total_batches:3d}] Loss: {avg_loss:.4f} | {sec_per_step:.2f}s/step | ETA: {rem_sec/60:.1f}m{vram_str}", flush=True)
             step_t0 = time.time()
 
-    return float(total_loss_tensor.item()) / max(n, 1)
+    ret_loss = float(total_loss_tensor.item()) / max(n, 1)
+    # MEMORY AUDIT FIX: Explicitly purge batch tensors & local variables
+    del total_loss_tensor, _rare_vec, trainable_params
+    if 'batch' in locals():
+        del batch, imgs, masks, wmasks, targets, weights
+    if 'logits' in locals():
+        del logits
+    if 'loss' in locals():
+        del loss
+    return ret_loss
 
 
 # ─────────────────────────────────────────────── Evaluation ──────────────────
@@ -237,6 +246,8 @@ def evaluate(
         P.append(torch.sigmoid(p.float()).cpu().numpy())
         Y.append(targets.numpy())
         W.append(weights.numpy())
+    if 'imgs' in locals():
+        del imgs, masks, wmasks, targets, weights
     P, Y, W = np.concatenate(P), np.concatenate(Y), np.concatenate(W)
     per: dict[str, float] = {}
     for j, t in enumerate(config.TARGETS):
@@ -250,6 +261,7 @@ def evaluate(
         if m.sum() > 1 and 0 < y_eval.sum() < m.sum():
             per[t] = float(roc_auc_score(y_eval, P[m, j]))
     macro = float(np.mean(list(per.values()))) if per else float("nan")
+    del P, Y, W
     return macro, per
 
 
@@ -262,7 +274,7 @@ def run_training(
     out_dir: str = ".",
     epochs: int | None = None,
     n_windows_train: int = config.N_WINDOWS_TRAIN,  # 6 windows covers ~65% continuous volume
-    num_workers: int = 16, # Utilize 16 of 20 DGX CPU cores, buffering ~45GB RAM
+    num_workers: int = 6,  # SOTA Memory Optimization: 6 workers eliminates queue RAM bloat (prevents OOM on 121GB RAM)
     seed: int = config.SEED,
     # model
     variant: str = "dinov2-base",         # Upgrade A: default to Base
@@ -429,26 +441,15 @@ def run_training(
     for ep in range(n_ep):
         ds_tr.set_epoch(ep)
         
+        # 1. Sequential Train DataLoader: Instantiate ONLY for training
         dl_tr = DataLoader(
             ds_tr, batch_size=batch_size, shuffle=True,
             drop_last=len(tr) > batch_size, num_workers=num_workers,
             pin_memory=(device.type == "cuda"),
             persistent_workers=False,
-            prefetch_factor=4 if num_workers > 0 else None,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
-        dl_va = None
-        if ds_va is not None:
-            dl_va = DataLoader(
-                ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
-                num_workers=min(4, num_workers), pin_memory=(device.type == "cuda"),
-                persistent_workers=False,
-                prefetch_factor=2 if num_workers > 0 else None,
-            )
 
-        # Gold upweighting: constant 1.5× throughout training.
-        # Constant (not curriculum) avoids Adam momentum destabilization from
-        # hard weight-schedule flips mid-training. 1.5× is moderate enough not
-        # to overfit to the small gold set, but enough to prioritize verified labels.
         loss_val = train_epoch(
             model_train, dl_tr, optimizer, scaler, scheduler, device,
             criterion,
@@ -461,18 +462,35 @@ def run_training(
             gold_weight_mult=1.5,
         )
 
+        # 2. IMMEDIATE PURGE of training DataLoader: terminates all workers and IPC buffers BEFORE validation!
+        del dl_tr
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         msg = f"epoch {ep + 1}/{n_ep}  loss {loss_val:.4f}"
         score = float("nan")
 
-        # Force garbage collection to purge train DataLoader zombie workers before validation
-        import gc
-        gc.collect()
-        
-        if dl_va is not None:
+        # 3. Sequential Validation DataLoader: Instantiate ONLY when validation runs, throttle workers
+        if ds_va is not None:
+            dl_va = DataLoader(
+                ds_va, batch_size=max(1, batch_size // 2), shuffle=False,
+                num_workers=min(2, num_workers), pin_memory=(device.type == "cuda"),
+                persistent_workers=False,
+                prefetch_factor=2 if num_workers > 0 else None,
+            )
             score, per = evaluate(model, dl_va, device)
             msg += f"  val macro-AUC {score:.4f}"
             top3 = sorted(per.items(), key=lambda kv: kv[1], reverse=True)[:3]
             msg += "  top3=[" + ", ".join(f"{k}:{v:.3f}" for k, v in top3) + "]"
+            
+            # 4. IMMEDIATE PURGE of validation DataLoader
+            del dl_va
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
         print(msg, flush=True)
 
         # ── SWA weight accumulation ───────────────────────────────────────────
@@ -480,9 +498,9 @@ def run_training(
             swa_model.update_parameters(model)
 
         # ── Best-checkpoint saving ────────────────────────────────────────────
-        save = (dl_va is None) or (np.isfinite(score) and score > best)
+        save = (ds_va is None) or (np.isfinite(score) and score > best)
         if save:
-            best = score if dl_va is not None else best
+            best = score if ds_va is not None else best
             epochs_no_improve = 0
             ckpt_file = os.path.join(out_dir, f"fold{fold}_best.pt")
             torch.save(
@@ -497,19 +515,9 @@ def run_training(
         else:
             epochs_no_improve += 1
             print(f"  [EARLY STOP] No validation AUC improvement for {epochs_no_improve}/{early_stop_patience} epochs (best: {best:.4f})", flush=True)
-            if dl_va is not None and epochs_no_improve >= early_stop_patience:
+            if ds_va is not None and epochs_no_improve >= early_stop_patience:
                 print(f"  [EARLY STOP] Validation AUC did not improve for {early_stop_patience} consecutive epochs. Stopping early at epoch {ep + 1}/{n_ep} to prevent overfitting.", flush=True)
                 break
-
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-            
-        # OOM FIX: Explicitly destroy DataLoaders and run GC to free pinned memory
-        del dl_tr
-        if dl_va is not None:
-            del dl_va
-        import gc
-        gc.collect()
 
         # ── Time-budget guard ─────────────────────────────────────────────────
         if time.time() - t0 > config.TIME_BUDGET_HOURS * 3600:
@@ -544,14 +552,19 @@ def run_training(
 
     if swa_model is not None and swa_epochs > 0 and (ep >= swa_start):
         print("Updating SWA batch-norm statistics …")
-        dl_tr = DataLoader(
+        dl_swa = DataLoader(
             ds_tr, batch_size=batch_size, shuffle=True,
-            drop_last=len(tr) > batch_size, num_workers=num_workers,
+            drop_last=len(tr) > batch_size, num_workers=min(4, num_workers),
             pin_memory=(device.type == "cuda"),
             persistent_workers=False,
-            prefetch_factor=4 if num_workers > 0 else None,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
-        safe_update_bn(dl_tr, swa_model, device=device)
+        safe_update_bn(dl_swa, swa_model, device=device)
+        del dl_swa
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         torch.save(
             dict(model=swa_model.module.state_dict(),
                  cfg=dataclasses.asdict(cfg),
@@ -573,6 +586,19 @@ def run_training(
         os.path.join(out_dir, f"fold{fold}_ema.pt"),
     )
     print(f"EMA checkpoint saved → fold{fold}_ema.pt")
+
+    # ── Final cleanup before exiting fold training ──────────────────────────
+    del model, model_train, optimizer, scheduler, scaler, ds_tr
+    if ds_va is not None:
+        del ds_va
+    if swa_model is not None:
+        del swa_model
+    if ema_model is not None:
+        del ema_model
+    import gc
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     return best
 

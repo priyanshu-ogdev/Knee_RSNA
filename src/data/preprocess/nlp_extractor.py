@@ -844,6 +844,13 @@ def auto_complete_extraction(
                 print(f"[WARNING] vLLM execution encountered an issue: {vllm_err}")
                 print("[FALLBACK] Automatically switching to Clinical Shield Rules engine to guarantee complete extraction...")
                 selected_engine = "rules"
+            finally:
+                if 'llm' in locals():
+                    del llm
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
     if selected_engine == "rules":
         completed_uids = {r['StudyInstanceUID'] for r in results if isinstance(r, dict) and 'StudyInstanceUID' in r}

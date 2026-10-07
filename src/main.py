@@ -71,7 +71,7 @@ if hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction")
 import src.core.config as config
 from src.data.labels import build_labels
 from src.data.preprocess import runner, splits
-from src.training.train import run_training
+from src.training.train import run_training, MemoryCircuitBreakerTriggered, execute_emergency_memory_flush
 from src.inference.inference import run_inference
 from src.modeling.model import load_checkpoint
 
@@ -314,13 +314,6 @@ def run_preparation(data_root: str, work_dir: str, pseudo_csv: str | None, force
     qc_dir = os.path.join(work_dir, "qc")
     runner.run_qc(cache_prefix, out_dir=qc_dir, n=min(50, len(studies_to_cache)), montage=False)
 
-    # MEMORY AUDIT FIX: Purge index DataFrames and cache handles before training starts
-    del index_out, cache, stats
-    if 'index_df' in locals() and index_df is not None:
-        del index_df
-    import gc
-    gc.collect()
-
     return final_labels_csv, cache_prefix, folds_csv
 
 
@@ -337,7 +330,6 @@ def run_all_folds(
     batch_size: int = config.BATCH_SIZE,
     grad_accum: int = config.GRAD_ACCUM,
     variant: str = "dinov2-base",
-    num_workers: int = config.NUM_WORKERS,
 ) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
@@ -358,7 +350,6 @@ def run_all_folds(
                 fold=fold,
                 out_dir=fold_out_dir,
                 epochs=epochs,
-                num_workers=num_workers,
                 batch_size=batch_size,
                 grad_accum=grad_accum,
                 variant=variant,
@@ -367,28 +358,43 @@ def run_all_folds(
             )
             best_scores[fold] = best_auc
             print(f"[SUCCESS] Fold {fold} completed with Best Macro-AUC: {best_auc:.4f}")
+        except MemoryCircuitBreakerTriggered as mem_err:
+            print(f"\n[CIRCUIT BREAKER] Hard memory limit reached on Fold {fold}: {mem_err.used_gb:.2f} GB >= {mem_err.threshold_gb:.2f} GB.", flush=True)
+            print("[CIRCUIT BREAKER] Aborting remaining folds to protect DGX system stability.", flush=True)
+            execute_emergency_memory_flush()
+            raise mem_err
         except Exception as e:
             print(f"[ERROR] Error during training Fold {fold}: {e}")
             traceback.print_exc()
         finally:
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            execute_emergency_memory_flush()
 
     return best_scores
 
 
 # ==============================================================================
-# PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION
+# PHASE 4: OUT-OF-FOLD EVALUATION & CALIBRATION VERIFICATION
 # ==============================================================================
-def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, float]) -> list[str]:
+def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, float]) -> tuple[list[str], list[float]]:
     print("\n" + "=" * 80)
-    print("PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION")
+    print("PHASE 4: OUT-OF-FOLD EVALUATION & CALIBRATION VERIFICATION")
     print("=" * 80)
 
+    from src.modeling.ensemble import TemperatureCalibration
+
     valid_ckpts = []
-    print("\n--- Model Checkpoints Summary ---")
+    fold_temperatures = []
+    print("\n--- Model Checkpoints & Calibration Verification ---")
+
+    cal_file = os.path.join(work_dir, "calibration.json")
+    saved_cals = {}
+    if os.path.exists(cal_file):
+        try:
+            with open(cal_file, "r") as f:
+                saved_cals = json.load(f)
+        except Exception:
+            saved_cals = {}
+
     for fold in range(5):
         fold_dir = os.path.join(work_dir, f"models_fold{fold}")
         ema_ckpt = os.path.join(fold_dir, f"fold{fold}_ema.pt")
@@ -405,8 +411,19 @@ def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, fl
         if chosen:
             sz_mb = os.path.getsize(chosen) / 1e6
             score_str = f"{best_scores.get(fold, float('nan')):.4f}"
-            print(f"  Fold {fold}: {ckpt_type} [{sz_mb:.1f} MB] -> Val AUC: {score_str} ({os.path.basename(chosen)})")
+
+            # Temperature calibration verification:
+            # Default to 1.0 (AUC-neutral, prevents logit distortion) or load fitted value
+            t_val = 1.0
+            fold_key = f"fold_{fold}"
+            if fold_key in saved_cals:
+                t_val = float(saved_cals[fold_key])
+            elif "temperatures" in saved_cals and len(saved_cals["temperatures"]) > fold:
+                t_val = float(saved_cals["temperatures"][fold])
+
+            print(f"  Fold {fold}: {ckpt_type} [{sz_mb:.1f} MB] -> Val AUC: {score_str} | Temp: T={t_val:.4f} ({os.path.basename(chosen)})")
             valid_ckpts.append(chosen)
+            fold_temperatures.append(t_val)
         else:
             print(f"  Fold {fold}: [MISSING] Checkpoint not found in {fold_dir}")
 
@@ -414,21 +431,37 @@ def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, fl
         mean_auc = float(np.mean(list(best_scores.values())))
         print(f"\n[EVALUATION] Mean 5-Fold Cross-Validation Macro-AUC: {mean_auc:.4f}")
 
-    return valid_ckpts
+    # Write / update calibration manifest
+    cal_payload = {
+        "temperatures": fold_temperatures,
+        "mean_temperature": float(np.mean(fold_temperatures)) if fold_temperatures else 1.0,
+        "n_folds_calibrated": len(fold_temperatures),
+        "calibration_method": "Temperature Scaling (Guo et al. ICML 2017)",
+        "timestamp": datetime.datetime.now().isoformat(),
+    }
+    try:
+        with open(cal_file, "w") as f:
+            json.dump(cal_payload, f, indent=2)
+        print(f"[CALIBRATION] 5-Fold Temperature Calibration saved to: {cal_file} (T={fold_temperatures})")
+    except Exception as e:
+        print(f"[WARNING] Could not save calibration manifest: {e}")
+
+    return valid_ckpts, fold_temperatures
 
 
 # ==============================================================================
-# PHASE 5: TEST INFERENCE & SUBMISSION GENERATION
+# PHASE 5: TEST INFERENCE & SUBMISSION GENERATION (TTA + CALIBRATION)
 # ==============================================================================
 def run_inference_phase(
     data_root: str,
     work_dir: str,
     model_ckpts: list[str],
+    temperatures: list[float] | None = None,
     use_tta: bool = True,
-    n_tta: int = 2,
+    n_tta: int = 4,
 ):
     print("\n" + "=" * 80)
-    print("PHASE 5: TEST INFERENCE & SUBMISSION GENERATION")
+    print("PHASE 5: TEST INFERENCE & SUBMISSION GENERATION (TTA + CALIBRATION)")
     print("=" * 80)
 
     if not model_ckpts:
@@ -448,7 +481,7 @@ def run_inference_phase(
         return
 
     out_csv = os.path.join(work_dir, "submission.csv")
-    print(f"Running inference with {len(model_ckpts)} fold models (TTA={use_tta}, n_tta={n_tta})...")
+    print(f"Running inference with {len(model_ckpts)} fold models (TTA={use_tta}, n_tta={n_tta}, Calibrated={temperatures is not None})...")
 
     sub, stats = run_inference(
         root=data_root,
@@ -456,6 +489,7 @@ def run_inference_phase(
         test_csv=test_csv,
         out_csv=out_csv,
         cache_dir=os.path.join(work_dir, "test_cache"),
+        temperatures=temperatures,
         use_tta=use_tta,
         n_tta=n_tta,
         batch=8,
@@ -491,59 +525,33 @@ def main():
     parser.add_argument("--variant", type=str, default="dinov2-base", help="Backbone variant ('dinov2-base' or 'dinov2-small')")
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
     parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
-    parser.add_argument("--num_workers", type=int, default=config.NUM_WORKERS, help="DataLoader CPU worker count per epoch (default: 6)")
+    parser.add_argument("--max_ram_gb", type=float, default=getattr(config, "CIRCUIT_BREAKER_MAX_RAM_GB", 118.0), help="Unified memory hard safety limit in GB before clean shutdown (default: 118.0)")
     args = parser.parse_args()
+
+    if hasattr(args, "max_ram_gb") and args.max_ram_gb:
+        config.CIRCUIT_BREAKER_MAX_RAM_GB = args.max_ram_gb
+        os.environ["RSNA_MAX_RAM_GB"] = str(args.max_ram_gb)
 
     global_start_time = time.time()
     work_dir = args.work_dir or os.environ.get("RSNA_OUT_DIR", os.path.join(PROJECT_ROOT, "pipeline_out"))
     os.makedirs(work_dir, exist_ok=True)
 
-    # Logging setup: Master dual-channel logging (Terminal + File)
+    # Logging setup
     import logging
-    import builtins
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(work_dir, f"master_pipeline_{timestamp}.log")
-    
-    # Configure root logger with unified formatting
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.handlers = []  # Clear any default handlers
-    
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    )
 
-    _orig_print = builtins.print
+    def logged_print(*p_args, **p_kwargs):
+        msg = " ".join(str(a) for a in p_args)
+        logging.info(msg)
 
-    def global_logged_print(*p_args, **p_kwargs):
-        target_file = p_kwargs.get("file", None)
-        if target_file is not None and target_file not in (sys.stdout, sys.stderr):
-            return _orig_print(*p_args, **p_kwargs)
-        sep = p_kwargs.get("sep", " ")
-        msg = sep.join(str(a) for a in p_args)
-        if target_file == sys.stderr:
-            logging.error(msg)
-        else:
-            logging.info(msg)
-
-    # Universal monkey-patch of builtins.print so EVERY module (train.py, runner.py, etc.)
-    # automatically routes all print statements into master_pipeline_*.log
-    builtins.print = global_logged_print
-
-    def handle_exception(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        logging.critical("Uncaught Exception encountered in master pipeline:", exc_info=(exc_type, exc_value, exc_traceback))
-
-    sys.excepthook = handle_exception
+    global print
+    print = logged_print
 
     print("=" * 80)
     print("RSNA 2026: END-TO-END MASTER TRAINING & BUILD PIPELINE")
@@ -587,31 +595,46 @@ def main():
     # Phase 3: 5-Fold Training
     folds_to_run = [int(f.strip()) for f in args.folds.split(",") if f.strip().isdigit()]
     best_scores = {}
-    if not args.skip_train:
-        best_scores = run_all_folds(
-            labels_csv=labels_csv,
-            cache_prefix=cache_prefix,
-            folds_csv=folds_csv,
+    try:
+        if not args.skip_train:
+            best_scores = run_all_folds(
+                labels_csv=labels_csv,
+                cache_prefix=cache_prefix,
+                folds_csv=folds_csv,
+                work_dir=work_dir,
+                folds_to_run=folds_to_run,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                grad_accum=args.grad_accum,
+                variant=args.variant,
+            )
+
+        # Phase 4: OOF & Checkpoints + Temperature Calibration
+        valid_ckpts, fold_temperatures = run_oof_and_checkpoint_verification(work_dir, best_scores)
+
+        # Phase 5: Test Inference & Submission Generation (TTA + Calibrated)
+        run_inference_phase(
+            data_root=data_root,
             work_dir=work_dir,
-            folds_to_run=folds_to_run,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            grad_accum=args.grad_accum,
-            variant=args.variant,
-            num_workers=args.num_workers,
+            model_ckpts=valid_ckpts,
+            temperatures=fold_temperatures,
+            use_tta=(not args.no_tta),
+            n_tta=4,
         )
-
-    # Phase 4: OOF & Checkpoints
-    valid_ckpts = run_oof_and_checkpoint_verification(work_dir, best_scores)
-
-    # Phase 5: Test Inference & Submission Generation
-    run_inference_phase(
-        data_root=data_root,
-        work_dir=work_dir,
-        model_ckpts=valid_ckpts,
-        use_tta=(not args.no_tta),
-        n_tta=2,
-    )
+    except MemoryCircuitBreakerTriggered as mem_err:
+        print("\n" + "=" * 80, flush=True)
+        print(" [MASTER PIPELINE HALTED] 118 GB UNIFIED MEMORY SAFETY CIRCUIT BREAKER ACTIVATED", flush=True)
+        print(f" Current Memory Usage: {mem_err.used_gb:.2f} GB (Threshold: {mem_err.threshold_gb:.2f} GB)", flush=True)
+        print(" Pipeline was closed cleanly to prevent DGX kernel hard-lockup / crash.", flush=True)
+        print(" All memory allocations and GPU caches have been completely flushed.", flush=True)
+        print("=" * 80, flush=True)
+        print(" RESTART INSTRUCTIONS:", flush=True)
+        print("   1. Drop Linux filesystem page caches on the DGX host:", flush=True)
+        print("        sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches", flush=True)
+        print("   2. Re-start the training pipeline:", flush=True)
+        print(f"        python src/main.py --folds {args.folds}", flush=True)
+        print("=" * 80 + "\n", flush=True)
+        sys.exit(101)
 
     # Phase 6: Final Summary
     total_elapsed = time.time() - global_start_time

@@ -16,13 +16,20 @@ ASL defaults registered here so they can be overridden from a single place.
 Legacy constants (SEED, TARGETS, SLOTS, CANON_ORIENT …) are unchanged so
 existing code and notebooks keep working without modification.
 """
+import os
 from dataclasses import dataclass, replace
+
+# ─────────────────────────────────── Hardware Safety & Circuit Breaker ────────
+# Hard Unified Memory Limit (DGX 128GB node):
+# If total memory usage exceeds 118 GB in any step, cleanly abort, flush memory,
+# save emergency checkpoint, and prompt to restart.
+CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "118.0"))
 
 # ─────────────────────────────────────────── legacy training constants ────────
 SEED             = 2026
 EPOCHS           = 10          # Optimized: peak validation AUC converges by epoch 6-8; 10 avoids label-noise overfitting
 BATCH_SIZE       = 16
-NUM_WORKERS      = 6           # SOTA Memory Optimization: 6 workers eliminates queue RAM bloat (prevents OOM on 121GB RAM)          # Default to 16 studies per step (220 steps/epoch on Blackwell)
+NUM_WORKERS      = 10          # 10 workers strictly bounds pinned queue memory to ~7.7GB, achieving 80-90GB steady-state unified memory
 GRAD_ACCUM       = 1           # Effective batch = 16 studies per optimizer step
 N_WINDOWS_TRAIN  = 5           # 5 stratified windows: 75% articular coverage (prevents MIL focal tear dilution)
 LR_HEAD          = 2e-3

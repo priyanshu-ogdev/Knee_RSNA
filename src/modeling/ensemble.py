@@ -1,4 +1,4 @@
-﻿"""Ensemble utilities.
+"""Ensemble utilities.
 
 Implements:
   TemperatureCalibration  Post-hoc probability calibration per model arm.
@@ -56,12 +56,18 @@ class TemperatureCalibration:
         mask = np.isfinite(oof_labels) & np.isfinite(oof_logits)
         lo = oof_logits[mask].ravel()
         la = oof_labels[mask].ravel()
-        res = minimize_scalar(
-            lambda T: self._nll(T, lo, la),
-            bounds=(0.1, 10.0),
-            method="bounded",
-        )
-        self.T = float(res.x)
+        if len(lo) == 0 or la.sum() == 0 or la.sum() == len(la):
+            self.T = 1.0
+            return self
+        try:
+            res = minimize_scalar(
+                lambda T: self._nll(T, lo, la),
+                bounds=(0.1, 10.0),
+                method="bounded",
+            )
+            self.T = float(res.x) if (hasattr(res, "x") and np.isfinite(res.x)) else 1.0
+        except Exception:
+            self.T = 1.0
         return self
 
     def transform(self, logits: np.ndarray) -> np.ndarray:

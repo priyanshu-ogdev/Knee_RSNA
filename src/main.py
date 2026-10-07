@@ -39,7 +39,7 @@ os.environ["KAGGLEHUB_CACHE"] = os.path.abspath(os.path.join(PROJECT_ROOT, "data
 
 # PyTorch Memory Allocation: prevent unified memory fragmentation on Grace Blackwell GB10
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
 # Suppress OpenCV / OpenMP / BLAS thread oversubscription
 os.environ["OMP_NUM_THREADS"] = "1"

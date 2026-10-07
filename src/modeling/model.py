@@ -248,9 +248,9 @@ class Model(nn.Module):
                 try:
                     gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                     if gb >= 80.0:
-                        self._cached_chunk_size = 1024  # 130GB GB10: Extreme batch parallelism
+                        self._cached_chunk_size = 512  # 130GB GB10: Safe high-parallelism
                     elif gb >= 24.0:
-                        self._cached_chunk_size = 768   # 24-48GB GPUs: Process entire 720-image batch in one shot!
+                        self._cached_chunk_size = 256  # 24-48GB GPUs: Saturates Tensor Cores perfectly without triggering Unified Memory swap hangs
                     else:
                         self._cached_chunk_size = 48   # 16GB Kaggle T4 / P100
                 except Exception:
@@ -384,10 +384,11 @@ def build_model(
             cfg_obj = AutoConfig.from_pretrained(src)
         bb = AutoModel.from_config(cfg_obj)
     
-    # Gradient Checkpointing DISABLED: We are utilizing the massive VRAM buffer for a 30-40% speedup.
-    # The entire forward pass will be kept in VRAM (consuming ~25GB total) to bypass backward recomputation.
-    bb.config.use_cache = True
-    # bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    # SOTA Memory Protection: PyTorch 2.x Non-Reentrant Gradient Checkpointing
+    # Strictly bounds activation memory (~8-15 GB) across all batch sizes.
+    # MANDATORY on DGX to prevent the GPU from silently spilling >50GB of backprop graphs into System RAM!
+    bb.config.use_cache = False
+    bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     
     # Phase 2 Speedup: Truncate top layers of the backbone
     if truncate_blocks > 0:

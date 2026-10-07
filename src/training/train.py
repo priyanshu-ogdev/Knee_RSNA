@@ -570,7 +570,8 @@ def run_training(
     # EMA gives a continuous smooth average of the weights, providing better
     # generalization than the instantaneous best checkpoint (verified across
     # ViT fine-tuning literature). Previously computed but never saved — fixed.
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.9998))
+    # Fix: 0.995 decay gives a half-life of ~1 epoch (146 steps), perfectly erasing the ghost weights of Epoch 1.
+    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.995))
 
     os.makedirs(out_dir, exist_ok=True)
     best, t0 = -1.0, time.time()

@@ -35,6 +35,11 @@ N_WINDOWS_TRAIN  = 5           # 5 stratified windows: 75% articular coverage (p
 LR_HEAD          = 2e-3
 LR_BACKBONE      = 1e-5        # Scaled for effective batch=16
 WEIGHT_DECAY     = 0.05        # Standard ViT recipe
+COATNET_LR_HEAD      = 1e-3
+COATNET_LR_BACKBONE  = 3e-5
+COATNET_WEIGHT_DECAY = 0.02
+COATNET_INPUT_SIZE   = 384
+COATNET_ENCODE_CHUNK = 8
 UNFREEZE_LAST    = 8           # Top 8 blocks fine-tuned with LLRD; blocks 0-3 frozen (preserves 2.5D MRI adaptation)
 LORA_RANK        = 0          # Upgrade B — rank for QV LoRA adapters
 LORA_ALPHA       = 32          # LoRA scaling: scale = LORA_ALPHA / LORA_RANK = 2
@@ -188,7 +193,6 @@ def cfg_from_dict(d: dict) -> PreCfg:
 CROP_MM    = PRESETS["v2"].crop_mm
 IMG_SIZE   = PRESETS["v2"].img_size
 GROUP_SIZE = PRESETS["v2"].group
-
 
 
 

@@ -23,6 +23,29 @@ TARGETS = [
     "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"
 ]
 
+
+def _validated_extraction_rows(frame: pd.DataFrame, expected_uids: set[str]) -> pd.DataFrame:
+    """Keep only complete, in-range extraction rows for the requested studies."""
+    required = {"StudyInstanceUID", *TARGETS}
+    if not required.issubset(frame.columns):
+        return frame.iloc[0:0].copy()
+
+    clean = frame.copy()
+    clean["StudyInstanceUID"] = clean["StudyInstanceUID"].astype(str).str.strip()
+    clean = clean[clean["StudyInstanceUID"].isin(expected_uids)].copy()
+    valid = clean["StudyInstanceUID"].ne("")
+    for target in TARGETS:
+        values = pd.to_numeric(clean[target], errors="coerce")
+        valid &= values.notna() & values.between(0.0, 1.0)
+        clean[target] = values
+        weight_column = f"{target}_weight"
+        if weight_column in clean.columns:
+            weights = pd.to_numeric(clean[weight_column], errors="coerce")
+            valid &= weights.notna() & weights.ge(0.0) & weights.le(1.0)
+            clean[weight_column] = weights
+    return clean.loc[valid].drop_duplicates("StudyInstanceUID", keep="last")
+
+
 def build_prompt(report: str) -> str:
     return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist. 
 Accurately extract the presence of the following 12 knee conditions from this MRI radiology report.
@@ -731,7 +754,11 @@ def auto_complete_extraction(
         raise FileNotFoundError(f"train.csv not found at {train_path}")
         
     train_df = pd.read_csv(train_path)
+    if train_df['StudyInstanceUID'].isna().any():
+        raise ValueError("train.csv contains a missing StudyInstanceUID")
     train_df['StudyInstanceUID'] = train_df['StudyInstanceUID'].astype(str).str.strip()
+    if train_df['StudyInstanceUID'].eq("").any() or train_df['StudyInstanceUID'].duplicated().any():
+        raise ValueError("train.csv must have non-empty, unique StudyInstanceUID values")
     gold_mask = train_df[TARGETS].notna().any(axis=1)
     
     report_col = 'Report' if 'Report' in train_df.columns else ('report' if 'report' in train_df.columns else None)
@@ -750,12 +777,13 @@ def auto_complete_extraction(
     if os.path.exists(out_csv) and not force:
         try:
             existing_df = pd.read_csv(out_csv)
-            existing_df['StudyInstanceUID'] = existing_df['StudyInstanceUID'].astype(str).str.strip()
-            # Validate expected target columns
-            if all(t in existing_df.columns for t in TARGETS):
-                done_uids = set(existing_df['StudyInstanceUID']) & needed_uids
-                existing_results = existing_df.to_dict('records')
-                print(f"[AUTO-DETECT] Existing checkpoint found: {len(done_uids)} / {total_needed} studies already extracted.")
+            valid_existing = _validated_extraction_rows(existing_df, needed_uids)
+            done_uids = set(valid_existing['StudyInstanceUID'])
+            existing_results = valid_existing.to_dict('records')
+            print(
+                f"[AUTO-DETECT] Valid cached extractions: {len(done_uids)} / "
+                f"{total_needed}; incomplete or invalid rows will be regenerated."
+            )
         except Exception as e:
             print(f"[WARNING] Could not parse existing {out_csv} ({e}). Starting fresh.")
             existing_results = []
@@ -763,6 +791,11 @@ def auto_complete_extraction(
             
     # 2. Check for completion
     if len(done_uids) >= total_needed:
+        if existing_results:
+            df_out = pd.DataFrame(existing_results)
+            tmp_csv = f"{out_csv}.tmp"
+            df_out.to_csv(tmp_csv, index=False)
+            os.replace(tmp_csv, out_csv)
         print(f"[SUCCESS] Pseudo-labels are 100% COMPLETE ({len(done_uids)} / {total_needed} studies verified).")
         print(f"[SUCCESS] File ready at: {out_csv}")
         return out_csv, {"status": "complete", "total": len(done_uids), "new": 0, "engine": "cached"}
@@ -873,6 +906,16 @@ def auto_complete_extraction(
                 print(f"[CHECKPOINT] Extracted {len(df_out)} / {total_needed} ({pct:.1f}%) -> {out_csv}")
                 
     final_df = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+    final_df = _validated_extraction_rows(final_df, needed_uids)
+    missing_uids = needed_uids - set(final_df['StudyInstanceUID'])
+    if missing_uids:
+        raise RuntimeError(
+            f"NLP extraction is incomplete: {len(missing_uids)} / {total_needed} "
+            "required studies have no complete, in-range labels"
+        )
+    tmp_csv = f"{out_csv}.tmp"
+    final_df.to_csv(tmp_csv, index=False)
+    os.replace(tmp_csv, out_csv)
     elapsed = time.time() - start_time
     print(f"[SUCCESS] NLP extraction completed in {elapsed:.1f}s. Total valid studies in {out_csv}: {len(final_df)}.")
     return out_csv, {"status": "complete", "total": len(final_df), "new": len(remaining_df), "engine": selected_engine}

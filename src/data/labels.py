@@ -14,14 +14,28 @@ import src.core.config as config
 def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
     """root: competition folder. extra_csv: same schema as train.csv (targets may be soft probabilities in [0,1]),
     optionally with '<target>_weight' columns (extractor confidence). -> DataFrame (and CSV if out_csv)."""
+    if not np.isfinite(extra_weight) or extra_weight < 0:
+        raise ValueError(f"extra_weight must be finite and non-negative, got {extra_weight!r}")
     tr = pd.read_csv(os.path.join(root, 'train.csv'))
+    if tr['StudyInstanceUID'].isna().any():
+        raise ValueError("train.csv contains a missing StudyInstanceUID")
     out = pd.DataFrame({'StudyInstanceUID': tr['StudyInstanceUID'].astype(str).str.strip()})
+    if out['StudyInstanceUID'].eq('').any() or out['StudyInstanceUID'].duplicated().any():
+        raise ValueError("train.csv must have non-empty, unique StudyInstanceUID values")
     gold = {t: (tr[t].astype(float) if t in tr.columns else pd.Series(np.nan, index=tr.index)) for t in config.TARGETS}
+    for target, values in gold.items():
+        finite = values[np.isfinite(values)]
+        if not finite.between(0.0, 1.0).all():
+            raise ValueError(f"gold labels for {target!r} must be in [0, 1]")
     ex = None
     if extra_csv and os.path.exists(extra_csv):
         ex_raw = pd.read_csv(extra_csv)
+        if 'StudyInstanceUID' not in ex_raw.columns or ex_raw['StudyInstanceUID'].isna().any():
+            raise ValueError(f"extra labels must contain non-null StudyInstanceUID values: {extra_csv}")
         ex_raw['StudyInstanceUID'] = ex_raw['StudyInstanceUID'].astype(str).str.strip()
-        ex = ex_raw.drop_duplicates('StudyInstanceUID').set_index('StudyInstanceUID').reindex(out['StudyInstanceUID'])
+        if ex_raw['StudyInstanceUID'].eq('').any() or ex_raw['StudyInstanceUID'].duplicated().any():
+            raise ValueError(f"extra labels must have non-empty, unique StudyInstanceUID values: {extra_csv}")
+        ex = ex_raw.set_index('StudyInstanceUID').reindex(out['StudyInstanceUID'])
     out['source'] = 'none'
     any_gold = pd.concat(gold, axis=1).notna().any(axis=1).values
     out.loc[any_gold, 'source'] = 'gold'
@@ -31,7 +45,14 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
         w = np.where(np.isfinite(g), 1.0, 0.0)
         if ex is not None and t in ex.columns:
             e = ex[t].astype(float).values
+            finite = e[np.isfinite(e)]
+            if not np.logical_and(finite >= 0.0, finite <= 1.0).all():
+                raise ValueError(f"extra labels for {t!r} must be in [0, 1]")
             ew = ex[f'{t}_weight'].astype(float).fillna(1.0).values if f'{t}_weight' in ex.columns else 1.0
+            if np.isscalar(ew):
+                pass
+            elif not np.isfinite(ew).all() or (ew < 0).any():
+                raise ValueError(f"extra weights for {t!r} must be finite and non-negative")
             use = ~np.isfinite(g) & np.isfinite(e)
             y = np.where(use, e, g)
             w = np.where(use, extra_weight * ew, w)

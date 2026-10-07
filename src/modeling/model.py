@@ -28,6 +28,7 @@ import torch.nn as nn
 from transformers import AutoModel
 
 import src.core.config as config
+from src.modeling.mil import build_timm_attention_mil
 
 # ── Anatomical slot prior ───────────────────────────────────────────────────
 # Maps each target to its most informative slot indices (0-indexed).
@@ -340,10 +341,14 @@ def build_model(
     variant: str = "dinov2-base",          # Standard first argument
     unfreeze_last: int = config.UNFREEZE_LAST,
     use_cross_slot: bool = True,           # Upgrade C: CrossSlotTransformer
-    lora_rank: int = 16,                   # Upgrade B: LoRA rank (0 = disable)
-    lora_alpha: int = 32,
+    lora_rank: int = config.LORA_RANK,     # Upgrade B: LoRA rank (0 = disable)
+    lora_alpha: int = config.LORA_ALPHA,
     truncate_blocks: int = 0,              # Phase 2 Speedup: drop last 3 blocks
-) -> Model:
+    model_type: str | None = None,
+    input_size: int = config.COATNET_INPUT_SIZE,
+    encode_chunk_size: int = config.COATNET_ENCODE_CHUNK,
+    pretrained: bool = True,
+) -> nn.Module:
     # Polymorphic argument resolution for backward compatibility
     if isinstance(variant, int):
         unfreeze_last = variant
@@ -366,6 +371,17 @@ def build_model(
         Whether to include the CrossSlotTransformer between WindowPool and
         SlotHead.  Set False for ablation comparison with baseline head.
     """
+    model_type = model_type or ("coatnet_mil" if variant.startswith("coatnet") else "dinov2")
+    if model_type == "coatnet_mil":
+        return build_timm_attention_mil(
+            variant,
+            pretrained=pretrained,
+            input_size=input_size,
+            encode_chunk_size=encode_chunk_size,
+        )
+    if model_type != "dinov2":
+        raise ValueError(f"Unknown model_type {model_type!r}; expected 'dinov2' or 'coatnet_mil'")
+
     src = variant if os.path.isdir(variant) else f"facebook/{variant}"
     try:
         bb = AutoModel.from_pretrained(src, drop_path_rate=0.2, attn_implementation="sdpa", local_files_only=os.path.isdir(src))  # SOTA FlashAttention-2 speedup  # Extreme regularization to prevent overfitting on pseudo-labels
@@ -425,10 +441,8 @@ def build_model(
 
 
 # -----------------------------------------------------------------------------
-# ARCHITECTURAL NOTE: ConvNeXt was evaluated and REJECTED in negative review.
-# Reason: Naive global average pooling (GAP) over all S*W windows diluted focal
-# tear signal by 36x, causing severe false negatives on ACL and Meniscus.
-# Our primary architecture is 100% pure DINOv2 + CrossSlotTransformer.
+# DINOv2 remains the default model. The optional timm MIL arm uses target-
+# specific attention over valid windows rather than global-average pooling.
 # -----------------------------------------------------------------------------
 
 def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") -> nn.Module:
@@ -437,10 +451,25 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
     Safely strips torch.compile (_orig_mod.) and DataParallel (module.) prefixes if present.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    variant = ckpt.get("variant", "dinov2-base")
-    use_cross_slot = ckpt.get("use_cross_slot", True)
-    model = build_model(variant=variant, use_cross_slot=use_cross_slot).to(device)
     state_dict = ckpt["model"]
+    model_config = dict(ckpt.get("model_config", {}))
+    model_config.setdefault("variant", ckpt.get("variant", "dinov2-base"))
+    model_config.setdefault(
+        "model_type",
+        ckpt.get("model_type", "coatnet_mil" if model_config["variant"].startswith("coatnet") else "dinov2"),
+    )
+    model_config.setdefault("use_cross_slot", ckpt.get("use_cross_slot", True))
+    if "lora_rank" not in model_config:
+        lora_a = next((v for k, v in state_dict.items() if k.endswith(".A")), None)
+        model_config["lora_rank"] = int(lora_a.shape[-1]) if lora_a is not None else 0
+    model_config.setdefault("lora_alpha", config.LORA_ALPHA)
+    model_config.setdefault("unfreeze_last", config.UNFREEZE_LAST)
+    model_config.setdefault("truncate_blocks", 0)
+    model_config.setdefault("input_size", config.COATNET_INPUT_SIZE)
+    model_config.setdefault("encode_chunk_size", config.COATNET_ENCODE_CHUNK)
+    model_config.setdefault("pretrained", False)
+
+    model = build_model(**model_config).to(device)
     cleaned_state_dict = {}
     for k, v in state_dict.items():
         clean_k = k
@@ -451,4 +480,6 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
         cleaned_state_dict[clean_k] = v
     model.load_state_dict(cleaned_state_dict)
     model.eval()
+    model._rsna_preprocessing_config = ckpt.get("cfg")
+    model._rsna_model_type = model_config["model_type"]
     return model

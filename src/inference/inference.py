@@ -86,6 +86,89 @@ def rank_percentile_blend(model_preds_list: list[np.ndarray]) -> np.ndarray:
     return blended
 
 
+def _rank_columns_average(values: np.ndarray) -> np.ndarray:
+    """Return column-wise percentile ranks using average ties, as in the d4 notebook."""
+    if values.ndim != 2 or not np.isfinite(values).all():
+        raise ValueError("Rank inputs must be a finite 2D array")
+    return (
+        pd.DataFrame(values)
+        .rank(method="average", pct=True)
+        .to_numpy(dtype=np.float32)
+    )
+
+
+def d4_family_rank_blend(
+    per_model_preds: list[np.ndarray],
+    model_types: list[str],
+) -> np.ndarray:
+    """Apply d4-derived target weights to this pipeline's DINOv2/CoAtNet families.
+
+    This is not the complete d4 blend: its second source is a Raptor/CoAtNet
+    hybrid, whose external Raptor and auxiliary model arms are not loaded here.
+    """
+    if len(per_model_preds) != len(model_types) or not per_model_preds:
+        raise ValueError("Each prediction array must have exactly one model family")
+    if any(pred.shape != per_model_preds[0].shape for pred in per_model_preds):
+        raise ValueError("All model-family prediction arrays must have the same shape")
+
+    families: dict[str, list[np.ndarray]] = {}
+    for predictions, model_type in zip(per_model_preds, model_types):
+        if model_type not in {"dinov2", "coatnet_mil"}:
+            raise ValueError(f"Unsupported model family for d4 blend: {model_type!r}")
+        families.setdefault(model_type, []).append(predictions)
+
+    if set(families) != {"dinov2", "coatnet_mil"}:
+        raise ValueError("d4 family blend requires at least one DINOv2 and one CoAtNet checkpoint")
+
+    family_ranks = {
+        name: _rank_columns_average(np.mean(np.stack(predictions), axis=0))
+        for name, predictions in families.items()
+    }
+    coatnet_weight = np.full(len(config.TARGETS), 0.60, dtype=np.float32)
+    coatnet_overrides = {
+        "ACL": 0.75,
+        "Medial Meniscus": 0.80,
+        "Lateral Meniscus": 1.00,
+        "Lateral OA": 0.75,
+        "Fracture": 0.75,
+    }
+    for target, weight in coatnet_overrides.items():
+        coatnet_weight[config.TARGETS.index(target)] = weight
+
+    combined = (
+        (1.0 - coatnet_weight[None, :]) * family_ranks["dinov2"]
+        + coatnet_weight[None, :] * family_ranks["coatnet_mil"]
+    )
+    return _rank_columns_average(combined)
+
+
+def resolve_preprocessing_config(
+    models: list[torch.nn.Module],
+    cfg: config.PreCfg | None,
+) -> config.PreCfg:
+    """Use checkpoint preprocessing metadata and reject incompatible model ensembles."""
+    checkpoint_cfgs = []
+    for model in models:
+        saved_cfg = getattr(model, "_rsna_preprocessing_config", None)
+        if saved_cfg is not None:
+            checkpoint_cfgs.append(
+                config.cfg_from_dict(saved_cfg) if isinstance(saved_cfg, dict) else saved_cfg
+            )
+
+    if not checkpoint_cfgs:
+        return cfg or config.get_cfg("v2")
+    if len(checkpoint_cfgs) != len(models):
+        raise ValueError(
+            "Some model checkpoints do not contain preprocessing metadata; "
+            "pass cfg explicitly to guarantee train/inference parity."
+        )
+    if any(saved_cfg != checkpoint_cfgs[0] for saved_cfg in checkpoint_cfgs[1:]):
+        raise ValueError("Ensemble checkpoints were trained with different preprocessing configs.")
+    if cfg is not None and cfg != checkpoint_cfgs[0]:
+        raise ValueError("Explicit inference cfg does not match the checkpoint preprocessing config.")
+    return cfg or checkpoint_cfgs[0]
+
+
 def prepare_test_tables(root: str, cfg: config.PreCfg, workers: int | None = None):
     """Directory-truth index of test_series -> annotated series table, slot table, laterality, records."""
     # Robust candidate test directory detection
@@ -280,10 +363,17 @@ def run_inference(
     batch: int = 8,
 ) -> tuple[pd.DataFrame, dict]:
     """Build the cache and run predictions in a pipelined fashion."""
-    cfg = cfg or config.get_cfg("v2")
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Auto-load checkpoint files if paths were passed instead of module instances
     loaded_models = [load_checkpoint(m, device) if isinstance(m, str) else m for m in models]
+    model_types = [
+        getattr(model, "_rsna_model_type", getattr(model, "model_type", "dinov2"))
+        for model in loaded_models
+    ]
+    unknown_types = set(model_types) - {"dinov2", "coatnet_mil"}
+    if unknown_types:
+        raise ValueError(f"Unsupported model families in inference ensemble: {sorted(unknown_types)}")
+    cfg = resolve_preprocessing_config(loaded_models, cfg)
 
     ann, tab, sides, records = prepare_test_tables(root, cfg, workers)
     studies = list(tab.index)
@@ -351,7 +441,11 @@ def run_inference(
 
     # Rank-Percentile Normalization across folds (UPGRADE: optimal ROC-AUC ensembling)
     if multi_model:
-        preds = rank_percentile_blend(per_model_preds)
+        if set(model_types) == {"dinov2", "coatnet_mil"}:
+            preds = d4_family_rank_blend(per_model_preds, model_types)
+            print("[BLEND] Applied d4-derived DINOv2/CoAtNet target-weighted rank blend.")
+        else:
+            preds = rank_percentile_blend(per_model_preds)
 
     # Impute missing studies (fallback to median so submission never fails)
     empty = np.asarray(cache.slot).sum(1) == 0
@@ -365,10 +459,64 @@ def run_inference(
     if order is not None:
         # Mandatory Kaggle submission rule: exact 1-to-1 match with test.csv rows and order
         sub = sub.set_index("StudyInstanceUID").reindex(order).reset_index()
-        
+
     out_dir = os.path.dirname(out_csv)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+
     sub.to_csv(out_csv, index=False)
 
     return sub, stats
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run trained RSNA knee checkpoints and write a Kaggle submission."
+    )
+    parser.add_argument("--root", required=True, help="Competition dataset root containing test.csv and test_series/")
+    parser.add_argument(
+        "--checkpoints",
+        nargs="+",
+        required=True,
+        help="Trained fold checkpoint paths; mixing DINOv2 and CoAtNet activates the d4 family blend",
+    )
+    parser.add_argument("--out", default="submission.csv", help="Output submission CSV")
+    parser.add_argument("--cache_dir", default=None, help="Optional test cache directory")
+    parser.add_argument("--batch", type=int, default=8, help="Inference batch size")
+    parser.add_argument("--n_tta", type=int, default=4, help="Number of test-time views")
+    parser.add_argument("--no_tta", action="store_true", help="Disable test-time augmentation")
+    args = parser.parse_args()
+
+    missing = [path for path in args.checkpoints if not os.path.isfile(path)]
+    if missing:
+        parser.error(f"checkpoint files not found: {missing}")
+    if args.batch <= 0 or args.n_tta <= 0:
+        parser.error("--batch and --n_tta must be positive")
+    test_csv = os.path.join(args.root, "test.csv")
+    if not os.path.isfile(test_csv):
+        parser.error(f"test.csv not found under --root: {args.root}")
+
+    submission, stats = run_inference(
+        root=args.root,
+        models=args.checkpoints,
+        test_csv=test_csv,
+        out_csv=args.out,
+        cache_dir=args.cache_dir,
+        use_tta=not args.no_tta,
+        n_tta=args.n_tta,
+        batch=args.batch,
+    )
+    test_ids = pd.read_csv(test_csv, dtype={"StudyInstanceUID": str})[
+        "StudyInstanceUID"
+    ].astype(str).str.strip().tolist()
+    if submission["StudyInstanceUID"].astype(str).tolist() != test_ids:
+        raise RuntimeError("Generated submission study IDs/order do not match test.csv")
+    if submission.isna().any().any():
+        raise RuntimeError("Generated submission contains missing values")
+    print(f"[SUCCESS] Submission: {args.out} ({len(submission)} studies); cache={stats}")
+
+
+if __name__ == "__main__":
+    main()

@@ -5,9 +5,9 @@ Executes all phases seamlessly in a unified workflow:
   PHASE 0: Environment & Hardware Configuration + Dataset Verification
   PHASE 1: NLP Pseudo-Label Auto-Detection & Completion (vLLM / Clinical Rules)
   PHASE 2: Dataset Merging, Stratification & Cache Build (Download-Aware)
-  PHASE 3: 5-Fold Deep Learning Training (DINOv2 + CrossSlotTransformer)
+  PHASE 3: 5-Fold Deep Learning Training (DINOv2 or CoAtNet attention-MIL)
   PHASE 4: Out-Of-Fold Evaluation & Checkpoint Verification
-  PHASE 5: Test Inference & Submission Generation (TTA + Calibration)
+  PHASE 5: Test Inference & Submission Generation (TTA; identity temperature)
   PHASE 6: Final Telemetry & Execution Summary
 """
 from __future__ import annotations
@@ -166,37 +166,19 @@ def run_nlp_phase(
             out_csv = cand
             break
 
-    try:
-        from src.data.preprocess.nlp_extractor import auto_complete_extraction
-        pseudo_csv, stats = auto_complete_extraction(
-            data_root=data_root,
-            out_csv=out_csv,
-            model_id=model_id,
-            engine=engine,
-            force=force,
-        )
-        return pseudo_csv
-    except Exception as e:
-        print(f"[WARNING] NLP auto-completion encountered an issue: {e}")
-        traceback.print_exc()
-        if os.path.exists(out_csv) and os.path.getsize(out_csv) > 1000:
-            print(f"[FALLBACK] Proceeding with existing pseudo-labels at: {out_csv}")
-            return out_csv
-        try:
-            print("[CRITICAL FALLBACK] Running emergency Clinical Shield Rules extraction to guarantee 100% study coverage...")
-            from src.data.preprocess.nlp_extractor import auto_complete_extraction
-            pseudo_csv, stats = auto_complete_extraction(
-                data_root=data_root,
-                out_csv=out_csv,
-                model_id=model_id,
-                engine="rules",
-                force=True,
-            )
-            return pseudo_csv
-        except Exception as err2:
-            print(f"[ERROR] Emergency rules extraction failed: {err2}")
-            print("[INFO] Proceeding with Gold standard labels.")
-            return None
+    from src.data.preprocess.nlp_extractor import auto_complete_extraction
+    pseudo_csv, stats = auto_complete_extraction(
+        data_root=data_root,
+        out_csv=out_csv,
+        model_id=model_id,
+        engine=engine,
+        force=force,
+    )
+    print(
+        f"[SUCCESS] NLP labels verified: {stats['total']} studies "
+        f"(new={stats['new']}, engine={stats['engine']})"
+    )
+    return pseudo_csv
 
 
 # ==============================================================================
@@ -329,11 +311,14 @@ def run_all_folds(
     epochs: int | None = None,
     batch_size: int = config.BATCH_SIZE,
     grad_accum: int = config.GRAD_ACCUM,
+    n_windows_train: int = config.N_WINDOWS_TRAIN,
     variant: str = "dinov2-base",
+    model_type: str = "dinov2",
+    pretrained: bool = True,
 ) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
-    print(f"Target Folds : {folds_to_run} | Backbone: {variant} | Batch Size: {batch_size} (accum: {grad_accum})")
+    print(f"Target Folds : {folds_to_run} | Model: {model_type}/{variant} | Batch Size: {batch_size} (accum: {grad_accum})")
     print("=" * 80)
 
     best_scores: dict[int, float] = {}
@@ -352,7 +337,10 @@ def run_all_folds(
                 epochs=epochs,
                 batch_size=batch_size,
                 grad_accum=grad_accum,
+                n_windows_train=n_windows_train,
                 variant=variant,
+                model_type=model_type,
+                pretrained=pretrained,
                 use_cross_slot=True,
                 swa_epochs=config.SWA_EPOCHS,
             )
@@ -373,84 +361,113 @@ def run_all_folds(
 
 
 # ==============================================================================
-# PHASE 4: OUT-OF-FOLD EVALUATION & CALIBRATION VERIFICATION
+# PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION
 # ==============================================================================
 def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, float]) -> tuple[list[str], list[float]]:
     print("\n" + "=" * 80)
-    print("PHASE 4: OUT-OF-FOLD EVALUATION & CALIBRATION VERIFICATION")
+    print("PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION")
     print("=" * 80)
 
-    from src.modeling.ensemble import TemperatureCalibration
-
     valid_ckpts = []
-    fold_temperatures = []
-    print("\n--- Model Checkpoints & Calibration Verification ---")
-
-    cal_file = os.path.join(work_dir, "calibration.json")
-    saved_cals = {}
-    if os.path.exists(cal_file):
-        try:
-            with open(cal_file, "r") as f:
-                saved_cals = json.load(f)
-        except Exception:
-            saved_cals = {}
+    oof_frames = []
+    print("\n--- Best-checkpoint and OOF prediction verification ---")
 
     for fold in range(5):
         fold_dir = os.path.join(work_dir, f"models_fold{fold}")
-        ema_ckpt = os.path.join(fold_dir, f"fold{fold}_ema.pt")
         best_ckpt = os.path.join(fold_dir, f"fold{fold}_best.pt")
-
-        chosen = None
-        if os.path.exists(ema_ckpt):
-            chosen = ema_ckpt
-            ckpt_type = "EMA (Primary)"
-        elif os.path.exists(best_ckpt):
-            chosen = best_ckpt
-            ckpt_type = "Best Instantaneous"
-
-        if chosen:
-            sz_mb = os.path.getsize(chosen) / 1e6
+        oof_path = os.path.join(fold_dir, f"fold{fold}_oof.csv")
+        if best_scores and fold not in best_scores:
+            continue
+        if os.path.exists(best_ckpt):
+            sz_mb = os.path.getsize(best_ckpt) / 1e6
             score_str = f"{best_scores.get(fold, float('nan')):.4f}"
-
-            # Temperature calibration verification:
-            # Default to 1.0 (AUC-neutral, prevents logit distortion) or load fitted value
-            t_val = 1.0
-            fold_key = f"fold_{fold}"
-            if fold_key in saved_cals:
-                t_val = float(saved_cals[fold_key])
-            elif "temperatures" in saved_cals and len(saved_cals["temperatures"]) > fold:
-                t_val = float(saved_cals["temperatures"][fold])
-
-            print(f"  Fold {fold}: {ckpt_type} [{sz_mb:.1f} MB] -> Val AUC: {score_str} | Temp: T={t_val:.4f} ({os.path.basename(chosen)})")
-            valid_ckpts.append(chosen)
-            fold_temperatures.append(t_val)
+            print(f"  Fold {fold}: best checkpoint [{sz_mb:.1f} MB] -> validation macro-AUC: {score_str}")
+            valid_ckpts.append(best_ckpt)
+            if best_scores:
+                if not os.path.exists(oof_path):
+                    raise FileNotFoundError(
+                        f"fold {fold} completed training but its out-of-fold predictions "
+                        f"are missing: {oof_path}"
+                    )
+                oof_fold = pd.read_csv(oof_path, dtype={"StudyInstanceUID": str})
+                if oof_fold["StudyInstanceUID"].duplicated().any():
+                    raise ValueError(f"fold {fold} OOF file contains duplicate study IDs")
+                missing_predictions = {
+                    f"pred_{target}" for target in config.TARGETS
+                } - set(oof_fold.columns)
+                if missing_predictions:
+                    raise ValueError(
+                        f"fold {fold} OOF file is missing prediction columns: "
+                        f"{sorted(missing_predictions)}"
+                    )
+                predictions = oof_fold[[f"pred_{target}" for target in config.TARGETS]].to_numpy(float)
+                if not np.isfinite(predictions).all() or ((predictions < 0) | (predictions > 1)).any():
+                    raise ValueError(f"fold {fold} OOF predictions contain invalid probabilities")
+                oof_fold["fold"] = fold
+                oof_frames.append(oof_fold)
         else:
-            print(f"  Fold {fold}: [MISSING] Checkpoint not found in {fold_dir}")
+            if best_scores and fold in best_scores:
+                raise FileNotFoundError(f"fold {fold} training completed without {best_ckpt}")
+            print(f"  Fold {fold}: [MISSING] Best checkpoint not found in {fold_dir}")
 
     if best_scores:
-        mean_auc = float(np.mean(list(best_scores.values())))
-        print(f"\n[EVALUATION] Mean 5-Fold Cross-Validation Macro-AUC: {mean_auc:.4f}")
+        if not oof_frames:
+            raise RuntimeError("Training completed but no OOF prediction files were produced")
+        oof = pd.concat(oof_frames, ignore_index=True)
+        if oof["StudyInstanceUID"].duplicated().any():
+            raise ValueError("OOF predictions overlap across folds")
+        labels_path = os.path.join(work_dir, "train_labels_v2.csv")
+        labels = pd.read_csv(labels_path, dtype={"StudyInstanceUID": str})
+        merged = oof.merge(labels, on="StudyInstanceUID", how="left", validate="one_to_one", suffixes=("", "_label"))
+        if merged[[f"{target}_weight" for target in config.TARGETS]].isna().any().any():
+            raise ValueError("OOF rows contain study IDs absent from the training label table")
+        from sklearn.metrics import roc_auc_score
 
-    # Write / update calibration manifest
-    cal_payload = {
-        "temperatures": fold_temperatures,
-        "mean_temperature": float(np.mean(fold_temperatures)) if fold_temperatures else 1.0,
-        "n_folds_calibrated": len(fold_temperatures),
-        "calibration_method": "Temperature Scaling (Guo et al. ICML 2017)",
-        "timestamp": datetime.datetime.now().isoformat(),
-    }
-    try:
-        with open(cal_file, "w") as f:
-            json.dump(cal_payload, f, indent=2)
-        print(f"[CALIBRATION] 5-Fold Temperature Calibration saved to: {cal_file} (T={fold_temperatures})")
-    except Exception as e:
-        print(f"[WARNING] Could not save calibration manifest: {e}")
+        per_target = {}
+        for target in config.TARGETS:
+            gold_mask = merged[f"{target}_weight"].to_numpy(float) >= 0.99
+            gold_targets = merged.loc[gold_mask, target].to_numpy(float)
+            gold_predictions = merged.loc[gold_mask, f"pred_{target}"].to_numpy(float)
+            if len(gold_targets) > 1 and 0 < gold_targets.sum() < len(gold_targets):
+                per_target[target] = {
+                    "auc": float(roc_auc_score(gold_targets, gold_predictions)),
+                    "n_gold": int(len(gold_targets)),
+                }
+        if not per_target:
+            raise RuntimeError("OOF predictions contain no gold target with both classes")
+        macro_auc = float(np.mean([m["auc"] for m in per_target.values()]))
+        oof_output = os.path.join(work_dir, "oof_predictions.csv")
+        oof.to_csv(oof_output, index=False)
+        metrics = {
+            "metric": "gold-only fold-held-out macro ROC-AUC",
+            "macro_auc": macro_auc,
+            "selection_bias_warning": (
+                "Each fold's best epoch was selected using that fold's gold validation labels; "
+                "this aggregate is useful for internal comparison but is not an unbiased "
+                "external estimate."
+            ),
+            "n_oof_studies": int(len(oof)),
+            "n_gold_studies_with_oof": int(
+                merged[[f"{target}_weight" for target in config.TARGETS]]
+                .ge(0.99).any(axis=1).sum()
+            ),
+            "folds": sorted(best_scores),
+            "per_target": per_target,
+        }
+        metrics_path = os.path.join(work_dir, "oof_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"\n[OOF] Gold-only macro-AUC: {macro_auc:.4f}; metrics saved to {metrics_path}")
+        print(f"[OOF] Study predictions saved to {oof_output}")
 
-    return valid_ckpts, fold_temperatures
+    # No calibration fit is implemented. Identity temperatures preserve ranking.
+    temperatures = [1.0] * len(valid_ckpts)
+    print("[CALIBRATION] No fitted calibrator available; using identity temperature T=1.")
+    return valid_ckpts, temperatures
 
 
 # ==============================================================================
-# PHASE 5: TEST INFERENCE & SUBMISSION GENERATION (TTA + CALIBRATION)
+# PHASE 5: TEST INFERENCE & SUBMISSION GENERATION (TTA; IDENTITY TEMPERATURE)
 # ==============================================================================
 def run_inference_phase(
     data_root: str,
@@ -459,14 +476,26 @@ def run_inference_phase(
     temperatures: list[float] | None = None,
     use_tta: bool = True,
     n_tta: int = 4,
+    ensemble_checkpoints: list[str] | None = None,
 ):
     print("\n" + "=" * 80)
-    print("PHASE 5: TEST INFERENCE & SUBMISSION GENERATION (TTA + CALIBRATION)")
+    print("PHASE 5: TEST INFERENCE & SUBMISSION GENERATION (TTA; IDENTITY TEMPERATURE)")
     print("=" * 80)
 
-    if not model_ckpts:
+    if ensemble_checkpoints is None:
+        ensemble_checkpoints = []
+    missing_checkpoints = [path for path in ensemble_checkpoints if not os.path.isfile(path)]
+    if missing_checkpoints:
+        raise FileNotFoundError(f"Ensemble checkpoints not found: {missing_checkpoints}")
+    all_checkpoints = list(dict.fromkeys([*model_ckpts, *ensemble_checkpoints]))
+    if not all_checkpoints:
         print("[WARNING] No trained model checkpoints available. Skipping inference.")
         return
+    checkpoint_temperatures = dict(zip(model_ckpts, temperatures or []))
+    all_temperatures = [
+        checkpoint_temperatures.get(checkpoint, 1.0)
+        for checkpoint in all_checkpoints
+    ]
 
     test_csv = os.path.join(data_root, "test.csv")
     test_dir = os.path.join(data_root, "test_series") if os.path.exists(os.path.join(data_root, "test_series")) else os.path.join(data_root, "test")
@@ -475,21 +504,25 @@ def run_inference_phase(
 
     if not has_test_files:
         print(f"[INFO] Test series images not found in {data_root}.")
-        print(f"[INFO] {len(model_ckpts)} fold model checkpoints are verified and ready for deployment.")
+        print(f"[INFO] {len(all_checkpoints)} model checkpoints are verified and ready for deployment.")
         print(f"[INFO] To generate submissions on Kaggle, run:")
         print(f"       python -m src.inference.inference --root /kaggle/input/rsna-knee-abnormality-detection")
         return
 
     out_csv = os.path.join(work_dir, "submission.csv")
-    print(f"Running inference with {len(model_ckpts)} fold models (TTA={use_tta}, n_tta={n_tta}, Calibrated={temperatures is not None})...")
+    print(
+        f"Running inference with {len(all_checkpoints)} models "
+        f"(TTA={use_tta}, n_tta={n_tta}, Calibrated={temperatures is not None}, "
+        f"families={[os.path.basename(path) for path in all_checkpoints]})..."
+    )
 
     sub, stats = run_inference(
         root=data_root,
-        models=model_ckpts,
+        models=all_checkpoints,
         test_csv=test_csv,
         out_csv=out_csv,
         cache_dir=os.path.join(work_dir, "test_cache"),
-        temperatures=temperatures,
+        temperatures=all_temperatures,
         use_tta=use_tta,
         n_tta=n_tta,
         batch=8,
@@ -521,12 +554,32 @@ def main():
     parser.add_argument("--epochs", type=int, default=config.EPOCHS, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE, help="Batch size per step")
     parser.add_argument("--grad_accum", type=int, default=config.GRAD_ACCUM, help="Gradient accumulation steps")
+    parser.add_argument("--n_windows_train", type=int, default=config.N_WINDOWS_TRAIN, help="Windows sampled per anatomical slot during training")
     parser.add_argument("--folds", type=str, default="0,1,2,3,4", help="Comma-separated list of folds to train (e.g. '0,1,2,3,4')")
-    parser.add_argument("--variant", type=str, default="dinov2-base", help="Backbone variant ('dinov2-base' or 'dinov2-small')")
+    parser.add_argument("--model_type", choices=["dinov2", "coatnet_mil"], default="dinov2", help="Training architecture family")
+    parser.add_argument("--variant", type=str, default=None, help="Backbone variant or timm architecture name (defaults by model family)")
+    parser.add_argument("--random_init", action="store_true", help="Do not load timm pretrained weights (CoAtNet MIL only)")
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
     parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
+    parser.add_argument(
+        "--ensemble_checkpoints",
+        nargs="+",
+        default=None,
+        help="Additional trained checkpoints; with DINOv2 and CoAtNet, applies the d4 target-specific rank blend",
+    )
     parser.add_argument("--max_ram_gb", type=float, default=getattr(config, "CIRCUIT_BREAKER_MAX_RAM_GB", 118.0), help="Unified memory hard safety limit in GB before clean shutdown (default: 118.0)")
     args = parser.parse_args()
+
+    if args.variant is None:
+        args.variant = (
+            "coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k"
+            if args.model_type == "coatnet_mil"
+            else "dinov2-base"
+        )
+    if args.ensemble_checkpoints:
+        missing_checkpoints = [p for p in args.ensemble_checkpoints if not os.path.isfile(p)]
+        if missing_checkpoints:
+            parser.error(f"ensemble checkpoint files not found: {missing_checkpoints}")
 
     if hasattr(args, "max_ram_gb") and args.max_ram_gb:
         config.CIRCUIT_BREAKER_MAX_RAM_GB = args.max_ram_gb
@@ -606,7 +659,10 @@ def main():
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 grad_accum=args.grad_accum,
+                n_windows_train=args.n_windows_train,
                 variant=args.variant,
+                model_type=args.model_type,
+                pretrained=not args.random_init,
             )
 
         # Phase 4: OOF & Checkpoints + Temperature Calibration
@@ -620,6 +676,7 @@ def main():
             temperatures=fold_temperatures,
             use_tta=(not args.no_tta),
             n_tta=4,
+            ensemble_checkpoints=args.ensemble_checkpoints,
         )
     except MemoryCircuitBreakerTriggered as mem_err:
         print("\n" + "=" * 80, flush=True)

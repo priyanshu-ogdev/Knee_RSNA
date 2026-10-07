@@ -72,15 +72,15 @@ class AsymmetricLoss(nn.Module):
         weights: torch.Tensor | None = None,  # [B, C] per-entry weight
     ) -> torch.Tensor:
         xs_pos = torch.sigmoid(logits)
-        xs_neg = xs_pos
+        xs_neg = 1.0 - xs_pos
 
         # Probability shift — kills easy negatives & mislabelled entries
         if self.clip > 0:
-            xs_neg = (xs_neg - self.clip).clamp(min=0.0)
+            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
 
         # Log loss terms
         loss_pos = targets       * torch.log(xs_pos.clamp(min=self.eps))
-        loss_neg = (1.0 - targets) * torch.log((1.0 - xs_neg).clamp(min=self.eps))
+        loss_neg = (1.0 - targets) * torch.log(xs_neg.clamp(min=self.eps))
         loss = loss_pos + loss_neg   # [B, C]
 
         # Asymmetric focusing — down-weight easy examples per class

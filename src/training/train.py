@@ -157,6 +157,7 @@ def handle_memory_circuit_breaker(
     cfg = None,
     variant: str = "dinov2-base",
     use_cross_slot: bool = True,
+    model_config: dict | None = None,
     out_dir: str = ".",
     active_loaders: list | None = None,
 ):
@@ -184,6 +185,8 @@ def handle_memory_circuit_breaker(
                 "used_gb": exc.used_gb,
                 "variant": variant,
                 "use_cross_slot": use_cross_slot,
+                "model_type": (model_config or {}).get("model_type", "dinov2"),
+                "model_config": model_config or {},
             }, emerg_ckpt)
             print(f" [CHECKPOINT] Emergency state saved to: {emerg_ckpt}", flush=True)
         except Exception as save_err:
@@ -395,13 +398,8 @@ def evaluate(
     P, Y, W = np.concatenate(P), np.concatenate(Y), np.concatenate(W)
     per: dict[str, float] = {}
     for j, t in enumerate(config.TARGETS):
-        m = W[:, j] >= 0.99  # Primary: Evaluate on Gold Labels
-        if m.sum() < 2 or not (0 < Y[m, j].sum() < m.sum()):
-            # Fallback if fold has no gold samples with both classes (e.g. rare Fracture): evaluate on all labeled samples binarized
-            m = W[:, j] > 0
-            y_eval = (Y[m, j] >= 0.5).astype(float)
-        else:
-            y_eval = Y[m, j]
+        m = W[:, j] >= 0.99
+        y_eval = Y[m, j]
         if m.sum() > 1 and 0 < y_eval.sum() < m.sum():
             per[t] = float(roc_auc_score(y_eval, P[m, j]))
     macro = float(np.mean(list(per.values()))) if per else float("nan")
@@ -421,6 +419,10 @@ def run_training(
     num_workers: int = 10,  # 10 workers strictly bounds pinned memory to ~7.7GB, achieving 80-90GB total unified memory
     seed: int = config.SEED,
     variant: str = "dinov2-base",         # Upgrade A: default to Base
+    model_type: str | None = None,
+    model_input_size: int = config.COATNET_INPUT_SIZE,
+    encode_chunk_size: int = config.COATNET_ENCODE_CHUNK,
+    pretrained: bool = True,
     unfreeze_last: int = config.UNFREEZE_LAST,
     use_cross_slot: bool = True,          # Upgrade C
     lora_rank: int = config.LORA_RANK,    # Upgrade B
@@ -450,6 +452,9 @@ def run_training(
     cfg    = cache_cfg(cache_prefix)   # config the cache was BUILT with — never re-derive
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df     = pd.read_csv(labels_csv)
+    model_type = model_type or ("coatnet_mil" if variant.startswith("coatnet") else "dinov2")
+    if model_type not in {"dinov2", "coatnet_mil"}:
+        raise ValueError(f"Unsupported model_type: {model_type}")
 
     if folds_csv:
         df = df.merge(pd.read_csv(folds_csv)[["StudyInstanceUID", "fold"]],
@@ -462,7 +467,7 @@ def run_training(
     print(
         f"device={device}  train={len(tr)}  val={len(va)}  fold={fold}  "
         f"preset={cfg.name}  D={cfg.stack_depth}  img={cfg.img_size}  "
-        f"variant={variant}  epochs={n_ep}  loss={loss_name}  "
+        f"model={model_type}/{variant}  epochs={n_ep}  loss={loss_name}  "
         f"mixup={mixup_alpha}  swa={swa_epochs}ep"
     )
 
@@ -473,7 +478,29 @@ def run_training(
         use_cross_slot=use_cross_slot,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        model_type=model_type,
+        input_size=model_input_size,
+        encode_chunk_size=encode_chunk_size,
+        pretrained=pretrained,
     ).to(device)
+    if model_type == "coatnet_mil":
+        model_config = {
+            "model_type": model_type,
+            "variant": variant,
+            "input_size": model_input_size,
+            "encode_chunk_size": encode_chunk_size,
+            "pretrained": False,
+        }
+    else:
+        model_config = {
+            "model_type": model_type,
+            "variant": variant,
+            "unfreeze_last": unfreeze_last,
+            "use_cross_slot": use_cross_slot,
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "truncate_blocks": 0,
+        }
 
     # Multi-GPU DataParallel for extreme throughput on DGX systems
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
@@ -501,6 +528,7 @@ def run_training(
     # ── Datasets ─────────────────────────────────────────────────────────────
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
     ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
+    eval_batch_size = 1 if model_type == "coatnet_mil" else batch_size * 2
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────
     # IMPROVEMENT 3: WD=0 for biases and norm layers (standard ViT recipe).
@@ -510,47 +538,90 @@ def run_training(
 
     # FIX: inner_model was never defined; the variable is just `model`.
     inner_model = model  # alias for clarity in checkpoint saving below
-
-    # UPGRADE: Layer-Wise LR Decay (LLRD) — standard ViT fine-tuning recipe.
-    # Each transformer block gets lr * decay^(n_layer - i) so lower layers
-    # (which encode general patch features) train more conservatively than the
-    # top layers (which encode task-specific semantics).
-    # Source: Touvron et al. DeiT III (2022), Oquab et al. DINOv2 (2023).
-    LLRD_DECAY = 0.85   # per-layer multiplicative decay
     backbone_params = []
-    n_layer = len(inner_model.backbone.encoder.layer)
-    for i, blk in enumerate(inner_model.backbone.encoder.layer):
-        layer_lr = config.LR_BACKBONE * (LLRD_DECAY ** (n_layer - i))
-        wd_p  = [p for n, p in blk.named_parameters() if p.requires_grad and not _is_no_decay(n)]
-        nwd_p = [p for n, p in blk.named_parameters() if p.requires_grad and _is_no_decay(n)]
-        if wd_p:
-            backbone_params.append({"params": wd_p,  "lr": layer_lr, "weight_decay": config.WEIGHT_DECAY})
-        if nwd_p:
-            backbone_params.append({"params": nwd_p, "lr": layer_lr, "weight_decay": 0.0})
-    # Embeddings and LayerNorm: use the slowest LR (bottom-most decay)
-    embed_lr = config.LR_BACKBONE * (LLRD_DECAY ** n_layer)
-    emb_wd_p  = [p for n, p in inner_model.backbone.named_parameters()
-                  if p.requires_grad and 'encoder.layer' not in n and not _is_no_decay(n)]
-    emb_nwd_p = [p for n, p in inner_model.backbone.named_parameters()
-                  if p.requires_grad and 'encoder.layer' not in n and _is_no_decay(n)]
-    if emb_wd_p:
-        backbone_params.append({"params": emb_wd_p,  "lr": embed_lr, "weight_decay": config.WEIGHT_DECAY})
-    if emb_nwd_p:
-        backbone_params.append({"params": emb_nwd_p, "lr": embed_lr, "weight_decay": 0.0})
-
-    head_params = (
-        list(inner_model.wpool.parameters())
-        + list(inner_model.head.parameters())
-        + (list(inner_model.cross_slot.parameters()) if inner_model.use_cross_slot else [])
+    head_params = []
+    if model_type == "coatnet_mil":
+        named_groups = [
+            (
+                [(f"backbone.{name}", parameter)
+                 for name, parameter in inner_model.backbone.named_parameters()],
+                config.COATNET_LR_BACKBONE,
+                backbone_params,
+            ),
+            (
+                [(name, parameter) for name, parameter in inner_model.named_parameters()
+                 if not name.startswith("backbone.")],
+                config.COATNET_LR_HEAD,
+                head_params,
+            ),
+        ]
+        for named_parameters, learning_rate, groups in named_groups:
+            for no_decay in (False, True):
+                parameters = [
+                    parameter for name, parameter in named_parameters
+                    if parameter.requires_grad and _is_no_decay(name) == no_decay
+                ]
+                if parameters:
+                    groups.append({
+                        "params": parameters,
+                        "lr": learning_rate,
+                        "weight_decay": 0.0 if no_decay else config.COATNET_WEIGHT_DECAY,
+                    })
+    else:
+        # Layer-wise learning-rate decay for the transformer backbone.
+        llrd_decay = 0.85
+        n_layer = len(inner_model.backbone.encoder.layer)
+        for i, block in enumerate(inner_model.backbone.encoder.layer):
+            layer_lr = config.LR_BACKBONE * (llrd_decay ** (n_layer - i))
+            wd_params = [
+                p for n, p in block.named_parameters()
+                if p.requires_grad and not _is_no_decay(n)
+            ]
+            no_wd_params = [
+                p for n, p in block.named_parameters()
+                if p.requires_grad and _is_no_decay(n)
+            ]
+            if wd_params:
+                backbone_params.append({
+                    "params": wd_params, "lr": layer_lr,
+                    "weight_decay": config.WEIGHT_DECAY,
+                })
+            if no_wd_params:
+                backbone_params.append({
+                    "params": no_wd_params, "lr": layer_lr, "weight_decay": 0.0,
+                })
+        embed_lr = config.LR_BACKBONE * (llrd_decay ** n_layer)
+        embed_wd = [
+            p for n, p in inner_model.backbone.named_parameters()
+            if p.requires_grad and "encoder.layer" not in n and not _is_no_decay(n)
+        ]
+        embed_no_wd = [
+            p for n, p in inner_model.backbone.named_parameters()
+            if p.requires_grad and "encoder.layer" not in n and _is_no_decay(n)
+        ]
+        if embed_wd:
+            backbone_params.append({
+                "params": embed_wd, "lr": embed_lr,
+                "weight_decay": config.WEIGHT_DECAY,
+            })
+        if embed_no_wd:
+            backbone_params.append({
+                "params": embed_no_wd, "lr": embed_lr, "weight_decay": 0.0,
+            })
+        head_params = (
+            list(inner_model.wpool.parameters())
+            + list(inner_model.head.parameters())
+            + (list(inner_model.cross_slot.parameters()) if inner_model.use_cross_slot else [])
+        )
+    optimizer_groups = (
+        head_params + backbone_params
+        if model_type == "coatnet_mil"
+        else [{"params": head_params, "lr": config.LR_HEAD, "weight_decay": 0.0}]
+        + backbone_params
     )
-    optimizer = torch.optim.AdamW(
-        [{"params": head_params, "lr": config.LR_HEAD, "weight_decay": 0.0}]
-        + backbone_params,
-        fused=(device.type == "cuda"),
-    )
+    optimizer = torch.optim.AdamW(optimizer_groups, fused=(device.type == "cuda"))
 
-    # ── LR Schedule (Upgrade J: cosine with warmup) ──────────────────────────
-    # Count actual optimizer steps per epoch under grad_accum directly from train dataset size
+    # ?? LR Schedule (Upgrade J: cosine with warmup) ??????????????????????????
     dl_tr_len = len(tr) // batch_size if len(tr) > batch_size else len(tr)
     steps_per_epoch = math.ceil(dl_tr_len / grad_accum) if dl_tr_len > 0 else 1
     total_steps = n_ep * max(steps_per_epoch, 1)
@@ -623,7 +694,7 @@ def run_training(
             # Instantiated ONLY during validation with throttled workers & batch size, bounding pinned memory to ~4.6 GB.
             if ds_va is not None:
                 dl_va = DataLoader(
-                    ds_va, batch_size=batch_size * 2, shuffle=False,
+                    ds_va, batch_size=eval_batch_size, shuffle=False,
                     num_workers=num_workers, pin_memory=(device.type == "cuda"),
                     persistent_workers=False,
                     prefetch_factor=2 if num_workers > 0 else None,
@@ -654,6 +725,7 @@ def run_training(
                 torch.save(
                     dict(model=inner_model.state_dict(),
                          cfg=dataclasses.asdict(cfg),
+                         model_config=model_config,
                          fold=fold, epoch=ep + 1, val=score,
                          variant=variant,
                          use_cross_slot=use_cross_slot),
@@ -724,6 +796,7 @@ def run_training(
             torch.save(
                 dict(model=swa_model.module.state_dict(),
                      cfg=dataclasses.asdict(cfg),
+                     model_config=model_config,
                      fold=fold, epoch=ep + 1, val=best,
                      swa=True, variant=variant,
                      use_cross_slot=use_cross_slot),
@@ -736,12 +809,70 @@ def run_training(
         torch.save(
             dict(model=ema_model.module.state_dict(),
                  cfg=dataclasses.asdict(cfg),
+                 model_config=model_config,
                  fold=fold, epoch=ep + 1, val=best,
                  ema=True, variant=variant,
                  use_cross_slot=use_cross_slot),
             os.path.join(out_dir, f"fold{fold}_ema.pt"),
         )
         print(f"EMA checkpoint saved → fold{fold}_ema.pt")
+
+        if ds_va is not None:
+            best_path = os.path.join(out_dir, f"fold{fold}_best.pt")
+            best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+            inner_model.load_state_dict(best_checkpoint["model"], strict=True)
+            inner_model.eval()
+            dl_oof = DataLoader(
+                ds_va,
+                batch_size=eval_batch_size,
+                shuffle=False,
+                num_workers=min(4, num_workers),
+                pin_memory=(device.type == "cuda"),
+                persistent_workers=False,
+                prefetch_factor=2 if num_workers > 0 else None,
+            )
+            active_loaders = [dl_oof]
+            oof_probabilities, oof_targets, oof_weights = [], [], []
+            ctx, _ = _autocast(device)
+            with torch.no_grad():
+                for oof_step, batch in enumerate(dl_oof):
+                    check_memory_circuit_breaker(
+                        stage=f"OOF Prediction Step {oof_step + 1}/{len(dl_oof)}"
+                    )
+                    imgs, masks, wmasks, targets, weights = batch
+                    with ctx:
+                        logits = inner_model(
+                            imgs.to(device, non_blocking=True),
+                            masks.to(device, non_blocking=True),
+                            wmasks.to(device, non_blocking=True),
+                        )
+                    oof_probabilities.append(torch.sigmoid(logits.float()).cpu().numpy())
+                    oof_targets.append(targets.numpy())
+                    oof_weights.append(weights.numpy())
+                    del imgs, masks, wmasks, targets, weights, logits, batch
+
+            oof = pd.DataFrame({"StudyInstanceUID": ds_va.ids})
+            probabilities = np.concatenate(oof_probabilities)
+            targets = np.concatenate(oof_targets)
+            weights = np.concatenate(oof_weights)
+            if len(oof) != len(probabilities):
+                raise RuntimeError(
+                    f"fold {fold}: OOF identifier/prediction count mismatch "
+                    f"({len(oof)} != {len(probabilities)})"
+                )
+            for j, target in enumerate(config.TARGETS):
+                oof[f"pred_{target}"] = probabilities[:, j]
+                oof[f"target_{target}"] = targets[:, j]
+                oof[f"weight_{target}"] = weights[:, j]
+            oof_path = os.path.join(out_dir, f"fold{fold}_oof.csv")
+            oof_tmp = f"{oof_path}.tmp"
+            oof.to_csv(oof_tmp, index=False)
+            os.replace(oof_tmp, oof_path)
+            print(f"OOF predictions from the selected best checkpoint saved → {oof_path}")
+            active_loaders = []
+            del best_checkpoint, dl_oof, oof_probabilities, oof_targets, oof_weights
+            del probabilities, targets, weights, oof
+            execute_emergency_memory_flush()
 
     except MemoryCircuitBreakerTriggered as exc:
         handle_memory_circuit_breaker(
@@ -753,6 +884,7 @@ def run_training(
             cfg=cfg if 'cfg' in locals() else None,
             variant=variant,
             use_cross_slot=use_cross_slot,
+            model_config=model_config if "model_config" in locals() else None,
             out_dir=out_dir,
             active_loaders=active_loaders,
         )
@@ -775,9 +907,3 @@ def run_training(
         torch.cuda.empty_cache()
 
     return best
-
-
-
-
-
-

@@ -21,7 +21,10 @@ class RSNADataset(Dataset):
         self.is_train, self.n_use, self.seed, self.aug, self.epoch = is_train, n_windows_use, seed, 0, 0
         with open(f'{cache_prefix}.meta.json') as fh:
             studies = json.load(fh)['studies']
-        self.rows, self.Y, self.Wt = loader.label_arrays(df.reset_index(drop=True), {s: i for i, s in enumerate(studies)})
+        available = set(studies)
+        aligned = df[df['StudyInstanceUID'].astype(str).isin(available)].reset_index(drop=True)
+        self.ids = aligned['StudyInstanceUID'].astype(str).tolist()
+        self.rows, self.Y, self.Wt = loader.label_arrays(aligned, {s: i for i, s in enumerate(studies)})
         self._cache = None
 
     def set_epoch(self, e):

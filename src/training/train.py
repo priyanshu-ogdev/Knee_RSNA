@@ -528,7 +528,7 @@ def run_training(
     # ── Datasets ─────────────────────────────────────────────────────────────
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
     ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
-    eval_batch_size = 1 if model_type in ("coatnet_mil", "timm_mil") else batch_size * 2
+    eval_batch_size = 1 if model_type == "coatnet_mil" else batch_size * 2
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────
     # IMPROVEMENT 3: WD=0 for biases and norm layers (standard ViT recipe).

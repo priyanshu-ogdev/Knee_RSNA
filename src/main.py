@@ -579,7 +579,7 @@ def run_all_folds(
 # ==============================================================================
 # PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION
 # ==============================================================================
-def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, float]) -> tuple[list[str], list[float]]:
+def run_oof_and_checkpoint_verification(model_dir: str, labels_csv: str, best_scores: dict[int, float]) -> tuple[list[str], list[float]]:
     print("\n" + "=" * 80)
     print("PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION")
     print("=" * 80)
@@ -589,7 +589,7 @@ def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, fl
     print("\n--- Best-checkpoint and OOF prediction verification ---")
 
     for fold in range(5):
-        fold_dir = os.path.join(work_dir, f"models_fold{fold}")
+        fold_dir = os.path.join(model_dir, f"models_fold{fold}")
         best_ckpt = os.path.join(fold_dir, f"fold{fold}_best.pt")
         oof_path = os.path.join(fold_dir, f"fold{fold}_oof.csv")
         if best_scores and fold not in best_scores:
@@ -632,8 +632,7 @@ def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, fl
         oof = pd.concat(oof_frames, ignore_index=True)
         if oof["StudyInstanceUID"].duplicated().any():
             raise ValueError("OOF predictions overlap across folds")
-        labels_path = os.path.join(work_dir, "train_labels_v2.csv")
-        labels = pd.read_csv(labels_path, dtype={"StudyInstanceUID": str})
+        labels = pd.read_csv(labels_csv, dtype={"StudyInstanceUID": str})
         merged = oof.merge(labels, on="StudyInstanceUID", how="left", validate="one_to_one", suffixes=("", "_label"))
         if merged[[f"{target}_weight" for target in config.TARGETS]].isna().any().any():
             raise ValueError("OOF rows contain study IDs absent from the training label table")
@@ -652,7 +651,7 @@ def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, fl
         if not per_target:
             raise RuntimeError("OOF predictions contain no gold target with both classes")
         macro_auc = float(np.mean([m["auc"] for m in per_target.values()]))
-        oof_output = os.path.join(work_dir, "oof_predictions.csv")
+        oof_output = os.path.join(model_dir, "oof_predictions.csv")
         oof.to_csv(oof_output, index=False)
         metrics = {
             "metric": "gold-only fold-held-out macro ROC-AUC",
@@ -670,7 +669,7 @@ def run_oof_and_checkpoint_verification(work_dir: str, best_scores: dict[int, fl
             "folds": sorted(best_scores),
             "per_target": per_target,
         }
-        metrics_path = os.path.join(work_dir, "oof_metrics.json")
+        metrics_path = os.path.join(model_dir, "oof_metrics.json")
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"\n[OOF] Gold-only macro-AUC: {macro_auc:.4f}; metrics saved to {metrics_path}")
@@ -759,6 +758,7 @@ def main():
     parser = argparse.ArgumentParser(description="RSNA Knee Abnormality Detection: Unified Master Pipeline")
     parser.add_argument("--data_root", type=str, default=None, help="Path to competition dataset root")
     parser.add_argument("--work_dir", type=str, default=None, help="Working output directory")
+    parser.add_argument("--model_dir", type=str, default=None, help="Directory for model checkpoints (defaults to work_dir)")
     
     # NLP Options
     parser.add_argument("--nlp_engine", type=str, default="auto", choices=["auto", "vllm", "rules"], help="NLP extraction engine: 'auto' (detects vLLM/CUDA, else rules), 'vllm', or 'rules'")
@@ -814,6 +814,9 @@ def main():
     global_start_time = time.time()
     work_dir = args.work_dir or os.environ.get("RSNA_OUT_DIR", os.path.join(PROJECT_ROOT, "pipeline_out"))
     os.makedirs(work_dir, exist_ok=True)
+    model_dir = args.model_dir or work_dir
+    if model_dir != work_dir:
+        os.makedirs(model_dir, exist_ok=True)
 
     # Logging setup
     import logging
@@ -886,7 +889,7 @@ def main():
                 labels_csv=labels_csv,
                 cache_prefix=cache_prefix,
                 folds_csv=folds_csv,
-                work_dir=work_dir,
+                work_dir=model_dir,
                 folds_to_run=folds_to_run,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
@@ -898,12 +901,12 @@ def main():
             )
 
         # Phase 4: OOF & Checkpoints + Temperature Calibration
-        valid_ckpts, fold_temperatures = run_oof_and_checkpoint_verification(work_dir, best_scores)
+        valid_ckpts, fold_temperatures = run_oof_and_checkpoint_verification(model_dir, labels_csv, best_scores)
 
         # Phase 5: Test Inference & Submission Generation (TTA + Calibrated)
         run_inference_phase(
             data_root=data_root,
-            work_dir=work_dir,
+            work_dir=model_dir,
             model_ckpts=valid_ckpts,
             temperatures=fold_temperatures,
             use_tta=(not args.no_tta),

@@ -60,9 +60,16 @@ def test_oof_report_uses_gold_only_and_best_checkpoints(tmp_path):
     labels["ACL_weight"] = [1.0, 1.0]
     oof.to_csv(model_dir / "fold0_oof.csv", index=False)
     labels.to_csv(tmp_path / "train_labels_v2.csv", index=False)
+    folds = pd.DataFrame({"StudyInstanceUID": ["a", "b"], "fold": [0, 0]})
+    folds_path = tmp_path / "folds.csv"
+    folds.to_csv(folds_path, index=False)
 
     checkpoints, temperatures = run_oof_and_checkpoint_verification(
-        str(tmp_path), {0: 1.0}
+        str(tmp_path),
+        str(tmp_path / "train_labels_v2.csv"),
+        str(folds_path),
+        [0],
+        {0: 1.0},
     )
 
     assert checkpoints == [str(best_checkpoint)]

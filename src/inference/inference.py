@@ -61,12 +61,16 @@ from src.data.preprocess import pipeline, cache as pcache, loader
 def rank_percentile_blend(model_preds_list: list[np.ndarray]) -> np.ndarray:
     """Combines N model probability matrices [N_samples, N_targets] using Rank-Percentile Normalization.
 
-    Eliminates calibration drift and scale differences across folds, guaranteeing each fold
-    has strictly equal voting power in ROC-AUC ordering. Mathematically optimal for AUC.
+    Reduces dependence on probability scale and gives each input prediction array
+    equal rank-space weight; it does not guarantee an AUC improvement.
     """
+    if not model_preds_list:
+        raise ValueError("At least one prediction array is required for blending")
     if len(model_preds_list) == 1:
         return model_preds_list[0]
     n_samples, n_targets = model_preds_list[0].shape
+    if any(pred.shape != (n_samples, n_targets) for pred in model_preds_list):
+        raise ValueError("All model prediction arrays must share the same [samples, targets] shape")
     blended = np.zeros((n_samples, n_targets), dtype=np.float32)
     for c in range(n_targets):
         target_ranks = []
@@ -75,15 +79,41 @@ def rank_percentile_blend(model_preds_list: list[np.ndarray]) -> np.ndarray:
             valid = np.isfinite(col)
             ranks = np.zeros_like(col, dtype=np.float32)
             if valid.sum() > 1:
-                order = np.argsort(col[valid])
-                r = np.empty_like(order, dtype=np.float32)
-                r[order] = np.linspace(0.0, 1.0, len(order), dtype=np.float32)
-                ranks[valid] = r
+                ranks[valid] = (
+                    pd.Series(col[valid])
+                    .rank(method="average", pct=True)
+                    .to_numpy(dtype=np.float32)
+                )
             elif valid.sum() == 1:
                 ranks[valid] = 0.5
             target_ranks.append(ranks)
         blended[:, c] = np.mean(target_ranks, axis=0)
     return blended
+
+
+def family_rank_percentile_blend(
+    per_model_preds: list[np.ndarray],
+    model_families: list[str],
+) -> np.ndarray:
+    """Average checkpoints within architectures, then give every architecture one rank vote."""
+    if len(per_model_preds) != len(model_families) or not per_model_preds:
+        raise ValueError("Each prediction array must have exactly one model family")
+    if any(pred.shape != per_model_preds[0].shape for pred in per_model_preds):
+        raise ValueError("All model prediction arrays must have the same shape")
+    families: dict[str, list[np.ndarray]] = {}
+    for predictions, family in zip(per_model_preds, model_families):
+        families.setdefault(family, []).append(predictions)
+    family_means = [
+        np.mean(np.stack(predictions), axis=0)
+        for predictions in families.values()
+    ]
+    if len(family_means) == 1:
+        return family_means[0]
+    return np.mean(
+        [_rank_columns_average(predictions) for predictions in family_means],
+        axis=0,
+        dtype=np.float32,
+    )
 
 
 def _rank_columns_average(values: np.ndarray) -> np.ndarray:
@@ -110,6 +140,10 @@ def d4_family_rank_blend(
         raise ValueError("Each prediction array must have exactly one model family")
     if any(pred.shape != per_model_preds[0].shape for pred in per_model_preds):
         raise ValueError("All model-family prediction arrays must have the same shape")
+    if per_model_preds[0].ndim != 2 or per_model_preds[0].shape[1] != len(config.TARGETS):
+        raise ValueError(
+            f"D4 blending requires {len(config.TARGETS)} target columns"
+        )
 
     families: dict[str, list[np.ndarray]] = {}
     for predictions, model_type in zip(per_model_preds, model_types):
@@ -360,7 +394,8 @@ def run_inference(
     temperatures: list | None = None,
     use_tta: bool = True,
     n_tta: int = 4,
-    batch: int = 8,
+    batch: int = 4,
+    use_d4_target_weights: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """Build the cache and run predictions in a pipelined fashion."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -370,9 +405,17 @@ def run_inference(
         getattr(model, "_rsna_model_type", getattr(model, "model_type", "dinov2"))
         for model in loaded_models
     ]
+    model_families = [
+        getattr(model, "_rsna_model_family", model_type)
+        for model, model_type in zip(loaded_models, model_types)
+    ]
     unknown_types = set(model_types) - {"dinov2", "coatnet_mil", "timm_mil"}
     if unknown_types:
         raise ValueError(f"Unsupported model families in inference ensemble: {sorted(unknown_types)}")
+    if use_d4_target_weights and set(model_types) != {"dinov2", "coatnet_mil"}:
+        raise ValueError(
+            "D4 target weights require exactly the DINOv2 and CoAtNet model families"
+        )
     cfg = resolve_preprocessing_config(loaded_models, cfg)
 
     ann, tab, sides, records = prepare_test_tables(root, cfg, workers)
@@ -441,11 +484,11 @@ def run_inference(
 
     # Rank-Percentile Normalization across folds (UPGRADE: optimal ROC-AUC ensembling)
     if multi_model:
-        if set(model_types) == {"dinov2", "coatnet_mil"}:
+        if use_d4_target_weights:
             preds = d4_family_rank_blend(per_model_preds, model_types)
-            print("[BLEND] Applied d4-derived DINOv2/CoAtNet target-weighted rank blend.")
+            print("[BLEND] Applied explicitly requested D4-derived target-weighted rank blend.")
         else:
-            preds = rank_percentile_blend(per_model_preds)
+            preds = family_rank_percentile_blend(per_model_preds, model_families)
 
     # Impute missing studies (fallback to median so submission never fails)
     empty = np.asarray(cache.slot).sum(1) == 0
@@ -487,6 +530,11 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=8, help="Inference batch size")
     parser.add_argument("--n_tta", type=int, default=4, help="Number of test-time views")
     parser.add_argument("--no_tta", action="store_true", help="Disable test-time augmentation")
+    parser.add_argument(
+        "--d4_target_weights",
+        action="store_true",
+        help="Opt into D4's target-specific DINO/CoAtNet weights instead of equal family-rank blending",
+    )
     args = parser.parse_args()
 
     missing = [path for path in args.checkpoints if not os.path.isfile(path)]
@@ -507,6 +555,7 @@ def main() -> None:
         use_tta=not args.no_tta,
         n_tta=args.n_tta,
         batch=args.batch,
+        use_d4_target_weights=args.d4_target_weights,
     )
     test_ids = pd.read_csv(test_csv, dtype={"StudyInstanceUID": str})[
         "StudyInstanceUID"

@@ -20,16 +20,20 @@ import os
 from dataclasses import dataclass, replace
 
 # ─────────────────────────────────── Hardware Safety & Circuit Breaker ────────
-# Hard Unified Memory Limit (DGX 128GB node):
-# If total memory usage exceeds 118 GB in any step, cleanly abort, flush memory,
-# save emergency checkpoint, and prompt to restart.
-CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "118.0"))
+# Use 88 GiB as an operational target on the 128-GiB unified-memory host.
+# It is advisory; the hard ceiling and available-memory guard preserve recovery room.
+MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "88.0"))
+CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "100.0"))
+MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "20.0"))
 
 # ─────────────────────────────────────────── legacy training constants ────────
 SEED             = 2026
 EPOCHS           = 10          # Optimized: peak validation AUC converges by epoch 6-8; 10 avoids label-noise overfitting
-BATCH_SIZE       = 24          # Upgraded: Hardware-optimized for 28GB VRAM + Gradient Checkpointing
-NUM_WORKERS      = 12          # 12 workers optimally balances NVMe throughput while keeping RAM strictly < 90GB
+BATCH_SIZE       = 24
+NUM_WORKERS      = 8
+PREFETCH_FACTOR  = 1
+EVAL_BATCH_SIZE  = 8
+PREPROCESS_WORKERS = 8
 GRAD_ACCUM       = 1           # Effective batch = 16 studies per optimizer step
 N_WINDOWS_TRAIN  = 5           # 5 stratified windows: 75% articular coverage (prevents MIL focal tear dilution)
 LR_HEAD          = 2e-3
@@ -46,8 +50,9 @@ LORA_ALPHA       = 32          # LoRA scaling: scale = LORA_ALPHA / LORA_RANK = 
 TIME_BUDGET_HOURS = 9999.0     # DGX Spark: no Kaggle time cap — disabled
 EARLY_STOP_PATIENCE = 3        # Early stopping patience on validation Macro-AUC
 
-# SWA settings (Izmailov et al., UAI 2018)
-SWA_EPOCHS      = 3            # apply SWA for the last SWA_EPOCHS of training
+# SWA duplicates model state and performs an extra full training pass; EMA is
+# retained instead. Enable SWA only for a measured ablation.
+SWA_EPOCHS      = 0
 SWA_LR          = 1e-6         # constant LR during SWA phase
 
 # Asymmetric Loss defaults (Ridnik et al., ICCV 2021)
@@ -193,6 +198,3 @@ def cfg_from_dict(d: dict) -> PreCfg:
 CROP_MM    = PRESETS["v2"].crop_mm
 IMG_SIZE   = PRESETS["v2"].img_size
 GROUP_SIZE = PRESETS["v2"].group
-
-
-

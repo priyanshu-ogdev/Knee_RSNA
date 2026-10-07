@@ -93,10 +93,17 @@ class TimmAttentionMIL(nn.Module):
             (batch_size * slots * windows, self.feature_dim), dtype=feature_dtype
         )
         if valid_indices.numel():
-            selected = flat_images.index_select(0, valid_indices).float().div(255.0)
-            encoded = self._encode(selected)
+            encoded_chunks = []
+            index_chunks = []
+            for start in range(0, valid_indices.numel(), self.encode_chunk_size):
+                indices = valid_indices[start:start + self.encode_chunk_size]
+                selected = flat_images.index_select(0, indices).float().div(255.0)
+                encoded_chunks.append(self._encode(selected))
+                index_chunks.append(indices)
+            encoded = torch.cat(encoded_chunks, dim=0)
+            indices = torch.cat(index_chunks, dim=0)
             flat_features = flat_features.index_copy(
-                0, valid_indices, encoded.to(feature_dtype)
+                0, indices, encoded.to(feature_dtype)
             )
 
         features = self.norm(

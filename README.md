@@ -63,7 +63,7 @@ Use the competition data directory containing `train.csv`, `train_series.csv`, a
 python src/main.py --data_root /path/to/competition --work_dir /path/to/rsna_run --fresh_preprocessing --prepare_only
 ```
 
-`--fresh_preprocessing` deliberately rebuilds the DICOM index and cache at the selected dimensions; it also forces fresh NLP extraction. This overwrites generated artifacts in `work_dir`, so use it only when a from-scratch run is intended. The default NLP engine is `auto`: it selects vLLM only when available with CUDA, otherwise the explicit clinical-rules extractor. Set `--nlp_engine vllm` or `--nlp_engine rules` to choose directly. Runtime failures do not switch engines mid-run. Each pseudo-label file has a provenance manifest; the label merge preserves gold values per target and uses report-derived values only where gold is missing.
+`--fresh_preprocessing` deliberately rebuilds the DICOM index and cache at the selected dimensions; it also forces fresh NLP extraction. This overwrites generated artifacts in `work_dir`, so use it only when a from-scratch run is intended. The default NLP engine is `auto`: it selects vLLM only when available with CUDA and the configured model/quantization is within the supported memory policy; otherwise it selects the explicit clinical-rules extractor. In particular, auto mode will not start the default unquantized 70B model. To request that model, configure supported FP8 quantization first. Set `--nlp_engine vllm` or `--nlp_engine rules` to choose directly; an explicitly unsafe 70B configuration fails before model loading. Runtime failures do not switch engines mid-run. vLLM's memory utilization is capped dynamically using current unified-memory headroom, the configured 88 GiB operating target, and the 20 GiB recovery reserve. Each pseudo-label file has a provenance manifest; the label merge preserves gold values per target and uses report-derived values only where gold is missing.
 
 Preparation checks:
 1. NLP outputs are bound to the exact `train.csv`, extractor/prompt version, model, report hashes, and label-engine choice.
@@ -75,10 +75,14 @@ Preparation checks:
 If DICOM download is incomplete, the run emits `status: awaiting_dicom` and does not proceed to training. Once preparation passes, launch the ordinary pipeline to resume the validated cache and train:
 
 ```bash
-python src/main.py --data_root /path/to/competition --work_dir /path/to/rsna_run
+python src/main.py --data_root /path/to/competition --work_dir /path/to/rsna_run --model_dir /path/to/rsna_run/dino
 ```
 
-Without `--prepare_only`, the same pipeline performs the preparation gates first and then proceeds directly to the configured training run. Training logs and checkpoints are saved under `work_dir`.
+Without `--prepare_only`, the same pipeline performs the preparation gates first and then proceeds directly to the configured training run. Keep `work_dir` shared for the validated data/cache and use a fresh `model_dir` for each model run; requested fold directories containing old checkpoints/OOF files are rejected rather than mixed into a new run.
+
+The DGX Spark defaults cap preprocessing at 8 workers, use 8 persistent training workers with one prefetched batch each, validate in batches of 8, and infer in batches of 4. The estimated queued training-image payload is logged at startup. System memory is monitored with an 88 GiB operating target, a 100 GiB hard ceiling, and a minimum 20 GiB available-memory guard. These are safety/throughput bounds, not a promise that the machine will sit at a particular memory level: the pipeline does not allocate dummy memory to reach 80–90 GiB. Tune `--num_workers`, `--prefetch_factor`, `--batch_size`, and `--eval_batch_size` only after observing DGX throughput and available memory.
+
+Validation for checkpoint selection runs only on Gold-labeled studies. The subsequent OOF export still predicts every study in each requested held-out fold, and pipeline completion is blocked unless every requested fold has a checkpoint and complete OOF coverage.
 
 ---
 

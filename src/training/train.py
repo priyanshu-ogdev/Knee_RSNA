@@ -1,27 +1,4 @@
-"""Training loop — v2 upgrade layer.
-
-Upgrades implemented vs. baseline (0.943):
-  B  AsymmetricLoss replacing Weighted BCE
-       Ridnik et al., ICCV 2021 (arXiv:2009.14119). MS-COCO +1pp over
-       Focal Loss; de-facto standard for multi-label classification.
-  E  Stochastic Weight Averaging (last SWA_EPOCHS epochs)
-       Izmailov et al., UAI 2018. Finds wider optima → better OOF generalisation.
-       PyTorch-native (torch.optim.swa_utils). No external deps.
-  I  Feature-space Mixup
-       Zhang et al., ICLR 2018. Applied AFTER the backbone (feature-space)
-       so anatomy is never corrupted. Alpha=0.2 (light mixing).
-  J  20 epochs, cosine LR schedule (8% warmup + cosine decay), WD=0.05
-       ViT fine-tuning best practices 2025 consensus (Touvron DeiT III,
-       Oquab DINOv2). Replaces OneCycleLR which can overshoot on ViTs.
-  label_smoothing=0.05 (Szegedy et al. 2016; standard ViT recipe).
-
-All data-contract fixes from the previous intermediate version are retained:
-  - TIME_BUDGET_HOURS defined in config (was AttributeError)
-  - Unlabelled targets masked via weight=0 (not NaN-loss)
-  - BF16 / FP16 autocast with proper GradScaler
-  - Seeded, fold-aware validation with per-label AUC
-  - Best-checkpoint saving
-"""
+"""Gold-validated multi-label training with memory-bounded input pipelines."""
 from __future__ import annotations
 import math
 
@@ -30,13 +7,11 @@ import time
 import dataclasses
 import numpy as np
 import pandas as pd
-import os
 import psutil
 # CRITICAL CPU THRASHING FIX:
 # Limit OpenCV and NumPy internal threading. PyTorch DataLoader spawns multiple processes
-# (num_workers=6). If OpenCV spawns threads equal to the core count (e.g. 100 on a DGX) 
-# inside EACH worker, the CPU will experience catastrophic thread thrashing (600+ threads),
-# completely bottlenecking the data pipeline.
+# OpenCV spawning threads equal to the core count inside each worker can thrash the CPU
+# and bottleneck the data pipeline.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -67,7 +42,7 @@ import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.optim.swa_utils import AveragedModel, SWALR, update_bn, get_ema_multi_avg_fn
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 import src.core.config as config
 from src.modeling.losses import build_loss
@@ -78,7 +53,7 @@ from src.data.preprocess.cache import cfg_of as cache_cfg
 
 # ────────────────────────────────────── Memory Circuit Breaker ────────────────
 class MemoryCircuitBreakerTriggered(RuntimeError):
-    """Raised when total unified system memory exceeds the 118 GB hard safety threshold."""
+    """Raised when unified-memory headroom reaches the configured hard limit."""
     def __init__(self, used_gb: float, threshold_gb: float, stage: str, details: dict | None = None):
         self.used_gb = used_gb
         self.threshold_gb = threshold_gb
@@ -94,20 +69,19 @@ def check_memory_circuit_breaker(
     stage: str,
     threshold_gb: float | None = None,
 ) -> tuple[float, float]:
-    """Inspects total system unified memory. Raises MemoryCircuitBreakerTriggered if used >= threshold_gb.
-
-    Fast kernel call (~15 microseconds) safe for every micro-step.
-    """
-    limit = threshold_gb if threshold_gb is not None else getattr(config, "CIRCUIT_BREAKER_MAX_RAM_GB", 118.0)
+    """Stop before the host loses the recovery headroom needed by the OS."""
+    limit = threshold_gb if threshold_gb is not None else config.CIRCUIT_BREAKER_MAX_RAM_GB
     mem = psutil.virtual_memory()
     used_gb = mem.used / (1024 ** 3)
     total_gb = mem.total / (1024 ** 3)
-    if used_gb >= limit:
+    available_gb = mem.available / (1024 ** 3)
+    min_available = getattr(config, "MIN_AVAILABLE_RAM_GB", 20.0)
+    if used_gb >= limit or available_gb <= min_available:
         details = {
             "used_gb": used_gb,
             "total_gb": total_gb,
             "percent": mem.percent,
-            "available_gb": mem.available / (1024 ** 3),
+            "available_gb": available_gb,
         }
         raise MemoryCircuitBreakerTriggered(used_gb, limit, stage, details)
     return used_gb, total_gb
@@ -119,8 +93,7 @@ def execute_emergency_memory_flush(active_loaders: list | None = None):
         for loader in active_loaders:
             if loader is not None:
                 try:
-                    if hasattr(loader, "_iterator") and loader._iterator is not None:
-                        loader._iterator._shutdown_workers()
+                    _shutdown_loader(loader)
                 except Exception:
                     pass
                 try:
@@ -146,6 +119,21 @@ def execute_emergency_memory_flush(active_loaders: list | None = None):
         libc.malloc_trim(0)
     except Exception:
         pass
+
+
+def _shutdown_loader(loader) -> None:
+    """Explicitly stop persistent DataLoader workers before releasing a fold."""
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None:
+        iterator._shutdown_workers()
+        loader._iterator = None
+
+
+def _loader_batch_bytes(cfg, windows: int, batch_size: int) -> int:
+    return (
+        config.N_SLOTS * windows * cfg.group * cfg.img_size * cfg.img_size
+        * batch_size
+    )
 
 
 def handle_memory_circuit_breaker(
@@ -174,7 +162,9 @@ def handle_memory_circuit_breaker(
     if model is not None and out_dir:
         try:
             os.makedirs(out_dir, exist_ok=True)
-            emerg_ckpt = os.path.join(out_dir, f"fold{fold}_emergency_118gb_checkpoint.pt")
+            emerg_ckpt = os.path.join(
+                out_dir, f"fold{fold}_emergency_{exc.threshold_gb:.0f}gb_checkpoint.pt"
+            )
             base_m = model.module if isinstance(model, nn.DataParallel) else model
             torch.save({
                 "model": base_m.state_dict(),
@@ -202,7 +192,7 @@ def handle_memory_circuit_breaker(
     print("  1. Flush Linux filesystem page cache on DGX:", flush=True)
     print("       sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches", flush=True)
     print(f"  2. Re-launch the training pipeline for Fold {fold}:", flush=True)
-    print(f"       python src/main.py --folds {fold}", flush=True)
+    print(f"       python src/main.py --folds {fold} --model_dir <fresh-model-dir>", flush=True)
     print("=" * 80 + "\n", flush=True)
 
 
@@ -351,11 +341,17 @@ def train_epoch(
             sys_mem = psutil.virtual_memory()
             sys_ram_gb = sys_mem.used / (1024**3)
             total_ram_gb = sys_mem.total / (1024**3)
-            limit_gb = getattr(config, "CIRCUIT_BREAKER_MAX_RAM_GB", 118.0)
+            limit_gb = config.CIRCUIT_BREAKER_MAX_RAM_GB
             headroom_gb = max(0.0, limit_gb - sys_ram_gb)
-            vram_alloc = torch.cuda.memory_allocated() / 1e9 if device.type == "cuda" else 0.0
-            vram_res = torch.cuda.memory_reserved() / 1e9 if device.type == "cuda" else 0.0
-            mem_str = f" | VRAM: {vram_alloc:.1f}/{vram_res:.1f}GB | Unified RAM: {sys_ram_gb:.1f}/{total_ram_gb:.0f}GB (Safety Headroom to {limit_gb:.0f}GB: {headroom_gb:.1f}GB)"
+            available_gb = sys_mem.available / (1024**3)
+            vram_alloc = torch.cuda.memory_allocated() / (1024 ** 3) if device.type == "cuda" else 0.0
+            vram_res = torch.cuda.memory_reserved() / (1024 ** 3) if device.type == "cuda" else 0.0
+            mem_str = (
+                f" | VRAM: {vram_alloc:.1f}/{vram_res:.1f}GiB"
+                f" | Unified RAM: {sys_ram_gb:.1f}/{total_ram_gb:.0f}GiB"
+                f" (available {available_gb:.1f}GiB; target {config.MEMORY_TARGET_GB:.0f}GiB;"
+                f" ceiling headroom {headroom_gb:.1f}GiB)"
+            )
             print(f"  [Epoch {epoch:2d}/{total_epochs:2d} | Step {micro_step + 1:3d}/{total_batches:3d}] Loss: {avg_loss:.4f} | {sec_per_step:.2f}s/step | ETA: {rem_sec/60:.1f}m{mem_str}", flush=True)
             step_t0 = time.time()
 
@@ -416,7 +412,9 @@ def run_training(
     out_dir: str = ".",
     epochs: int | None = None,
     n_windows_train: int = config.N_WINDOWS_TRAIN,
-    num_workers: int = 10,  # 10 workers strictly bounds pinned memory to ~7.7GB, achieving 80-90GB total unified memory
+    num_workers: int = config.NUM_WORKERS,
+    prefetch_factor: int = config.PREFETCH_FACTOR,
+    eval_batch_size: int = config.EVAL_BATCH_SIZE,
     seed: int = config.SEED,
     variant: str = "dinov2-base",         # Upgrade A: default to Base
     model_type: str | None = None,
@@ -526,9 +524,30 @@ def run_training(
     ).to(device)
 
     # ── Datasets ─────────────────────────────────────────────────────────────
+    if num_workers < 0 or prefetch_factor < 1 or eval_batch_size < 1:
+        raise ValueError("num_workers must be >= 0, prefetch_factor and eval_batch_size must be >= 1")
+    num_workers = min(num_workers, os.cpu_count() or 1)
+    gold_mask = (
+        va[[f"{target}_weight" for target in config.TARGETS]]
+        .fillna(0.0)
+        .ge(0.99)
+        .any(axis=1)
+    ) if len(va) else pd.Series(dtype=bool)
+    va_gold = va.loc[gold_mask].reset_index(drop=True) if len(va) else va
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
-    ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
-    eval_batch_size = 1 if model_type == "coatnet_mil" else batch_size * 2
+    ds_va = RSNADataset(va_gold, cache_prefix, cfg, False, None, seed, aug=False) if len(va_gold) else None
+    ds_oof = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
+    queued_train_gb = (
+        _loader_batch_bytes(cfg, n_windows_train, batch_size)
+        * num_workers * prefetch_factor / (1024 ** 3)
+    )
+    print(
+        f"loader workers={num_workers}, prefetch={prefetch_factor}, "
+        f"estimated prefetched image payload≈{queued_train_gb:.1f} GiB; "
+        f"validation batch={eval_batch_size}, gold studies={len(va_gold)}/{len(va)}; "
+        f"memory target={config.MEMORY_TARGET_GB:.0f} GiB, "
+        f"hard ceiling={config.CIRCUIT_BREAKER_MAX_RAM_GB:.0f} GiB"
+    )
 
     # ── Optimiser (dual LR: slow backbone, fast head) ────────────────────────
     # IMPROVEMENT 3: WD=0 for biases and norm layers (standard ViT recipe).
@@ -648,22 +667,22 @@ def run_training(
     best, t0 = -1.0, time.time()
     epochs_no_improve = 0
 
-    active_loaders = []
+    dl_tr = DataLoader(
+        ds_tr, batch_size=batch_size, shuffle=True,
+        drop_last=len(tr) > batch_size, num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+    dl_va = (
+        DataLoader(ds_va, batch_size=eval_batch_size, shuffle=False,
+                   num_workers=0, pin_memory=False)
+        if ds_va is not None else None
+    )
+    active_loaders = [dl_tr]
     try:
         for ep in range(n_ep):
             ds_tr.set_epoch(ep)
-
-            # 1. SEQUENTIAL TRAINING DATALOADER:
-            # Created only during the training phase.
-            # num_workers=10 with prefetch_factor=2 strictly bounds pinned queue memory to ~7.7 GB.
-            dl_tr = DataLoader(
-                ds_tr, batch_size=batch_size, shuffle=True,
-                drop_last=len(tr) > batch_size, num_workers=num_workers,
-                pin_memory=(device.type == "cuda"),
-                persistent_workers=False,
-                prefetch_factor=2 if num_workers > 0 else None,
-            )
-            active_loaders = [dl_tr]
 
             # Gold upweighting: constant 1.5× throughout training.
             # Constant (not curriculum) avoids Adam momentum destabilization from
@@ -681,34 +700,14 @@ def run_training(
                 gold_weight_mult=1.5,
             )
 
-            # 2. IMMEDIATE PURGE OF TRAINING WORKERS:
-            # Explicitly shuts down worker processes & frees IPC pinned memory BEFORE validation!
-            active_loaders = []
-            del dl_tr
-            execute_emergency_memory_flush()
-
             msg = f"epoch {ep + 1}/{n_ep}  loss {loss_val:.4f}"
             score = float("nan")
 
-            # 3. SEQUENTIAL VALIDATION DATALOADER:
-            # Instantiated ONLY during validation with throttled workers & batch size, bounding pinned memory to ~4.6 GB.
-            if ds_va is not None:
-                dl_va = DataLoader(
-                    ds_va, batch_size=eval_batch_size, shuffle=False,
-                    num_workers=num_workers, pin_memory=(device.type == "cuda"),
-                    persistent_workers=False,
-                    prefetch_factor=2 if num_workers > 0 else None,
-                )
-                active_loaders = [dl_va]
+            if dl_va is not None:
                 score, per = evaluate(model, dl_va, device)
                 msg += f"  val macro-AUC {score:.4f}"
                 all_conds = ", ".join(f"{k}:{v:.3f}" for k, v in sorted(per.items()))
                 msg += f"\n       Per-target AUCs ({len(per)}/12 evaluated): [{all_conds}]"
-
-                # 4. IMMEDIATE PURGE OF VALIDATION WORKERS:
-                active_loaders = []
-                del dl_va
-                execute_emergency_memory_flush()
 
             print(msg, flush=True)
 
@@ -738,8 +737,6 @@ def run_training(
                 if ds_va is not None and epochs_no_improve >= early_stop_patience:
                     print(f"  [EARLY STOP] Validation AUC did not improve for {early_stop_patience} consecutive epochs. Stopping early at epoch {ep + 1}/{n_ep} to prevent overfitting.", flush=True)
                     break
-
-            execute_emergency_memory_flush()
 
             # ── Time-budget guard ─────────────────────────────────────────────
             if time.time() - t0 > config.TIME_BUDGET_HOURS * 3600:
@@ -786,13 +783,12 @@ def run_training(
                 drop_last=len(tr) > batch_size, num_workers=min(4, num_workers),
                 pin_memory=(device.type == "cuda"),
                 persistent_workers=False,
-                prefetch_factor=2 if num_workers > 0 else None,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
             )
             active_loaders = [dl_swa]
             safe_update_bn(dl_swa, swa_model, device=device)
             active_loaders = []
             del dl_swa
-            execute_emergency_memory_flush()
             torch.save(
                 dict(model=swa_model.module.state_dict(),
                      cfg=dataclasses.asdict(cfg),
@@ -817,19 +813,21 @@ def run_training(
         )
         print(f"EMA checkpoint saved → fold{fold}_ema.pt")
 
-        if ds_va is not None:
+        _shutdown_loader(dl_tr)
+        active_loaders = []
+        if ds_oof is not None:
             best_path = os.path.join(out_dir, f"fold{fold}_best.pt")
             best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
             inner_model.load_state_dict(best_checkpoint["model"], strict=True)
             inner_model.eval()
             dl_oof = DataLoader(
-                ds_va,
+                ds_oof,
                 batch_size=eval_batch_size,
                 shuffle=False,
                 num_workers=min(4, num_workers),
                 pin_memory=(device.type == "cuda"),
-                persistent_workers=False,
-                prefetch_factor=2 if num_workers > 0 else None,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
             )
             active_loaders = [dl_oof]
             oof_probabilities, oof_targets, oof_weights = [], [], []
@@ -851,7 +849,7 @@ def run_training(
                     oof_weights.append(weights.numpy())
                     del imgs, masks, wmasks, targets, weights, logits, batch
 
-            oof = pd.DataFrame({"StudyInstanceUID": ds_va.ids})
+            oof = pd.DataFrame({"StudyInstanceUID": ds_oof.ids})
             probabilities = np.concatenate(oof_probabilities)
             targets = np.concatenate(oof_targets)
             weights = np.concatenate(oof_weights)
@@ -869,10 +867,10 @@ def run_training(
             oof.to_csv(oof_tmp, index=False)
             os.replace(oof_tmp, oof_path)
             print(f"OOF predictions from the selected best checkpoint saved → {oof_path}")
+            _shutdown_loader(dl_oof)
             active_loaders = []
             del best_checkpoint, dl_oof, oof_probabilities, oof_targets, oof_weights
             del probabilities, targets, weights, oof
-            execute_emergency_memory_flush()
 
     except MemoryCircuitBreakerTriggered as exc:
         handle_memory_circuit_breaker(
@@ -889,8 +887,15 @@ def run_training(
             active_loaders=active_loaders,
         )
         raise exc
+    except Exception:
+        execute_emergency_memory_flush(active_loaders=active_loaders)
+        raise
 
     # ── Final cleanup before exiting fold training ───────────────────────────
+    _shutdown_loader(dl_tr)
+    del dl_tr
+    if dl_va is not None:
+        del dl_va
     del model, inner_model
     if 'model_train' in locals():
         del model_train

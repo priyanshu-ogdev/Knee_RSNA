@@ -16,7 +16,8 @@ scipy
 scikit-learn
 # 5. Orchestration & Caching
 kagglehub
-python-dotenv
+psutil
+python-dotenv
 tqdm
 pydicom
 tenacity

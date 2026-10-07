@@ -59,6 +59,16 @@ python src/main.py --model_type coatnet_mil --variant coatnet_rmlp_2_rw_384.sw_i
 This is a starting configuration, not a measured throughput or score
 recommendation; tune only after observing unified-memory use on the host.
 
+The DINOv2 model retains slot identity through per-slot window pooling,
+learned slot embeddings, cross-slot attention, and target-to-slot attention.
+The timm MIL implementation currently flattens valid windows across all six
+slots before target-specific pooling, so it has no explicit slot token or
+cross-slot stage. That makes it a useful CNN-vs-transformer ablation, but not
+an architectural match to the D4 Raptor/CoAtNet family. A worthwhile follow-up
+ablation is hierarchical timm pooling (windows within slots, then slots per
+target); keep it separate from the existing model until matched-fold results
+show a benefit.
+
 ## 5. Outputs and checkpoint contract
 
 The model returns logits shaped `[B, 12]`, ordered by `config.TARGETS`.
@@ -87,15 +97,31 @@ selection-biased and is for internal comparison, not an unbiased external
 estimate. No temperature calibrator is fitted; inference uses the identity
 temperature.
 
-The copied d4 notebook is an inference/ensemble graph, not a training recipe.
-Its code depends on separately published Kaggle model assets and pinned
-checkpoints. The copied notebook has no executed cells or saved outputs, so its
-reported leaderboard score and its new blend contribution cannot be
-independently reproduced from this repository. The new CoAtNet attention-MIL
-arm is a `src/`-native complementary experiment, not a reproduction of the d4
-CoAtNet/Raptor/RadImageNet/DINO fleet. Exact reproduction still requires the
-original training recipes, source artifacts, and leakage-safe predictions for
-each member family.
+The copied D4 notebook is an inference/ensemble graph, not a training recipe.
+Its declared graph combines 20 DINO members, five A5 folds, RadImageNet E10/E13/E11
+heads, four Raptor views, four CoAtNet readers, and optional additional student
+fleets. These are already task-specific trained checkpoints; the notebook
+validates pinned external artifacts and does not create knee classifiers from
+generic encoders at inference time. The D4 notebook in this checkout has no
+executed cells or saved outputs, so its documented 0.946 score and this exact
+graph's contribution cannot be independently reproduced here.
+
+The local `src/` pipeline currently trains DINOv2 and timm MIL classifiers.
+It does not reproduce D4's A5, RadImageNet heads, Raptor views, or their
+distinct preprocessing and checkpoint contracts. A DINOv2, ConvNeXt, or
+RadImageNet encoder pretrained on a different task is not by itself a predictor
+for these twelve labels: train a task-specific MIL/classification head at
+minimum, and compare frozen-backbone probing with partial fine-tuning. Loading
+an already-trained compatible RSNA checkpoint can skip training, but only if
+its head, target order, preprocessing, and study-level validation are verified.
+
+Scalar temperature scaling is not a score upgrade for ROC-AUC: for positive
+temperature, `sigmoid(logit / T)` preserves the ordering of predictions within
+each target. It can improve probability calibration for a probability-sensitive
+metric, but cannot supply missing task supervision. It also has no effect when
+predictions are rank-normalized before blending. With only 58 Gold studies,
+avoid fitting many target-specific blend weights or nonlinear stackers to the
+same validation predictions.
 
 For live inference, pass trained DINOv2 and CoAtNet checkpoints together:
 
@@ -110,17 +136,47 @@ python -m src.inference.inference \
 ```
 
 The inference process loads the checkpoint models and runs them on the
-competition test data. When both families are present, it averages
-probabilities within each family, converts each family output to average-tie
-percentile ranks per target, applies the d4-derived CoAtNet target weights,
-then rank-normalizes the blend. CoAtNet has weight `0.60` by default, `0.75`
-for ACL, Lateral OA, and Fracture, `0.80` for Medial Meniscus, and `1.00` for
-Lateral Meniscus. `src/main.py --ensemble_checkpoints ...` supports the same
-live-checkpoint ensemble alongside a family trained by that run.
+competition test data. It averages probabilities within each family, converts
+each family output to average-tie percentile ranks per target, and gives each
+family equal weight by default. The optional `--d4_target_weights` switch applies CoAtNet weight
+`0.60` by default, `0.75` for ACL, Lateral OA, and Fracture, `0.80` for Medial
+Meniscus, and `1.00` for Lateral Meniscus. These weights came from a different
+D4 model graph and should be retained only when a matched out-of-fold
+comparison supports them for the local checkpoints. `src/main.py
+--ensemble_checkpoints ...` supports the same live-checkpoint ensemble
+alongside a family trained by that run.
 
-This is a live DINOv2/CoAtNet blend using the d4 notebook's target-weight
-schedule, not an exact reproduction of its complete blend graph: the notebook's
-other source is a Raptor/CoAtNet hybrid, while this repository does not run the
-external Raptor, A5, RadImageNet, or auxiliary CoAtNet arms or their distinct
-preprocessing. The copied d4 notebook also has no saved execution outputs, so
-its reported leaderboard score remains unverified here.
+This is not an exact reproduction of the D4 blend graph: this repository does
+not run the external Raptor, A5, RadImageNet, or auxiliary CoAtNet arms or
+their distinct preprocessing. The copied D4 notebook also has no saved
+execution outputs, so its reported leaderboard score remains unverified here.
+
+## 7. DGX memory and fold lifecycle
+
+Research references: [DINOv2 model card](https://huggingface.co/facebook/dinov2-base)
+describes the released encoder as lacking a task-fine-tuned head and recommends
+training a downstream classifier; the
+[ConvNeXt model card](https://huggingface.co/timm/convnext_small.in12k_ft_in1k)
+documents ImageNet pretraining rather than knee-abnormality supervision; and
+[Guo et al.](https://arxiv.org/abs/1706.04599) study temperature scaling as
+probability calibration, not as a way to improve ranking metrics.
+
+The DGX Spark configuration uses an 88-GiB memory operating target, a 100-GiB
+hard ceiling, and a 20-GiB minimum-available-memory guard. The target is
+observational, not an instruction to allocate unused memory: the system's
+file cache and other processes determine actual utilization. Defaults use up
+to eight DICOM preprocessing workers, eight persistent training workers with
+one prefetched batch each, Gold-only validation batches of eight, and
+inference batches of four. The pipeline logs an image-only estimate of the
+training prefetch queue; actual use also includes model activations, pinned
+buffers, workers, OS cache, and other processes. Adjust the corresponding CLI
+flags only from measured throughput and memory on the DGX.
+
+The training dataset shares its epoch counter with persistent workers so that
+window sampling and augmentation remain fresh and deterministic across
+epochs. A fold's best checkpoint is selected using only Gold-labeled studies;
+after training, OOF inference covers every study in the requested held-out
+fold. Checkpoint verification checks requested folds and exact OOF study-ID
+coverage. Existing artifacts for a requested fold are not overwritten; use a
+new `--model_dir` for a new run. The default SWA pass is disabled because the
+pipeline retains EMA and SWA added an unused model copy and full-data pass.

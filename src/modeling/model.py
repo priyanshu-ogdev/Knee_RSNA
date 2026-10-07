@@ -1,23 +1,16 @@
 """Model architecture: DINOv2 backbone + WindowPool + CrossSlotTransformer + SlotHead.
 
-Upgrade history vs. baseline (0.943):
+Architecture notes:
   A  DINOv2-Small → DINOv2-Base (86M, dim=768)
-       Source: Oquab et al., arXiv:2304.07193 (Meta AI / TMLR 2024).
-       Linear-probe gap: ViT-S 79.8% → ViT-B 82.1% (+2.3pp ImageNet-1K).
-       For fine-tuned medical classification the gap is typically 3-5pp larger.
+               Source: Oquab et al., arXiv:2304.07193 (Meta AI / TMLR 2024).
 
-  B  LoRA (Low-Rank Adaptation) injected into QV projections of all 12 blocks.
-       Source: Hu et al., ICLR 2022 (original); Han et al. "MeLo" arXiv 2023
-               (medical: 0.17% params, parity with full fine-tuning);
-               NIH-indexed lung nodule study 2024 (+3% AUC vs FFT).
-       rank=16, alpha=32 by default. Last `unfreeze_last` blocks are fully
-       unfrozen on top of LoRA so final feature layers have maximum plasticity.
+  B  Optional LoRA adapters. Disabled by default (LORA_RANK=0); when enabled,
+               the current target suffixes cover Q/K/V and the MLP fc1/fc2 layers.
+               Last `unfreeze_last` blocks are fully unfrozen.
 
   C  CrossSlotTransformer inserted between WindowPool and SlotHead.
-       Source: Shao et al. "TransMIL", NeurIPS 2021 (+1.1-2.3% AUC on
-               pathology slides); Li et al. ACMIL 2024 (cross-bag attention).
-       6 slot tokens = negligible compute. Adds cross-slot anatomical reasoning:
-       e.g., ACL confidence in Sag slot can attend to corroborating Cor slot.
+               This is a small, explicit cross-slot interaction module; its contribution
+               to this competition must be established by a matched ablation.
 """
 from __future__ import annotations
 
@@ -34,7 +27,8 @@ from src.modeling.mil import build_timm_attention_mil
 # Maps each target to its most informative slot indices (0-indexed).
 # Slots: 0=SAG_FLUID_FS, 1=COR_FLUID_FS, 2=AX_FLUID_FS,
 #        3=SAG_FLUID_NOFS, 4=COR_T1, 5=SAG_T1
-# Source: 0.946 / 0.957 public notebooks (verified against anatomy literature).
+# Anatomical hypotheses only; these priors have not been isolated in a
+# leakage-safe ablation on this repository's validation data.
 SLOT_PRIOR_TABLE = {
     "ACL":              {0, 3, 5},   # Sagittal (ACL runs anterior→posterior)
     "MCL":              {1, 4},      # Coronal (MCL runs medially)
@@ -49,7 +43,7 @@ SLOT_PRIOR_TABLE = {
     "Contusion":        {0, 1},     # Fluid-sensitive (bone marrow edema)
     "Fracture":         {0, 1, 2},  # All planes
 }
-SLOT_PRIOR_STRENGTH = 2.0  # additive logit bias to preferred slots at init
+SLOT_PRIOR_STRENGTH = 2.0  # additive attention-logit bias; requires ablation
 
 
 
@@ -59,7 +53,7 @@ class LoRALinear(nn.Module):
 
     Freezes the original linear weight and adds trainable A (d_in x r) and
     B (r x d_out) matrices.  Output = W*x + scale * B^T * A^T * x.
-    rank=16, alpha=32 → scale=2.0 (standard hyper).
+    rank=16, alpha=32 -> scale=2.0. LoRA is disabled in the default config.
     """
 
     def __init__(self, linear: nn.Linear, rank: int = 16, alpha: int = 32):
@@ -86,10 +80,11 @@ def inject_lora(
     alpha: int = 32,
     target_suffixes: tuple[str, ...] = ("query", "key", "value", "fc1", "fc2"),
 ) -> nn.Module:
-    """Replace Q and V Linear projections in all transformer blocks with LoRALinear.
+    """Replace selected transformer projections and MLP layers with LoRALinear.
 
     Works with HuggingFace ViT (DINOv2) which uses encoder.layer[i].attention.attention.{query,value}.
-    The original module is kept inside LoRALinear, keeping the backbone structurally unchanged.
+    By default, query/key/value and mlp.fc1/fc2 are adapted. The original
+    module is kept inside LoRALinear, preserving the backbone structure.
     """
     for name, mod in list(backbone.named_modules()):
         if isinstance(mod, nn.Linear) and any(name.endswith(s) for s in target_suffixes):
@@ -144,12 +139,7 @@ class CrossSlotTransformer(nn.Module):
 
 # ─────────────────────────────────────────────────────────── SlotHead ─────────
 class SlotHead(nn.Module):
-    """Attention-pooling from slot embeddings to per-target logits.
-
-    Unchanged from baseline (the 0.943 architecture). CrossSlotTransformer
-    feeds into this — it provides cross-slot context, SlotHead does the final
-    query-guided routing to the 12 disease classifiers.
-    """
+    """Attention-pool slot embeddings into one logit per target."""
 
     def __init__(self, dim: int, n_slot: int, n_out: int,
                  hidden: int = 256, p: float = 0.2, use_prior: bool = True):
@@ -164,9 +154,7 @@ class SlotHead(nn.Module):
         self.drop = nn.Dropout(p)
         self.out = nn.Linear(hidden, n_out)
         self.hidden = hidden
-        # Anatomical slot prior (SOTA: 0.946 and 0.957 public notebooks).
-        # Biases SlotHead attention toward the correct anatomical plane per
-        # target at initialization so early training is not wasted on routing.
+        # Heuristic anatomical prior; its value should be checked by ablation.
         prior_mat = torch.zeros(n_out, n_slot)
         if use_prior and n_slot == config.N_SLOTS:
             for ti, tname in enumerate(config.TARGETS):
@@ -482,4 +470,9 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
     model.eval()
     model._rsna_preprocessing_config = ckpt.get("cfg")
     model._rsna_model_type = model_config["model_type"]
+    model._rsna_model_family = (
+        model_config["variant"]
+        if model_config["model_type"] in {"coatnet_mil", "timm_mil"}
+        else model_config["model_type"]
+    )
     return model

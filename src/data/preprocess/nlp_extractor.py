@@ -5,6 +5,7 @@ import hashlib
 import pandas as pd
 import torch
 import time
+import psutil
 
 # SOTA Fix: Load .env so the HuggingFace token (HF_TOKEN) is available for downloading the gated Nemotron model.
 try:
@@ -494,11 +495,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     
     print(f"[INFO] Initializing vLLM Engine for {model_id} on DGX Spark GB10...")
     
-    # SOTA Fix for DGX Spark GB10 (Single Unit Grace Blackwell, 128GB Unified Memory):
-    # 1. Single unit = tensor_parallel_size=1
-    # 2. bitsandbytes INT8 requires ~70GB, leaving plenty of room on 128GB
-    # 3. Memory utilization defaults to 0.80 (102.4 GB) to ensure 25.6 GB CPU RAM is reserved
-    #    for the ARM Grace CPU, Linux OS kernel, and Kagglehub I/O buffers without triggering OOM killer.
+    # Legacy extraction path; keep its default reservation conservative as well.
     use_quant = os.environ.get("VLLM_QUANTIZATION", "bitsandbytes")
     if use_quant.lower() in ["bitsandbytes", "bnb"]:
         tp_size = 1
@@ -520,7 +517,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
             "quantization": use_quant,
         }
     
-    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
+    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.65"))
     enforce_eager_flag = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
     
     llm = LLM(
@@ -857,17 +854,39 @@ def auto_complete_extraction(
     # Resolve the engine once per run. A runtime failure must not silently switch
     # labeling methodology part-way through the dataset.
     selected_engine = engine.lower()
+    requested_model = (
+        model_id
+        or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
+    )
+    quantization = os.environ.get("VLLM_QUANTIZATION", "none").lower()
+    large_unquantized_model = (
+        re.search(r"(?:^|[-_/])70b(?:[-_/]|$)", requested_model.lower()) is not None
+        and quantization not in {"fp8", "fp8_e4m3", "fp8_e5m2"}
+    )
     if selected_engine == "auto":
-        selected_engine = "vllm" if LLM is not None and torch.cuda.is_available() else "rules"
+        selected_engine = (
+            "vllm"
+            if LLM is not None and torch.cuda.is_available() and not large_unquantized_model
+            else "rules"
+        )
+        if large_unquantized_model:
+            print(
+                "[SAFETY] Auto-selected clinical rules instead of unquantized 70B vLLM. "
+                "Use an explicitly supported quantization or a smaller model to enable vLLM."
+            )
     if selected_engine not in {"vllm", "rules"}:
         raise ValueError(f"Unsupported NLP extraction engine: {engine!r}")
     if selected_engine == "vllm" and LLM is None:
         raise ImportError("vLLM was requested but is not installed; refusing to switch to rules labels")
+    if selected_engine == "vllm" and large_unquantized_model:
+        raise ValueError(
+            "Refusing to load the 70B NLP model without FP8 quantization: its unquantized "
+            "weights alone exceed the DGX Spark's unified memory. Set VLLM_QUANTIZATION=fp8 "
+            "or select a smaller model."
+        )
 
     resolved_model = (
-        model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
-        if selected_engine == "vllm"
-        else "clinical-rules-v1"
+        requested_model if selected_engine == "vllm" else "clinical-rules-v1"
     )
     prompt_sha256 = hashlib.sha256(build_prompt("__REPORT_TEXT__").encode("utf-8")).hexdigest()
     train_sha256 = _sha256_file(train_path)
@@ -973,10 +992,35 @@ def auto_complete_extraction(
     if selected_engine == "vllm":
         try:
             print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
-            model_to_use = model_id or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
-            gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
+            model_to_use = requested_model
+            requested_gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.65"))
+            if not 0.0 < requested_gpu_util < 1.0:
+                raise ValueError("VLLM_GPU_MEMORY_UTILIZATION must be between 0 and 1")
+            total_gpu_gb = (
+                torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            )
+            memory = psutil.virtual_memory()
+            used_gb = memory.used / (1024 ** 3)
+            available_gb = memory.available / (1024 ** 3)
+            safe_budget_gb = min(
+                config.MEMORY_TARGET_GB - used_gb,
+                available_gb - config.MIN_AVAILABLE_RAM_GB,
+            )
+            if safe_budget_gb <= 0:
+                raise RuntimeError(
+                    f"Insufficient unified-memory headroom for vLLM: {available_gb:.1f} GiB "
+                    f"available; at least {config.MIN_AVAILABLE_RAM_GB:.1f} GiB must remain."
+                )
+            memory_target_util = min(0.99, safe_budget_gb / total_gpu_gb)
+            gpu_util = min(requested_gpu_util, memory_target_util)
+            if gpu_util < requested_gpu_util:
+                print(
+                    f"[SAFETY] Capping vLLM GPU memory utilization at {gpu_util:.3f} "
+                    f"based on current use ({used_gb:.1f} GiB) and the "
+                    f"{config.MEMORY_TARGET_GB:.0f} GiB target."
+                )
             enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
-            use_quant = os.environ.get("VLLM_QUANTIZATION", "none").lower()
+            use_quant = quantization
 
             llm_kwargs = {}
             if use_quant in ["fp8", "fp8_e4m3", "fp8_e5m2"]:

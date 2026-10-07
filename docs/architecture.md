@@ -1,50 +1,76 @@
-# RSNA 2026 Knee Abnormality Detection: Ultimate V2 Architecture & Pipeline Design
+# RSNA Knee Classification Architecture
 
-This document provides a highly detailed, comprehensive review of the state-of-the-art (SOTA) V2 repository stored in `src/`. It breaks down the foundational architecture, the critical data integrity bugs that were solved, and the targeted optimizations engineered specifically to scale on high-end Linux hardware (like the NVIDIA DGX Spark 128GB) and surpass the 0.96+ AUC threshold.
+## Current models
 
----
+The pipeline trains twelve study-level findings from six routed MRI series
+slots. Cached images are sampled as 2.5D windows of three adjacent slices.
+Training and inference share the same preprocessing/cache contract.
 
-## 1. The Foundational Baseline & Model Upgrades (`src/model.py`, `src/train.py`)
-Predicting 12 specific knee conditions (from ligament tears to osteoarthritis) requires a model that understands both dense global context and fine local structures, while fighting severe class imbalances.
+### DINOv2 MIL
 
-* **The Backbone:** The foundation uses the HuggingFace `dinov2-small` Vision Transformer. DINOv2 provides incredibly robust, self-supervised feature embeddings.
-* **EMA Stabilization:** The V2 pipeline integrates an Exponential Moving Average (EMA) shadow model in `train.py`. The EMA tracks a smoothed average of model weights across epochs, significantly reducing volatility and creating a more robust, stable model for Kaggle's hidden test set.
-* **Rare Target Loss Multipliers:** Some knee abnormalities (like specific meniscal tears or fractures) are highly underrepresented. We introduced a `RARE_TARGET_WEIGHTS` multiplier array in `config.py`. The loss function scales gradients for these rare targets by up to 2.0x, ensuring the network does not lazily optimize for majority classes (like Effusion).
-* **Focal Top-K Pooling (L2 Normalization):** The `WindowPool` module aggregates spatial chunks. We upgraded the `focal_tok` (Top-K) pooling logic. Instead of blindly sorting by scalar means, the model now computes the L2 norm of the spatial feature dimensions to rank and pool the most information-dense windows, drastically improving performance on localized tears.
+The default `dinov2` model uses a pretrained DINOv2 image encoder. It combines
+CLS, mean-patch, and high-magnitude patch features for each window, pools
+windows within each slot, optionally applies cross-slot attention, and routes
+slot features to target-specific outputs. It is task-trained using the
+competition labels; the generic DINOv2 encoder weights alone do not predict the
+twelve findings. LoRA is disabled by default. The anatomical slot prior is a
+heuristic that still needs a matched ablation.
 
----
+### timm attention MIL
 
-## 2. Preprocessing & Data Integrity Fixes (`src/dataset.py`, `src/preprocess/`)
-The provided RSNA DICOM dataset is notoriously noisy. Our audit resolved several catastrophic data hazards:
+`timm_mil` uses a pretrained timm image backbone and target-specific attention
+over valid windows. It currently pools the windows from all slots together;
+unlike DINOv2, it does not explicitly encode slot identity or add a cross-slot
+stage. This is architectural diversity, but also a concrete ablation
+opportunity: compare flat pooling with hierarchical window-within-slot and
+slot-within-target pooling using the same folds, labels, and training budget.
+Do not promote the more complex head without repeatable out-of-fold benefit.
 
-* **Anamorphic Distortion & Physical Cropping:** 7.3% of series have non-square matrices (e.g., 512x640). Using fixed pixel crops destroys the anatomical aspect ratio. 
-  **The Fix:** `pixels.py` reads `PixelSpacing` directly from the DICOM headers and calculates the exact crop necessary for a **physical 130.0 mm crop** (`CROP_MM = 130.0`). This guarantees the anatomical scale is mathematically isotropic.
-* **WindowCenter/Width Variations:** Over 51% of slices have dynamic, non-standard windowing tags. 
-  **The Fix:** We actively ignore DICOM `WindowCenter`/`WindowWidth` metadata. Instead, `pixels.py` utilizes robust image percentiles (1.0% to 99.5%) to dynamically scale voxel intensities to [0, 1]. `clip_negative=True` ensures catastrophic uint8 wrap-arounds (observed in Canon scanners) are averted.
-* **3D Volumetric Z-Extent Interpolation:** For high-density 3D sequences (like Siemens SPACE), using raw slice indices breaks depth constancy. 
-  **The Fix:** `pixels.py` uses `z_groups()` to map slices uniformly across the physical Z-extent in millimeters.
-* **The 6-Slot Routing Bug (Fixed!):** The competition provides a `Fluid_Sensitive` CSV flag. Originally, the pipeline ignored this and executed regex text-searches on DICOM descriptions to route series into Fluid/Non-Fluid slots, completely corrupting routing for the 17.7% of metadata-poor or mislabeled studies. 
-  **The Fix:** We forced `slot_fs_priority = "csv"` in `config.py` and patched `slots.py` to seamlessly fallback to `Fluid_Sensitive` even if Kaggle prunes CSV columns in the hidden test set. Routing is now 100% anchored to the provided ground truth.
+## Pretraining, task fitting, and calibration
 
----
+Pretrained weights provide an image representation, not a knee-abnormality
+classifier. For a generic encoder, fit at least a task-specific classification
+or MIL head; then compare a frozen-encoder probe with partial fine-tuning.
+An already-trained RSNA checkpoint can be loaded directly only when its output
+head, target order, preprocessing, and validation provenance match.
 
-## 3. High-Performance Hardware Optimizations (`src/preprocess/`)
-To process thousands of 3D knee MRIs on high-core-count, massive-memory architectures (NVIDIA DGX Spark 128GB), the pipeline was refactored for raw speed and memory efficiency:
+Positive scalar temperature scaling preserves per-target prediction order and
+therefore cannot improve ROC-AUC by itself. It can improve probability
+calibration for a probability-sensitive metric. In a rank-based ensemble it
+does not affect ranks. With 58 Gold studies, fitting many target-specific blend
+weights or nonlinear stackers to the same predictions is prone to overfitting.
 
-* **Zero-Copy Linux Multiprocessing (`fork`):** Python's `spawn` multiprocessing context is incredibly slow as it reloads modules into every worker. We upgraded `cache.py` to utilize `fork` on Linux environments, cutting IPC overhead by nearly an order of magnitude.
-* **Memory-Optimized Border Padding:** The padding logic in `pixels.py` originally upcasted the entire 800,000+ pixel image matrix into `float32` just to compute a border median. 
-  **The Fix:** We implemented a linear transformation corollary: `float(_border_median(raw)) * slope + icpt`. This calculates the median natively in integers *before* upcasting, slashing RAM spikes and preventing Linux OOM thrashing on 64-core systems.
-* **Bypassing PyDicom Sequence Overhead:** PyDicom's default parser loads hundreds of useless metadata tags. 
-  **The Fix:** We injected a `specific_tags` whitelist into `dicomio.py`, strictly limiting the parser to pixel data and geometry headers. This yields a massive **30-50% speedup** in overall decoding throughput.
-* **Deeper Spatial Stacking:** Because of the new memory optimizations, we successfully doubled the network's spatial window view (`n_windows_train` increased from 4 to 8), feeding twice as much anatomical context to the DINOv2 backbone without OOMing the 128GB DGX node.
+## D4 comparison
 
----
+The copied D4 notebook declares an inference ensemble made from external,
+task-trained checkpoints: 20 DINO members, five A5 folds, RadImageNet E10/E13/E11
+heads, four Raptor views, four CoAtNet readers, and optional student fleets.
+Its code pins and validates external artifacts; it does not train those models
+from generic weights during inference. This repository does not reproduce
+those model families, checkpoints, or all of their preprocessing.
 
-## 4. Inference & Ensembling (`src/inference.py`)
-To push beyond the single-model threshold, the final inference stage blends our optimized DINOv2 Transformer with a Convolutional framework.
+The notebook in `tmp/d4_blend/` has no executed cells or saved outputs in this
+checkout. Its documented 0.946 leaderboard score and the contribution of its
+full current graph are therefore not independently verifiable here. The
+D4-derived target-specific DINO/CoAtNet weights are opt-in only; equal
+architecture-family rank blending is the local default because the local
+CoAtNet model is not the D4 Raptor/CoAtNet system.
 
-* **Target-Specific Blending:** Transformers excel at global context (Effusion), while Convolutional networks (like CoAtNet) excel at sharp, local edges (Fractures, Meniscus tears). The inference script exploits this by weighting the blend dynamically.
-* **Rank Ensembling:** Directly averaging probabilities between fundamentally different architectures causes calibration collapse. The `rank_ensemble()` function converts all probabilities into **percentiles** before blending them, maximizing AUC completely free of calibration drift.
+## Recommended experiment order
 
-### Summary
-The V2 codebase solves every structural anomaly in the RSNA Knee dataset and optimally harnesses high-throughput Linux hardware. With EMA stabilization, rare-target multipliers, perfect slot routing, and hardware-accelerated multiprocessing, the pipeline is fully prepped to execute the 5-fold training loop and secure top leaderboard standing.
+1. Establish matched-fold OOF baselines for DINOv2 and one genuinely different
+   CNN backbone such as ConvNeXt-Small. Measure per-target AUC and rank
+   correlation, not only the aggregate.
+2. Test frozen-backbone/head-only training against the existing partial
+   fine-tuning recipe. Keep the validation studies Gold-only and prevent
+   pseudo-labels from becoming validation targets.
+3. If the CNN contributes complementary errors, test slot-aware hierarchical
+   MIL against flat pooling. Reuse the same folds, augmentation, epochs, and
+   label policy so the head is the only intended change.
+4. Compare equal family-rank blending with the D4-weighted blend on predictions
+   not used to select epochs or weights. Retain extra arms only when the
+   improvement is consistent and checkpoint/preprocessing provenance is
+   complete.
+
+No architecture, ensemble, memory, or leaderboard gain is claimed until these
+experiments are run on the actual dataset and DGX environment.

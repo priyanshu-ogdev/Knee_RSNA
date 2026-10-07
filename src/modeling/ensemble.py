@@ -4,13 +4,11 @@ Implements:
   TemperatureCalibration  Post-hoc probability calibration per model arm.
                           Guo et al., ICML 2017 — "On Calibration of Modern Neural Networks".
                           Finds scalar T per arm that minimises NLL on OOF predictions.
-                          AUC is rank-invariant (unaffected by monotone T scaling) but the
-                          calibrated probabilities make rank-percentile blending more principled.
+                          Positive scalar temperature does not change per-target AUC/ranks.
 
   greedy_ensemble_select  Caruana et al., ICML 2004 — "Ensemble Selection from Libraries of Models".
-                          Greedy forward selection from a pool of model predictions on a held-out
-                          OOF set. Always >= mean blending. Supports with-replacement (models can
-                          be selected multiple times, effectively up-weighting them).
+                          Experimental greedy selection on OOF predictions; its
+                          in-sample result is not an unbiased generalization estimate.
 
   rank_ensemble_n         N-arm rank-percentile blending (generalization of baseline 2-arm blend).
                           Per-target CoAtNet weighting kept from baseline (0.943 source).
@@ -96,8 +94,8 @@ def greedy_ensemble_select(
     Returns a list of indices (with repetitions) into oof_preds representing the
     selected ensemble members. Weight of each model = count(index) / n_select.
 
-    This guarantees the selected ensemble is always >= the best single model
-    on the OOF metric (hill-climbing property).
+    This does not guarantee improvement over the best single model and can
+    overfit when the OOF set is small or reused for model selection.
     """
     from sklearn.metrics import roc_auc_score
 

@@ -232,6 +232,7 @@ def run_preparation(
     work_dir: str,
     pseudo_csv: str | None,
     force: bool = False,
+    workers: int | None = None,
 ) -> tuple[str, str | None, str]:
     print("\n" + "=" * 80)
     print("PHASE 2: DATASET MERGE, STRATIFICATION & CACHE BUILD")
@@ -357,7 +358,12 @@ def run_preparation(
 
     # Build an input-fingerprinted index for every train series.
     idx_dir = os.path.join(work_dir, "idx")
-    cpu_cores = max(2, os.cpu_count() or 1)
+    cpu_cores = min(
+        workers if workers is not None else config.PREPROCESS_WORKERS,
+        os.cpu_count() or 1,
+    )
+    if cpu_cores < 1:
+        raise ValueError("preprocessing workers must be at least 1")
     print("Indexing and validating every training DICOM series...")
     index_out = runner.run_index(
         data_root, idx_dir, splits=("train",), workers=cpu_cores, force=force
@@ -528,6 +534,9 @@ def run_all_folds(
     batch_size: int = config.BATCH_SIZE,
     grad_accum: int = config.GRAD_ACCUM,
     n_windows_train: int = config.N_WINDOWS_TRAIN,
+    num_workers: int = config.NUM_WORKERS,
+    prefetch_factor: int = config.PREFETCH_FACTOR,
+    eval_batch_size: int = config.EVAL_BATCH_SIZE,
     variant: str = "dinov2-base",
     model_type: str = "dinov2",
     pretrained: bool = True,
@@ -539,6 +548,28 @@ def run_all_folds(
 
     best_scores: dict[int, float] = {}
 
+    if not folds_to_run or len(folds_to_run) != len(set(folds_to_run)):
+        raise ValueError("folds_to_run must be a non-empty list of unique fold IDs")
+    if any(fold not in range(5) for fold in folds_to_run):
+        raise ValueError(f"fold IDs must be in 0..4: {folds_to_run}")
+    for fold in folds_to_run:
+        fold_out_dir = os.path.join(work_dir, f"models_fold{fold}")
+        existing_outputs = [
+            os.path.join(fold_out_dir, f"fold{fold}_{name}.pt")
+            for name in ("best", "ema", "swa")
+        ] + [os.path.join(fold_out_dir, f"fold{fold}_oof.csv")]
+        if os.path.isdir(fold_out_dir):
+            existing_outputs.extend(
+                os.path.join(fold_out_dir, name)
+                for name in os.listdir(fold_out_dir)
+                if name.startswith(f"fold{fold}_emergency_") and name.endswith("_checkpoint.pt")
+            )
+        existing_outputs = [path for path in existing_outputs if os.path.exists(path)]
+        if existing_outputs:
+            raise FileExistsError(
+                f"Fold {fold} already has artifacts; refusing to mix a new run with stale "
+                f"checkpoints/OOF files. Choose a fresh --model_dir. Existing: {existing_outputs}"
+            )
     for fold in folds_to_run:
         print(f"\n{'='*35} STARTING FOLD {fold} {'='*35}")
         fold_out_dir = os.path.join(work_dir, f"models_fold{fold}")
@@ -553,6 +584,9 @@ def run_all_folds(
                 epochs=epochs,
                 batch_size=batch_size,
                 grad_accum=grad_accum,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                eval_batch_size=eval_batch_size,
                 n_windows_train=n_windows_train,
                 variant=variant,
                 model_type=model_type,
@@ -570,6 +604,7 @@ def run_all_folds(
         except Exception as e:
             print(f"[ERROR] Error during training Fold {fold}: {e}")
             traceback.print_exc()
+            raise RuntimeError(f"Training failed for requested fold {fold}; stopping to avoid a partial ensemble") from e
         finally:
             execute_emergency_memory_flush()
 
@@ -579,27 +614,54 @@ def run_all_folds(
 # ==============================================================================
 # PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION
 # ==============================================================================
-def run_oof_and_checkpoint_verification(model_dir: str, labels_csv: str, best_scores: dict[int, float]) -> tuple[list[str], list[float]]:
+def run_oof_and_checkpoint_verification(
+    model_dir: str,
+    labels_csv: str,
+    folds_csv: str,
+    requested_folds: list[int],
+    best_scores: dict[int, float],
+    require_oof: bool = True,
+) -> tuple[list[str], list[float]]:
     print("\n" + "=" * 80)
     print("PHASE 4: OUT-OF-FOLD EVALUATION & CHECKPOINT VERIFICATION")
     print("=" * 80)
 
+    if not requested_folds or len(requested_folds) != len(set(requested_folds)):
+        raise ValueError("requested_folds must be a non-empty list of unique fold IDs")
+    if any(fold not in range(5) for fold in requested_folds):
+        raise ValueError(f"requested fold IDs must be in 0..4: {requested_folds}")
+    if require_oof and set(best_scores) != set(requested_folds):
+        raise RuntimeError(
+            f"Training completed folds {sorted(best_scores)}, but requested "
+            f"{sorted(requested_folds)}; refusing a partial ensemble"
+        )
+    fold_table = pd.read_csv(folds_csv, dtype={"StudyInstanceUID": str})
+    if not {"StudyInstanceUID", "fold"}.issubset(fold_table.columns):
+        raise ValueError("folds manifest must contain StudyInstanceUID and fold columns")
+    if fold_table["StudyInstanceUID"].duplicated().any():
+        raise ValueError("folds manifest contains duplicate StudyInstanceUID values")
+    fold_values = pd.to_numeric(fold_table["fold"], errors="raise")
+    if (
+        fold_values.isna().any()
+        or not np.equal(fold_values, fold_values.astype(int)).all()
+        or not set(fold_values.astype(int)).issubset(set(range(5)))
+    ):
+        raise ValueError("folds manifest must assign integer fold IDs in 0..4")
+    fold_table["fold"] = fold_values.astype(int)
     valid_ckpts = []
     oof_frames = []
     print("\n--- Best-checkpoint and OOF prediction verification ---")
 
-    for fold in range(5):
+    for fold in requested_folds:
         fold_dir = os.path.join(model_dir, f"models_fold{fold}")
         best_ckpt = os.path.join(fold_dir, f"fold{fold}_best.pt")
         oof_path = os.path.join(fold_dir, f"fold{fold}_oof.csv")
-        if best_scores and fold not in best_scores:
-            continue
         if os.path.exists(best_ckpt):
             sz_mb = os.path.getsize(best_ckpt) / 1e6
             score_str = f"{best_scores.get(fold, float('nan')):.4f}"
             print(f"  Fold {fold}: best checkpoint [{sz_mb:.1f} MB] -> validation macro-AUC: {score_str}")
             valid_ckpts.append(best_ckpt)
-            if best_scores:
+            if require_oof:
                 if not os.path.exists(oof_path):
                     raise FileNotFoundError(
                         f"fold {fold} completed training but its out-of-fold predictions "
@@ -608,6 +670,16 @@ def run_oof_and_checkpoint_verification(model_dir: str, labels_csv: str, best_sc
                 oof_fold = pd.read_csv(oof_path, dtype={"StudyInstanceUID": str})
                 if oof_fold["StudyInstanceUID"].duplicated().any():
                     raise ValueError(f"fold {fold} OOF file contains duplicate study IDs")
+                expected_ids = set(
+                    fold_table.loc[fold_table["fold"] == fold, "StudyInstanceUID"].astype(str)
+                )
+                actual_ids = set(oof_fold["StudyInstanceUID"].astype(str))
+                if actual_ids != expected_ids:
+                    raise ValueError(
+                        f"fold {fold} OOF study coverage mismatch: "
+                        f"missing={len(expected_ids - actual_ids)}, "
+                        f"unexpected={len(actual_ids - expected_ids)}"
+                    )
                 missing_predictions = {
                     f"pred_{target}" for target in config.TARGETS
                 } - set(oof_fold.columns)
@@ -622,11 +694,9 @@ def run_oof_and_checkpoint_verification(model_dir: str, labels_csv: str, best_sc
                 oof_fold["fold"] = fold
                 oof_frames.append(oof_fold)
         else:
-            if best_scores and fold in best_scores:
-                raise FileNotFoundError(f"fold {fold} training completed without {best_ckpt}")
-            print(f"  Fold {fold}: [MISSING] Best checkpoint not found in {fold_dir}")
+            raise FileNotFoundError(f"Requested fold {fold} has no best checkpoint: {best_ckpt}")
 
-    if best_scores:
+    if require_oof:
         if not oof_frames:
             raise RuntimeError("Training completed but no OOF prediction files were produced")
         oof = pd.concat(oof_frames, ignore_index=True)
@@ -692,6 +762,8 @@ def run_inference_phase(
     use_tta: bool = True,
     n_tta: int = 4,
     ensemble_checkpoints: list[str] | None = None,
+    batch_size: int = 4,
+    use_d4_target_weights: bool = False,
 ):
     print("\n" + "=" * 80)
     print("PHASE 5: TEST INFERENCE & SUBMISSION GENERATION (TTA; IDENTITY TEMPERATURE)")
@@ -740,7 +812,8 @@ def run_inference_phase(
         temperatures=all_temperatures,
         use_tta=use_tta,
         n_tta=n_tta,
-        batch=8,
+        batch=batch_size,
+        use_d4_target_weights=use_d4_target_weights,
     )
 
     # Acceptance verification
@@ -761,7 +834,7 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None, help="Directory for model checkpoints (defaults to work_dir)")
     
     # NLP Options
-    parser.add_argument("--nlp_engine", type=str, default="auto", choices=["auto", "vllm", "rules"], help="NLP extraction engine: 'auto' (detects vLLM/CUDA, else rules), 'vllm', or 'rules'")
+    parser.add_argument("--nlp_engine", type=str, default="auto", choices=["auto", "vllm", "rules"], help="NLP engine; auto uses rules when the configured vLLM model is outside the memory policy")
     parser.add_argument("--nlp_model", type=str, default="nvidia/Llama-3.1-Nemotron-70B-Instruct-HF", help="vLLM model ID for report extraction")
     parser.add_argument("--force_nlp", action="store_true", help="Force re-extraction of pseudo-labels from scratch")
     parser.add_argument(
@@ -775,6 +848,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=config.EPOCHS, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE, help="Batch size per step")
     parser.add_argument("--grad_accum", type=int, default=config.GRAD_ACCUM, help="Gradient accumulation steps")
+    parser.add_argument("--num_workers", type=int, default=config.NUM_WORKERS, help="Persistent training DataLoader workers")
+    parser.add_argument("--prefetch_factor", type=int, default=config.PREFETCH_FACTOR, help="Batches prefetched per training worker")
+    parser.add_argument("--eval_batch_size", type=int, default=config.EVAL_BATCH_SIZE, help="Gold validation and OOF batch size")
+    parser.add_argument("--preprocess_workers", type=int, default=config.PREPROCESS_WORKERS, help="CPU workers for DICOM indexing/cache construction")
+    parser.add_argument("--inference_batch_size", type=int, default=4, help="Study batch size for test inference")
     parser.add_argument("--n_windows_train", type=int, default=config.N_WINDOWS_TRAIN, help="Windows sampled per anatomical slot during training")
     parser.add_argument("--folds", type=str, default="0,1,2,3,4", help="Comma-separated list of folds to train (e.g. '0,1,2,3,4')")
     parser.add_argument("--model_type", choices=["dinov2", "coatnet_mil", "timm_mil"], default="dinov2", help="Training architecture family")
@@ -788,13 +866,36 @@ def main():
     )
     parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
     parser.add_argument(
+        "--d4_target_weights",
+        action="store_true",
+        help="Use D4's target-specific DINO/CoAtNet weights instead of equal family-rank blending",
+    )
+    parser.add_argument(
         "--ensemble_checkpoints",
         nargs="+",
         default=None,
         help="Additional trained checkpoints; with DINOv2 and CoAtNet, applies the d4 target-specific rank blend",
     )
-    parser.add_argument("--max_ram_gb", type=float, default=getattr(config, "CIRCUIT_BREAKER_MAX_RAM_GB", 118.0), help="Unified memory hard safety limit in GB before clean shutdown (default: 118.0)")
+    parser.add_argument("--max_ram_gb", type=float, default=config.CIRCUIT_BREAKER_MAX_RAM_GB, help="Unified-memory hard safety ceiling in GiB (default: 100 GiB)")
     args = parser.parse_args()
+
+    if (
+        args.batch_size < 1 or args.grad_accum < 1 or args.num_workers < 0
+        or args.prefetch_factor < 1 or args.eval_batch_size < 1
+        or args.preprocess_workers < 1 or args.inference_batch_size < 1
+        or args.n_windows_train < 1 or args.epochs < 1 or args.max_ram_gb <= 0
+    ):
+        parser.error("batch/epoch/window/worker settings and the RAM ceiling must be positive (num_workers may be zero)")
+    fold_tokens = [token.strip() for token in args.folds.split(",")]
+    if any(not token.isdigit() for token in fold_tokens):
+        parser.error("--folds must contain only comma-separated integer IDs")
+    folds_to_run = [int(token) for token in fold_tokens]
+    if (
+        not folds_to_run
+        or len(folds_to_run) != len(set(folds_to_run))
+        or any(fold not in range(5) for fold in folds_to_run)
+    ):
+        parser.error("--folds must be a non-empty, comma-separated set of unique IDs from 0 through 4")
 
     if args.variant is None:
         args.variant = (
@@ -807,7 +908,7 @@ def main():
         if missing_checkpoints:
             parser.error(f"ensemble checkpoint files not found: {missing_checkpoints}")
 
-    if hasattr(args, "max_ram_gb") and args.max_ram_gb:
+    if args.max_ram_gb:
         config.CIRCUIT_BREAKER_MAX_RAM_GB = args.max_ram_gb
         os.environ["RSNA_MAX_RAM_GB"] = str(args.max_ram_gb)
 
@@ -858,7 +959,8 @@ def main():
 
     # Phase 2: Dataset Merge & Cache Build
     labels_csv, cache_prefix, folds_csv = run_preparation(
-        data_root, work_dir, pseudo_csv, force=args.fresh_preprocessing
+        data_root, work_dir, pseudo_csv, force=args.fresh_preprocessing,
+        workers=args.preprocess_workers,
     )
 
     # Check if cache is built (if download is in progress, cache_prefix is None)
@@ -881,7 +983,6 @@ def main():
         return
 
     # Phase 3: 5-Fold Training
-    folds_to_run = [int(f.strip()) for f in args.folds.split(",") if f.strip().isdigit()]
     best_scores = {}
     try:
         if not args.skip_train:
@@ -894,6 +995,9 @@ def main():
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 grad_accum=args.grad_accum,
+                num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                eval_batch_size=args.eval_batch_size,
                 n_windows_train=args.n_windows_train,
                 variant=args.variant,
                 model_type=args.model_type,
@@ -901,7 +1005,14 @@ def main():
             )
 
         # Phase 4: OOF & Checkpoints + Temperature Calibration
-        valid_ckpts, fold_temperatures = run_oof_and_checkpoint_verification(model_dir, labels_csv, best_scores)
+        valid_ckpts, fold_temperatures = run_oof_and_checkpoint_verification(
+            model_dir=model_dir,
+            labels_csv=labels_csv,
+            folds_csv=folds_csv,
+            requested_folds=folds_to_run,
+            best_scores=best_scores,
+            require_oof=not args.skip_train,
+        )
 
         # Phase 5: Test Inference & Submission Generation (TTA + Calibrated)
         run_inference_phase(
@@ -912,19 +1023,21 @@ def main():
             use_tta=(not args.no_tta),
             n_tta=4,
             ensemble_checkpoints=args.ensemble_checkpoints,
+            batch_size=args.inference_batch_size,
+            use_d4_target_weights=args.d4_target_weights,
         )
     except MemoryCircuitBreakerTriggered as mem_err:
         print("\n" + "=" * 80, flush=True)
-        print(" [MASTER PIPELINE HALTED] 118 GB UNIFIED MEMORY SAFETY CIRCUIT BREAKER ACTIVATED", flush=True)
+        print(" [MASTER PIPELINE HALTED] UNIFIED MEMORY SAFETY CIRCUIT BREAKER ACTIVATED", flush=True)
         print(f" Current Memory Usage: {mem_err.used_gb:.2f} GB (Threshold: {mem_err.threshold_gb:.2f} GB)", flush=True)
-        print(" Pipeline was closed cleanly to prevent DGX kernel hard-lockup / crash.", flush=True)
+        print(f" Pipeline stopped with {mem_err.details.get('available_gb', 0.0):.1f} GiB available; recovery headroom protected.", flush=True)
         print(" All memory allocations and GPU caches have been completely flushed.", flush=True)
         print("=" * 80, flush=True)
         print(" RESTART INSTRUCTIONS:", flush=True)
         print("   1. Drop Linux filesystem page caches on the DGX host:", flush=True)
         print("        sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches", flush=True)
         print("   2. Re-start the training pipeline:", flush=True)
-        print(f"        python src/main.py --folds {args.folds}", flush=True)
+        print(f"        python src/main.py --folds {args.folds} --model_dir <fresh-model-dir>", flush=True)
         print("=" * 80 + "\n", flush=True)
         sys.exit(101)
 

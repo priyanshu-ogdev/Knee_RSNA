@@ -18,7 +18,8 @@ class RSNADataset(Dataset):
 
     def __init__(self, df, cache_prefix, cfg=None, is_train=False, n_windows_use=None, seed=config.SEED, aug=True):
         self.prefix, self.cfg = cache_prefix, cfg or cache_mod.cfg_of(cache_prefix)   # default: the cache's own config
-        self.is_train, self.n_use, self.seed, self.aug, self.epoch = is_train, n_windows_use, seed, 0, 0
+        self.is_train, self.n_use, self.seed, self.aug = is_train, n_windows_use, seed, aug
+        self.epoch = torch.zeros((), dtype=torch.int64).share_memory_()
         with open(f'{cache_prefix}.meta.json') as fh:
             studies = json.load(fh)['studies']
         available = set(studies)
@@ -28,7 +29,7 @@ class RSNADataset(Dataset):
         self._cache = None
 
     def set_epoch(self, e):
-        self.epoch = int(e)
+        self.epoch.fill_(int(e))
 
     def __len__(self):
         return len(self.rows)
@@ -36,7 +37,7 @@ class RSNADataset(Dataset):
     def __getitem__(self, k):
         if self._cache is None:
             self._cache = cache_mod.StudyCache(self.prefix, 'r')
-        rng = np.random.default_rng([self.seed, self.epoch, int(k)])
+        rng = np.random.default_rng([self.seed, int(self.epoch.item()), int(k)])
         imgs, slot, wm = loader.make_sample(self._cache, int(self.rows[k]), self.cfg, self.is_train, self.n_use, rng, self.aug)
         return (torch.from_numpy(imgs), torch.from_numpy(slot).float(), torch.from_numpy(wm).float(),
                 torch.from_numpy(self.Y[k]), torch.from_numpy(self.Wt[k]))

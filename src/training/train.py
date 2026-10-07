@@ -488,8 +488,8 @@ def run_training(
             )
             score, per = evaluate(model, dl_va, device)
             msg += f"  val macro-AUC {score:.4f}"
-            top3 = sorted(per.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            msg += "  top3=[" + ", ".join(f"{k}:{v:.3f}" for k, v in top3) + "]"
+            all_conds = ", ".join(f"{k}:{v:.3f}" for k, v in sorted(per.items()))
+            msg += f"\n       Per-target AUCs ({len(per)}/12 evaluated): [{all_conds}]"
             
             # 4. IMMEDIATE PURGE of validation DataLoader
             del dl_va

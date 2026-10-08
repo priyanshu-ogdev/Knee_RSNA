@@ -77,7 +77,7 @@ def main():
     
     target_aucs = []
     for t in TARGETS:
-        mask = merged[f"{t}_weight_pred"].values > 0.0
+        mask = merged[f"{t}_weight"].values > 0.0
         y_true = merged[f"{t}_true"].values[mask]
         y_pred = merged[f"{t}_pred"].values[mask]
         if len(set(y_true)) > 1:
@@ -100,7 +100,7 @@ def main():
         print(f"\nLanguage: {lang} (N={len(lang_df)})")
         lang_aucs = []
         for t in TARGETS:
-            mask_l = lang_df[f"{t}_weight_pred"].values > 0.0
+            mask_l = lang_df[f"{t}_weight"].values > 0.0
             y_true_l = lang_df[f"{t}_true"].values[mask_l]
             y_pred_l = lang_df[f"{t}_pred"].values[mask_l]
             if len(set(y_true_l)) > 1:

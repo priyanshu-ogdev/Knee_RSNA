@@ -2,8 +2,9 @@ import os
 import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score
+import argparse
 import time
-from src.data.preprocess.nlp_extractor import extract_by_rules, TARGETS
+from src.data.preprocess.nlp_extractor import auto_complete_extraction, TARGETS
 
 def detect_language(report: str) -> str:
     r_lower = report.lower()
@@ -26,23 +27,39 @@ def detect_language(report: str) -> str:
     return 'English'
 
 def main():
-    train_df = pd.read_csv(os.path.join("D:/Knee_RSNA/data", 'train.csv'))
-    gold_df = train_df[train_df['ACL'].notna()].copy()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, default="data")
+    parser.add_argument("--engine", type=str, default="vllm", choices=["vllm"])
+    args = parser.parse_args()
+
+    train_df = pd.read_csv(os.path.join(args.data_root, 'train.csv'))
     
+    # Isolate 58 Gold studies
+    gold_df = train_df[train_df['ACL'].notna()].copy()
     print(f"Isolated {len(gold_df)} gold studies for evaluation.")
     
+    temp_dir = "temp_gold_eval"
+    os.makedirs(temp_dir, exist_ok=True)
+    gold_df.to_csv(os.path.join(temp_dir, 'train.csv'), index=False)
+    
+    out_csv = os.path.join(temp_dir, 'gold_extractions.csv')
+    
+    print(f"Running NLP Extractor (Engine: {args.engine})...")
     start_time = time.time()
     
-    extracted_rows = []
-    for idx, row in gold_df.iterrows():
-        out = extract_by_rules(row['Report'], row['StudyInstanceUID'])
-        extracted_rows.append(out)
-        
-    extracted_df = pd.DataFrame(extracted_rows)
+    # Pass evaluate=True to bypass the fully_labeled_mask skip logic
+    out_path, stats = auto_complete_extraction(
+        data_root=temp_dir,
+        out_csv=out_csv,
+        engine=args.engine,
+        force=True,
+        evaluate=True
+    )
     
     elapsed = time.time() - start_time
+    extracted_df = pd.read_csv(out_path)
     print(f"Extraction completed in {elapsed:.2f} seconds.")
-    print(f"Average time per report: {elapsed / len(gold_df):.4f} seconds.")
+    print(f"Average time per report: {elapsed / len(gold_df):.2f} seconds.")
     
     merged = pd.merge(gold_df, extracted_df, on="StudyInstanceUID", suffixes=("_true", "_pred"))
     
@@ -53,7 +70,7 @@ def main():
     merged['Language'] = merged['Report'].apply(detect_language)
     
     print("\n" + "="*50)
-    print("OVERALL METRICS (RULES ENGINE)")
+    print(f"OVERALL METRICS ({args.engine.upper()} ENGINE)")
     print("="*50)
     
     target_aucs = []

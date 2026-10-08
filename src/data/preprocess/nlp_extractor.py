@@ -308,7 +308,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 # Shield 2: Anatomical Cross-Talk Prevention
                 # ---------------------------------------------------------------------
                 # ACL vs PCL
-                elif t == "ACL":
+                if t == "ACL":
                     pcl_terms = ["posterior cruciate", "pcl", "achterste kruisband", "akb", "hinteres kreuzband", "hkb", "cruzado posterior", "lcp", "croise posterieur", "croisé postérieur"]
                     acl_terms = ["anterior", "acl", "voorste", "vkb", "vorderes", "lca", "croise anterieur", "croisé antérieur"]
                     if any(p in q_low for p in pcl_terms) and not any(a in q_low for a in acl_terms):
@@ -759,64 +759,14 @@ NEG_WORDS = [
     r"\bbez\b", r"\bne\b", r"\bnema\b", r"\bnije\b", r"\bodsutan\b",
     r"\bнет\b", r"\bотсутствует\b"]
 
-def extract_by_rules(report: str, uid: str) -> dict:
-    """Fast, deterministic Clinical Shield Heuristic Extractor applying verified multilingual clinical logic."""
-    rep_low = str(report).lower()
-    out = {"StudyInstanceUID": str(uid).strip()}
-    
-    for t in TARGETS:
-        rule = CLINICAL_RULES[t]
-        pos_found = False
-        neg_found = False
-        
-        for pat in rule["neg"]:
-            if re.search(pat, rep_low, flags=re.IGNORECASE):
-                neg_found = True
-                break
-                
-        for pat in rule["pos"]:
-            m = re.search(pat, rep_low, flags=re.IGNORECASE)
-            if m:
-                # Look at 40 chars before the match specifically for negation
-                start_pre = max(0, m.start() - 40)
-                pre_snippet = rep_low[start_pre:m.start()]
-                
-                # Check snippet window
-                start_full = max(0, m.start() - 30)
-                end_full = min(len(rep_low), m.end() + 30)
-                full_snippet = rep_low[start_full:end_full]
-                
-                if any(h in full_snippet for h in HEDGING_PHRASES):
-                    continue
-                if any(re.search(x, full_snippet, flags=re.IGNORECASE) for x in rule["crosstalk_exclude"]):
-                    continue
-                    
-                # Exact word-boundary negation check BEFORE the positive match
-                if any(re.search(neg, pre_snippet, flags=re.IGNORECASE) for neg in NEG_WORDS):
-                    neg_found = True
-                    continue
-                    
-                pos_found = True
-                break
-                
-        if pos_found and not neg_found:
-            out[t], out[f"{t}_weight"] = 1.0, 0.5
-        elif neg_found:
-            out[t], out[f"{t}_weight"] = 0.0, 0.5
-        else:
-            if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
-                out[t], out[f"{t}_weight"] = 0.0, 0.0
-            else:
-                out[t], out[f"{t}_weight"] = 0.0, 0.0
-                
-    return out
+
 
 
 def auto_complete_extraction(
     data_root: str,
     out_csv: str,
     model_id: str | None = None,
-    engine: str = "auto",
+    engine: str = "vllm",
     force: bool = False,
     chunk_size: int = 50,
     evaluate: bool = False,
@@ -887,21 +837,10 @@ def auto_complete_extraction(
         re.search(r"(?:^|[-_/])7[0-9]b(?:[-_/]|$)", requested_model.lower()) is not None
         and quantization not in {"fp8", "fp8_e4m3", "fp8_e5m2"}
     )
-    if selected_engine == "auto":
-        selected_engine = (
-            "vllm"
-            if LLM is not None and torch.cuda.is_available() and not large_unquantized_model
-            else "rules"
-        )
-        if large_unquantized_model:
-            print(
-                "[SAFETY] Auto-selected clinical rules instead of unquantized 70B/72B vLLM. "
-                "Use an explicitly supported quantization or a smaller model to enable vLLM."
-            )
-    if selected_engine not in {"vllm", "rules"}:
-        raise ValueError(f"Unsupported NLP extraction engine: {engine!r}")
-    if selected_engine == "vllm" and LLM is None:
-        raise ImportError("vLLM was requested but is not installed; refusing to switch to rules labels")
+    if selected_engine != "vllm":
+        raise ValueError("Only 'vllm' engine is supported. Rules engine has been removed for accuracy.")
+    if LLM is None:
+        raise ImportError("vLLM is required but not installed.")
     if selected_engine == "vllm" and large_unquantized_model:
         raise ValueError(
             "Refusing to load the 70B/72B NLP model without FP8 quantization: its unquantized "
@@ -1180,46 +1119,6 @@ def auto_complete_extraction(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                
-    if selected_engine == "rules":
-        completed_uids = {r['StudyInstanceUID'] for r in results if isinstance(r, dict) and 'StudyInstanceUID' in r}
-        rules_df = needed_df[~needed_df['StudyInstanceUID'].isin(completed_uids)].copy()
-        print(f"[INFO] Running Clinical Shield Heuristic Extractor on {len(rules_df)} reports...")
-        n_processed = 0
-        for i, (_, row) in enumerate(rules_df.iterrows()):
-            uid = str(row['StudyInstanceUID']).strip()
-            rep = str(row["_report_text"])
-            res = extract_by_rules(rep, uid)
-            res.update(
-                report_sha256=_report_sha256(rep),
-                extractor_version=EXTRACTOR_VERSION,
-                engine=selected_engine,
-                model_id=resolved_model,
-                prompt_sha256=prompt_sha256,
-            )
-            results.append(res)
-            n_processed += 1
-            
-            if n_processed % 500 == 0 or n_processed == len(rules_df):
-                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
-                _atomic_csv(df_out, out_csv)
-                saved_rows = _validated_extraction_rows(
-                    df_out,
-                    needed_uids,
-                    report_hashes,
-                    {
-                        "extractor_version": EXTRACTOR_VERSION,
-                        "engine": selected_engine,
-                        "model_id": resolved_model,
-                        "prompt_sha256": prompt_sha256,
-                    },
-                )
-                _atomic_json(
-                    manifest_path,
-                    {**contract, "status": "in_progress", "completed_studies": len(saved_rows)},
-                )
-                pct = (len(df_out) / total_needed) * 100
-                print(f"[CHECKPOINT] Extracted {len(df_out)} / {total_needed} ({pct:.1f}%) -> {out_csv}")
                 
     final_df = (
         pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')

@@ -257,6 +257,10 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                             "exact_quote": quote_match.group(1).strip() if quote_match else ""
                         }
             
+        found_targets = sum(1 for t in TARGETS if t in normalized_data)
+        if found_targets < 6:
+            return None
+
         for t in TARGETS:
             val = normalized_data.get(t, {})
             raw_state = val.get("state") if isinstance(val, dict) else None
@@ -316,86 +320,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 
             if is_present:
                 # ---------------------------------------------------------------------
-                # Shield 2: Anatomical Cross-Talk Prevention
-                # ---------------------------------------------------------------------
-                # ACL vs PCL
-                if t == "ACL":
-                    pcl_terms = ["posterior cruciate", "pcl", "achterste kruisband", "akb", "hinteres kreuzband", "hkb", "cruzado posterior", "lcp", "croise posterieur", "croisé postérieur"]
-                    acl_terms = ["anterior", "acl", "voorste", "vkb", "vorderes", "lca", "croise anterieur", "croisé antérieur"]
-                    if any(p in q_low for p in pcl_terms) and not any(a in q_low for a in acl_terms):
-                        is_present = False
-                
-                # MCL vs LCL & MPFL
-                elif t == "MCL":
-                    lcl_terms = ["lateral collateral", "lcl", "fcl", "fibular collateral", "laterale band", "aussenband", "außenband", "colateral lateral", "colateral externo", "lce", "collatéral latéral"]
-                    mcl_terms = ["medial", "mcl", "binnenband", "innenband", "colateral medial", "colateral interno", "lcm", "collatéral médial"]
-                    if any(l in q_low for l in lcl_terms) and not any(m in q_low for m in mcl_terms):
-                        is_present = False
-                        
-                    mpfl_terms = ["mpfl", "patellofemoral ligament", "patelofemoral", "medial retinaculum", "retináculo medial", "retinaculo medial", "mediale retinaculum"]
-                    mcl_specific = ["collateral", "colateral", "mcl", "tibiaal", "tibial", "binnenband", "innenband"]
-                    if any(mp in q_low for mp in mpfl_terms) and not any(ms in q_low for ms in mcl_specific):
-                        is_present = False
-
-                # Medial Meniscus vs Lateral Meniscus
-                elif t == "Medial Meniscus":
-                    lm_terms = ["lateral meniscus", "lateralen meniskus", "buitenmeniscus", "menisco lateral", "menisco externo", "menisque lateral"]
-                    mm_terms = ["medial", "innenmeniskus", "binnenmeniscus", "menisco medial", "menisco interno", "menisque medial"]
-                    if any(lm in q_low for lm in lm_terms) and not any(mm in q_low for mm in mm_terms):
-                        is_present = False
-
-                elif t == "Lateral Meniscus":
-                    mm_terms = ["medial meniscus", "medialen meniskus", "binnenmeniscus", "innenmeniskus", "menisco medial", "menisco interno", "menisque medial"]
-                    lm_terms = ["lateral", "aussenmeniskus", "außenmeniskus", "buitenmeniscus", "externo", "externe"]
-                    if any(mm in q_low for mm in mm_terms) and not any(lm in q_low for lm in lm_terms):
-                        is_present = False
-
-                # Grade 1 / Grade 2 Intrameniscal Degeneration Shield (Non-tear signal)
-                if is_present and t in ["Medial Meniscus", "Lateral Meniscus"]:
-                    grade_terms = ["grade 1", "grade i", "grade 2", "grade ii", "grad 1", "grad i", "grad 2", "grad ii", "intrameniscal", "intrameniscale", "myxoid", "myxoide"]
-                    no_tear_terms = ["without surface", "no surface extension", "no tear", "ohne riss", "zonder scheur", "sin rotura", "no articular", "sin extension", "sin extensión", "zonder doorbraak", "intact surface"]
-                    if any(g in q_low for g in grade_terms) and any(nt in q_low for nt in no_tear_terms):
-                        is_present = False
-                        is_absent = True
-
-                # Physiological Fluid Shield for Effusion
-                if is_present and t == "Effusion":
-                    phys_terms = ["physiological", "minimal trace", "trace fluid", "no effusion", "kein erguss", "geen hydrops", "sin derrame", "fisiológico", "fisiologico", "fysiologische"]
-                    heavy_terms = ["moderate", "large", "marked", "copious", "severo", "groot", "ausgeprägt", "substantieel"]
-                    if any(p in q_low for p in phys_terms) and not any(h in q_low for h in heavy_terms):
-                        is_present = False
-                        is_absent = True
-
-                # ---------------------------------------------------------------------
-                # Shield 3: Multi-Lingual Hedging & Uncertainty Demotion
-                # ---------------------------------------------------------------------
-                if is_present:
-                    hedging_phrases = [
-                        # English
-                        "cannot exclude", "cannot rule out", "suspected", "questionable", "possible", 
-                        "borderline", "differential diagnosis", "may represent", "inconclusive", "not definitely",
-                        # Spanish
-                        "no descartable", "sospecha", "cuestionable", "no se puede descartar", "dudoso", "dudosa",
-                        # Dutch
-                        "niet uit te sluiten", "niet geheel uit te sluiten", "verdacht", "mogelijk", "twijfelachtig", "geen zekere",
-                        # German
-                        "nicht auszuschliessen", "nicht auszuschließen", "fraglich", "differenzialdiagnose", "v.a.", "verdacht auf", "unklar",
-                        # French
-                        "ne peut etre exclu", "ne peut être exclu", "douteux", "douteuse", "suspect",
-                        # Greek
-                        "δεν μπορεί να αποκλειστεί", "πιθανή", "αμφίβολ", "ύποπτ"
-                        # Turkish
-                        "şüpheli", "olası", "dışlanamaz", "kuşkulu", "belirsiz",
-                        # Croatian/Serbian/Bosnian
-                        "sumnjivo", "moguće", "ne može se isključiti", "suspektno", "vjerojatno",
-                        # Russian
-                        "подозрение", "вероятно", "не исключено", "возможно", "сомнительно"
-                    ]
-                    if any(h in q_low for h in hedging_phrases):
-                        is_present = False
-
-                # ---------------------------------------------------------------------
-                # Shield 5: Grounding Verification Against Original Report
+                  # Shield 5: Grounding Verification Against Original Report
                 # ---------------------------------------------------------------------
                 if (is_present or is_absent) and original_report:
                     clean_q = clean_txt(exact_quote)

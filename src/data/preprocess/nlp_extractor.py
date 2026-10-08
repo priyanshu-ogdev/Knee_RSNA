@@ -471,6 +471,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
         max_model_len=16384,
         tensor_parallel_size=tp_size,
         gpu_memory_utilization=gpu_util,
+            trust_remote_code=True,
         **llm_kwargs
     )
     
@@ -980,6 +981,7 @@ def auto_complete_extraction(
                 max_model_len=16384,
                 tensor_parallel_size=1,
                 gpu_memory_utilization=gpu_util,
+            trust_remote_code=True,
                 **llm_kwargs
             )
             import json

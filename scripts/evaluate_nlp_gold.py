@@ -75,8 +75,9 @@ def main():
     
     target_aucs = []
     for t in TARGETS:
-        y_true = merged[f"{t}_true"].values
-        y_pred = merged[f"{t}_pred"].values
+        mask = merged[f"{t}_weight_pred"].values > 0.0
+        y_true = merged[f"{t}_true"].values[mask]
+        y_pred = merged[f"{t}_pred"].values[mask]
         if len(set(y_true)) > 1:
             auc = roc_auc_score(y_true, y_pred)
             f1 = f1_score(y_true, (y_pred >= 0.5).astype(int))
@@ -97,8 +98,9 @@ def main():
         print(f"\nLanguage: {lang} (N={len(lang_df)})")
         lang_aucs = []
         for t in TARGETS:
-            y_true_l = lang_df[f"{t}_true"].values
-            y_pred_l = lang_df[f"{t}_pred"].values
+            mask_l = lang_df[f"{t}_weight_pred"].values > 0.0
+            y_true_l = lang_df[f"{t}_true"].values[mask_l]
+            y_pred_l = lang_df[f"{t}_pred"].values[mask_l]
             if len(set(y_true_l)) > 1:
                 try:
                     auc = roc_auc_score(y_true_l, y_pred_l)

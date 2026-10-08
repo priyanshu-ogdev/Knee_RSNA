@@ -196,10 +196,13 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         try:
             data = json.loads(clean_json_sanitized)
         except json.JSONDecodeError:
-            # Fallback using ast.literal_eval for non-strict python-like dicts
-            import ast
-            ast_str = clean_json_sanitized.replace('true', 'True').replace('false', 'False').replace('null', 'None')
-            data = ast.literal_eval(ast_str)
+            try:
+                # Fallback using ast.literal_eval for non-strict python-like dicts
+                import ast
+                ast_str = clean_json_sanitized.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+                data = ast.literal_eval(ast_str)
+            except Exception:
+                data = None
             
         out = {"StudyInstanceUID": str(uid).strip()}
         
@@ -211,10 +214,26 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         target_map = {normalize_key(t): t for t in TARGETS}
         
         normalized_data = {}
-        for k, v in data.items():
-            norm_k = normalize_key(k)
-            if norm_k in target_map:
-                normalized_data[target_map[norm_k]] = v
+        if data is not None:
+            for k, v in data.items():
+                norm_k = normalize_key(k)
+                if norm_k in target_map:
+                    normalized_data[target_map[norm_k]] = v
+        else:
+            # SOTA Fallback: Regex parsing if JSON/AST completely fails (e.g. unescaped newlines, broken quotes)
+            for t in TARGETS:
+                escaped_t = re.escape(t)
+                pattern = rf'["\']?{escaped_t}["\']?\s*:\s*\{{([^}}]+)\}}'
+                match = re.search(pattern, raw_text, re.IGNORECASE)
+                if match:
+                    inner = match.group(1)
+                    state_match = re.search(r'["\']?state["\']?\s*:\s*["\']([^"\']+)["\']', inner, re.IGNORECASE)
+                    quote_match = re.search(r'["\']?exact_quote["\']?\s*:\s*["\']([^"\']*)["\']', inner, re.IGNORECASE)
+                    if state_match:
+                        normalized_data[t] = {
+                            "state": state_match.group(1).strip(),
+                            "exact_quote": quote_match.group(1).strip() if quote_match else ""
+                        }
             
         for t in TARGETS:
             val = normalized_data.get(t, {})

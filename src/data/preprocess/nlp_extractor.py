@@ -362,18 +362,18 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
             conf_str = str(v.get('confidence', '')).lower()
             if is_present:
                 if 'high' in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.95, 0.5
+                    out[t], out[f"{t}_weight"] = 0.95, 1.0
                 elif 'low' in conf_str:
                     out[t], out[f"{t}_weight"] = 0.65, 0.5
                 else:
-                    out[t], out[f"{t}_weight"] = 0.85, 0.5
+                    out[t], out[f"{t}_weight"] = 0.85, 0.85
             elif is_absent:
                 if 'high' in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.05, 0.5
+                    out[t], out[f"{t}_weight"] = 0.05, 1.0
                 elif 'low' in conf_str:
                     out[t], out[f"{t}_weight"] = 0.35, 0.5
                 else:
-                    out[t], out[f"{t}_weight"] = 0.15, 0.5
+                    out[t], out[f"{t}_weight"] = 0.15, 0.85
             else:
                 # not_stated / hedged / missing
                 if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
@@ -1320,7 +1320,8 @@ if __name__ == '__main__':
         
         target_aucs = []
         for t in TARGETS:
-            mask = merged[f"{t}_weight"].values > 0.0
+            # FIX: Evaluate on all gold studies where truth is known, do NOT let the model's weight mask its own mistakes!
+            mask = ~merged[f"{t}_true"].isna().values
             y_true = merged[f"{t}_true"].values[mask]
             y_pred = merged[f"{t}_pred"].values[mask]
             if len(set(y_true)) > 1:
@@ -1343,7 +1344,7 @@ if __name__ == '__main__':
             print(f"\nLanguage: {lang} (N={len(lang_df)})")
             lang_aucs = []
             for t in TARGETS:
-                mask_l = lang_df[f"{t}_weight"].values > 0.0
+                mask_l = ~lang_df[f"{t}_true"].isna().values
                 y_true_l = lang_df[f"{t}_true"].values[mask_l]
                 y_pred_l = lang_df[f"{t}_pred"].values[mask_l]
                 if len(set(y_true_l)) > 1:

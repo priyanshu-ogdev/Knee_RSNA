@@ -148,12 +148,12 @@ CLINICAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
 EXAMPLES:
 Report (Turkish): "Ön çapraz bağ sağlamdır. Medial menisküs arka boynuzunda yırtık izlendi. Eklem mesafesinde minimal efüzyon."
 Output:
-{
-  "ACL": {"reasoning": "Ön çapraz bağ (ACL) is described as sağlamdır (intact/normal).", "exact_quote": "Ön çapraz bağ sağlamdır.", "state": "absent"},
-  "Medial Meniscus": {"reasoning": "Medial menisküs arka boynuzunda (medial meniscus posterior horn) has a yırtık (tear).", "exact_quote": "Medial menisküs arka boynuzunda yırtık izlendi.", "state": "present"},
-  "Effusion": {"reasoning": "Minimal efüzyon (minimal effusion) is present, which is trace/physiological.", "exact_quote": "Eklem mesafesinde minimal efüzyon.", "state": "absent"},
-  "MCL": {"reasoning": "No mention of medial collateral ligament.", "exact_quote": "None", "state": "not_stated"}
-}
+{{
+  "ACL": {{"reasoning": "Ön çapraz bağ (ACL) is described as sağlamdır (intact/normal).", "exact_quote": "Ön çapraz bağ sağlamdır.", "state": "absent"}},
+  "Medial Meniscus": {{"reasoning": "Medial menisküs arka boynuzunda (medial meniscus posterior horn) has a yırtık (tear).", "exact_quote": "Medial menisküs arka boynuzunda yırtık izlendi.", "state": "present"}},
+  "Effusion": {{"reasoning": "Minimal efüzyon (minimal effusion) is present, which is trace/physiological.", "exact_quote": "Eklem mesafesinde minimal efüzyon.", "state": "absent"}},
+  "MCL": {{"reasoning": "No mention of medial collateral ligament.", "exact_quote": "None", "state": "not_stated"}}
+}}
 
 REPORT:
 {report}
@@ -372,6 +372,12 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                         "ne peut etre exclu", "ne peut être exclu", "douteux", "douteuse", "suspect",
                         # Greek
                         "δεν μπορεί να αποκλειστεί", "πιθανή", "αμφίβολ", "ύποπτ"
+                        # Turkish
+                        "şüpheli", "olası", "dışlanamaz", "kuşkulu", "belirsiz",
+                        # Croatian/Serbian/Bosnian
+                        "sumnjivo", "moguće", "ne može se isključiti", "suspektno", "vjerojatno",
+                        # Russian
+                        "подозрение", "вероятно", "не исключено", "возможно", "сомнительно"
                     ]
                     if any(h in q_low for h in hedging_phrases):
                         is_present = False
@@ -747,7 +753,10 @@ NEG_WORDS = [
     r"\bno\b", r"\bsin\b", r"\bgeen\b", r"\bkein\b", r"\bkeine\b", r"\bkeinen\b",
     r"\bwithout\b", r"\bnot seen\b", r"\babsent\b", r"\baucun\b", r"\baucune\b",
     r"\bpas de\b", r"\babsence de\b"
-]
+,
+    r"\byok\b", r"\byoktur\b", r"\bizlenmedi\b", r"\bgörülmedi\b", r"\bdeğil\b", r"\bolmadan\b",
+    r"\bbez\b", r"\bne\b", r"\bnema\b", r"\bnije\b", r"\bodsutan\b",
+    r"\bнет\b", r"\bотсутствует\b"]
 
 def extract_by_rules(report: str, uid: str) -> dict:
     """Fast, deterministic Clinical Shield Heuristic Extractor applying verified multilingual clinical logic."""
@@ -809,6 +818,7 @@ def auto_complete_extraction(
     engine: str = "auto",
     force: bool = False,
     chunk_size: int = 50,
+    evaluate: bool = False,
 ) -> tuple[str, dict]:
     """Unified Auto-Detection & Completion Engine for NLP Pseudo-Labels.
     
@@ -847,7 +857,7 @@ def auto_complete_extraction(
         
     reports = train_df[report_col].fillna("").astype(str)
     report_present = reports.str.strip().ne("")
-    needed_df = train_df[~fully_labeled_mask & report_present].copy()
+    needed_df = train_df[report_present].copy() if evaluate else train_df[~fully_labeled_mask & report_present].copy()
     needed_df["_report_text"] = reports.loc[needed_df.index]
     total_needed = len(needed_df)
     needed_uids = set(needed_df['StudyInstanceUID'])

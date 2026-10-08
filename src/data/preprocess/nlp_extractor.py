@@ -163,16 +163,16 @@ GENERAL RULES:
 5. "confidence": EXACTLY ONE of ["high", "medium", "low"].
 
 MULTI-LINGUAL HINTS:
-- Turkish: yırtık/zedelenme=present, sağlam/normal/izlenmedi=absent.
-- Croatian/Serbian: ruptura/lezija=present, uredno/intaktno=absent.
-- Russian/Bulgarian: разрыв/повреждение=present, норма/без изменений=absent.
-- Greek: ρήξη=present, φυσιολογικό=absent.
-- German: Kreuzband=ACL, Erguss=Effusion, keine Ruptur/intakt=absent.
-- Spanish: LCA=ACL, derrame=effusion, sin rotura=absent.
-- Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, geen scheur=absent.
-- French: LCA=ACL, épanchement=effusion, sans fissure=absent.
-
-EXAMPLES:
+  - Turkish: yırtık/zedelenme=present, sağlam/normal/izlenmedi=absent.
+  - Croatian/Serbian: ruptura/lezija=present, uredno/intaktno=absent.
+  - Russian/Bulgarian: разрыв/повреждение=present, норма/интактный=absent.
+  - Greek: ρήξη=present, φυσιολογικό=absent.
+  - German: Kreuzband=ACL, Erguss=Effusion, keine Ruptur/intakt=absent.
+  - Spanish: LCA=ACL, derrame=effusion, sin rotura=absent.
+  - Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, geen scheur=absent.
+  - French: LCA=ACL, épanchement=effusion, sans fissure=absent.
+  
+  EXAMPLES:
 Report (English): "Anterior cruciate ligament is completely torn. Menisci are unremarkable. Minimal physiological joint fluid."
 Output:
 {{
@@ -1225,36 +1225,143 @@ def auto_complete_extraction(
     }
 
 
-if __name__ == "__main__":
+
+def detect_language(report: str) -> str:
+    r_lower = report.lower()
+    if 'sağlam' in r_lower or 'yırtık' in r_lower or 'eklem' in r_lower:
+        return 'Turkish'
+    if 'ruptura' in r_lower or 'meniskus' in r_lower or 'ligament' in r_lower:
+        return 'Croatian/Serbian'
+    if 'разрыв' in r_lower or 'повреждение' in r_lower or 'норма' in r_lower:
+        return 'Russian'
+    if 'ρήξη' in r_lower or 'φυσιολογικό' in r_lower:
+        return 'Greek'
+    if 'rotura' in r_lower or 'derrame' in r_lower:
+        return 'Spanish'
+    if 'scheur' in r_lower or 'geen' in r_lower:
+        return 'Dutch'
+    if 'ruptur' in r_lower or 'erguss' in r_lower or 'kein' in r_lower:
+        return 'German'
+    if 'rupture' in r_lower or 'épanchement' in r_lower or 'sans' in r_lower:
+        return 'French'
+    return 'English'
+
+if __name__ == '__main__':
+    import argparse
     import kagglehub
-    # Dynamically resolve project root relative to this script
+    import time
+    from sklearn.metrics import roc_auc_score, f1_score
+    
+    parser = argparse.ArgumentParser(description="Run LLM NLP Label Extractor")
+    parser.add_argument("--evaluate", action="store_true", help="Run in gold-evaluation mode to output ROC-AUC metrics")
+    parser.add_argument("--data_root", type=str, default="", help="Path to RSNA dataset directory")
+    parser.add_argument("--engine", type=str, default="vllm", choices=["vllm"], help="LLM engine to use")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-72B-Instruct", help="LLM HuggingFace ID")
+    parser.add_argument("--force", action="store_true", help="Force complete regeneration of all labels")
+    args = parser.parse_args()
+
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
     
     # SOTA Fix: Force Kagglehub cache to root data folder to align with main.py
     os.environ['KAGGLEHUB_CACHE'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
     
-    # SOTA Fix: Redirect HuggingFace cache to root data folder to avoid home directory quota limit (Errno 122)
+    # SOTA Fix: Redirect HuggingFace cache to root data folder to avoid home directory quota limit
     if 'HF_HOME' not in os.environ:
         os.environ['HF_HOME'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'hf_cache'))
     
-    knee_env = os.environ.get('KNEE_DATA')
-    local_data = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
-    if knee_env and os.path.exists(os.path.join(knee_env, 'train.csv')):
-        DATA_ROOT = os.path.abspath(knee_env)
-        print(f"[SUCCESS] Dataset located via KNEE_DATA at: {DATA_ROOT}")
-    elif os.path.exists(os.path.join(local_data, 'train.csv')):
-        DATA_ROOT = local_data
-        print(f"[SUCCESS] Dataset already present locally at: {DATA_ROOT}")
+    DATA_ROOT = args.data_root
+    if not DATA_ROOT:
+        knee_env = os.environ.get('KNEE_DATA')
+        local_data = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
+        if knee_env and os.path.exists(os.path.join(knee_env, 'train.csv')):
+            DATA_ROOT = os.path.abspath(knee_env)
+            print(f"[SUCCESS] Dataset located via KNEE_DATA at: {DATA_ROOT}")
+        elif os.path.exists(os.path.join(local_data, 'train.csv')):
+            DATA_ROOT = local_data
+            print(f"[SUCCESS] Dataset already present locally at: {DATA_ROOT}")
+        else:
+            print("Checking/Downloading RSNA dataset via Kagglehub...")
+            DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
+            print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
+
+    if args.evaluate:
+        train_df = pd.read_csv(os.path.join(DATA_ROOT, 'train.csv'))
+        gold_df = train_df[train_df['ACL'].notna()].copy()
+        print(f"Isolated {len(gold_df)} gold studies for evaluation.")
+        
+        temp_dir = "temp_gold_eval"
+        os.makedirs(temp_dir, exist_ok=True)
+        gold_df.to_csv(os.path.join(temp_dir, 'train.csv'), index=False)
+        out_csv = os.path.join(temp_dir, 'gold_extractions.csv')
+        
+        print(f"Running NLP Extractor (Engine: {args.engine})...")
+        start_time = time.time()
+        
+        out_path, stats = auto_complete_extraction(
+            data_root=temp_dir,
+            out_csv=out_csv,
+            engine=args.engine,
+            model_id=args.model,
+            force=args.force,
+            evaluate=True
+        )
+        
+        elapsed = time.time() - start_time
+        extracted_df = pd.read_csv(out_path)
+        print(f"Extraction completed in {elapsed:.2f} seconds.")
+        print(f"Average time per report: {elapsed / len(gold_df):.2f} seconds.")
+        
+        merged = pd.merge(gold_df, extracted_df, on="StudyInstanceUID", suffixes=("_true", "_pred"))
+        merged['Language'] = merged['Report'].apply(detect_language)
+        
+        print("\n" + "="*50)
+        print(f"OVERALL METRICS ({args.engine.upper()} ENGINE)")
+        print("="*50)
+        
+        target_aucs = []
+        for t in TARGETS:
+            mask = merged[f"{t}_weight"].values > 0.0
+            y_true = merged[f"{t}_true"].values[mask]
+            y_pred = merged[f"{t}_pred"].values[mask]
+            if len(set(y_true)) > 1:
+                auc = roc_auc_score(y_true, y_pred)
+                f1 = f1_score(y_true, (y_pred >= 0.5).astype(int))
+                target_aucs.append(auc)
+                print(f"{t}: AUC = {auc:.4f}, F1 = {f1:.4f}")
+            else:
+                print(f"{t}: AUC = N/A (only 1 class in gold set)")
+                
+        if target_aucs:
+            print(f"MACRO ROC-AUC: {sum(target_aucs)/len(target_aucs):.4f}")
+        
+        print("\n" + "="*50)
+        print("METRICS BY LANGUAGE (MACRO AUC)")
+        print("="*50)
+        
+        for lang in merged['Language'].unique():
+            lang_df = merged[merged['Language'] == lang]
+            print(f"\nLanguage: {lang} (N={len(lang_df)})")
+            lang_aucs = []
+            for t in TARGETS:
+                mask_l = lang_df[f"{t}_weight"].values > 0.0
+                y_true_l = lang_df[f"{t}_true"].values[mask_l]
+                y_pred_l = lang_df[f"{t}_pred"].values[mask_l]
+                if len(set(y_true_l)) > 1:
+                    try:
+                        auc = roc_auc_score(y_true_l, y_pred_l)
+                        lang_aucs.append(auc)
+                    except ValueError:
+                        pass
+            if lang_aucs:
+                print(f"  Macro AUC: {sum(lang_aucs)/len(lang_aucs):.4f}")
+            else:
+                print("  Macro AUC: N/A (not enough class variance)")
     else:
-        print("Checking/Downloading RSNA dataset via Kagglehub...")
-        DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
-        print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
-    
-    OUT = os.path.join(DATA_ROOT, "pseudo_labels.csv")
-    auto_complete_extraction(
-        DATA_ROOT,
-        OUT,
-        model_id=os.environ.get("LLM_MODEL_ID"),
-        engine=os.environ.get("NLP_ENGINE", "auto"),
-        force=os.environ.get("FORCE_NLP", "0").lower() in {"1", "true", "yes"},
-    )
+        OUT = os.path.join(DATA_ROOT, "pseudo_labels.csv")
+        auto_complete_extraction(
+            DATA_ROOT,
+            OUT,
+            model_id=args.model,
+            engine=args.engine,
+            force=args.force
+        )

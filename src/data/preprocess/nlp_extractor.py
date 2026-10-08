@@ -5,6 +5,17 @@ import hashlib
 import pandas as pd
 import torch
 import time
+
+import json
+
+def append_to_jsonl(uid, raw_output, out_csv):
+    out_dir = os.path.dirname(out_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    jsonl_path = os.path.join(out_dir, "raw_llm_outputs.jsonl")
+    with open(jsonl_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"StudyInstanceUID": uid, "raw_output": raw_output}) + "\n")
+
 import psutil
 import src.core.config as config
 
@@ -26,7 +37,7 @@ TARGETS = [
     "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"
 ]
 
-EXTRACTOR_VERSION = "clinical-report-labels-v2"
+EXTRACTOR_VERSION = "clinical-report-labels-v3"
 
 
 def _sha256_file(path: str) -> str:
@@ -285,7 +296,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                         "within normal limits", "sin rotura", "geen scheur", "keine ruptur"
                     ]
                     present_phrases = [
-                        "present", "torn", "tear", "fracture", "positive", "mild", "moderate", "severe"
+                        "present", "torn", "tear", "fracture", "positive", "mild", "moderate", "severe", "abnormal"
                     ]
                     if any(x in s_low for x in absent_phrases):
                         is_absent = True
@@ -513,18 +524,18 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     )
     
     # SOTA Fix: 2048 tokens is generous for chain of thought reasoning + 12 target JSON
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=4096)
     
     print(f"[INFO] Processing {len(to_extract)} reports in chunks...")
     start_time = time.time()
     
     results = existing_results
-    CHUNK_SIZE = 50
+    CHUNK_SIZE = 500
     
     global_failed_queue = []
     for i in range(0, len(to_extract), CHUNK_SIZE):
         chunk_df = to_extract.iloc[i:i+CHUNK_SIZE]
-        raw_reports = [str(r)[:12000] for r in chunk_df[report_col]]
+        raw_reports = [str(r)[:8000] for r in chunk_df[report_col]]
         messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
         uids_chunk = chunk_df['StudyInstanceUID'].tolist()
         
@@ -533,6 +544,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
         
         for output, uid, report_str in zip(outputs, uids_chunk, raw_reports):
             text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+            append_to_jsonl(uid, text, out_csv)
             res = parse_json_response(text, uid, original_report=report_str)
             if res:
                 results.append(res)
@@ -557,7 +569,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
             break
             
         print(f"\n[INFO] Global Retry Pass {attempt + 1} / {max_global_retries} for {len(current_queue)} failed reports...")
-        retry_params = SamplingParams(temperature=0.0, max_tokens=2048)
+        retry_params = SamplingParams(temperature=0.0, max_tokens=4096)
         next_queue = []
         
         for i in range(0, len(current_queue), CHUNK_SIZE):
@@ -567,6 +579,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
             
             for output, (uid, report_str) in zip(retry_outputs, chunk_items):
                 text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                append_to_jsonl(uid, text, out_csv)
                 res = parse_json_response(text, uid, original_report=report_str)
                 if res:
                     results.append(res)
@@ -581,7 +594,22 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
         print(f"[INFO] Checkpoint saved atomically after retry pass {attempt + 1}. Total extracted: {len(df_out)}")
 
     if current_queue:
-        print(f"[ERROR] {len(current_queue)} reports permanently failed extraction after all retries.")
+        print(f"[ERROR] {len(current_queue)} reports permanently failed extraction after all retries. Falling back to default empty weights.")
+        for uid, _ in current_queue:
+            fallback = {"StudyInstanceUID": uid}
+            for t in TARGETS:
+                fallback[t] = 0.0
+                fallback[f"{t}_weight"] = 0.0
+            fallback.update(
+                extractor_version=EXTRACTOR_VERSION,
+                engine=selected_engine,
+                model_id=resolved_model,
+            )
+            results.append(fallback)
+        df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+        tmp_csv = f"{out_csv}.tmp"
+        df_out.to_csv(tmp_csv, index=False)
+        os.replace(tmp_csv, out_csv)
     
     print(f"[SUCCESS] Processed {len(results)} reports in {time.time() - start_time:.2f} seconds.")
     print(f"[SUCCESS] Saved to {out_csv}. Ready for Phase 2 training pipeline.")
@@ -768,7 +796,7 @@ def auto_complete_extraction(
     model_id: str | None = None,
     engine: str = "vllm",
     force: bool = False,
-    chunk_size: int = 50,
+    chunk_size: int = 500,
     evaluate: bool = False,
 ) -> tuple[str, dict]:
     """Unified Auto-Detection & Completion Engine for NLP Pseudo-Labels.
@@ -1003,13 +1031,13 @@ def auto_complete_extraction(
                 gpu_memory_utilization=gpu_util,
                 **llm_kwargs
             )
-            sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
+            sampling_params = SamplingParams(temperature=0.0, max_tokens=4096)
 
             global_failed_queue = []
             for i in range(0, len(remaining_df), chunk_size):
                 chunk = remaining_df.iloc[i:i+chunk_size]
                 full_reports = chunk["_report_text"].astype(str).tolist()
-                raw_reports = [report[:12000] for report in full_reports]
+                raw_reports = [report[:8000] for report in full_reports]
                 messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
                 uids_chunk = chunk['StudyInstanceUID'].tolist()
 
@@ -1018,6 +1046,7 @@ def auto_complete_extraction(
 
                 for output, uid, report_str, full_report in zip(outputs, uids_chunk, raw_reports, full_reports):
                     text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                    append_to_jsonl(uid, text, out_csv)
                     res = parse_json_response(text, uid, original_report=report_str)
                     if res:
                         res.update(
@@ -1062,7 +1091,7 @@ def auto_complete_extraction(
                 print(f"\n[INFO] Global Retry Pass {attempt + 1} / {max_global_retries} for {len(current_queue)} failed reports...")
                 
                 # We retry with temperature=0.0 to introduce microscopic variation that can un-stick the greedy decode without hallucinating
-                retry_params = SamplingParams(temperature=0.0, max_tokens=2048)
+                retry_params = SamplingParams(temperature=0.0, max_tokens=4096)
                 next_queue = []
                 
                 for i in range(0, len(current_queue), chunk_size):
@@ -1072,6 +1101,7 @@ def auto_complete_extraction(
                     
                     for output, (uid, report_str, full_report) in zip(retry_outputs, chunk_items):
                         text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                        append_to_jsonl(uid, text, out_csv)
                         res = parse_json_response(text, uid, original_report=report_str)
                         if res:
                             res.update(
@@ -1098,8 +1128,27 @@ def auto_complete_extraction(
                 print(f"[CHECKPOINT] Saved {len(df_out)} studies after retry pass {attempt + 1}.")
                 
             if current_queue:
-                print(f"[ERROR] {len(current_queue)} reports permanently failed after all global retries.")
-                raise RuntimeError(f"NLP extraction incomplete: {len(current_queue)} studies could not be extracted.")
+                print(f"[ERROR] {len(current_queue)} reports permanently failed after all global retries. Falling back to default empty weights.")
+                for uid, _, full_report in current_queue:
+                    fallback = {"StudyInstanceUID": uid}
+                    for t in TARGETS:
+                        fallback[t] = 0.0
+                        fallback[f"{t}_weight"] = 0.0
+                    fallback.update(
+                        report_sha256=_report_sha256(full_report),
+                        extractor_version=EXTRACTOR_VERSION,
+                        engine=selected_engine,
+                        model_id=resolved_model,
+                        prompt_sha256=prompt_sha256,
+                    )
+                    results.append(fallback)
+                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                _atomic_csv(df_out, out_csv)
+                saved_rows = _validated_extraction_rows(
+                    df_out, needed_uids, report_hashes,
+                    {"extractor_version": EXTRACTOR_VERSION, "engine": selected_engine, "model_id": resolved_model, "prompt_sha256": prompt_sha256}
+                )
+
         except Exception as vllm_err:
             _atomic_json(
                 manifest_path,

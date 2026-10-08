@@ -125,65 +125,80 @@ def build_prompt(report: str) -> str:
     return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist. 
 Accurately extract the presence of the following 12 knee conditions from this MRI radiology report.
 
+OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT):
+{{
+  "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}}
+}}
+
 TARGETS & CLINICAL DEFINITIONS:
 1. ACL: Anterior Cruciate Ligament tear (complete, partial, high-grade, low-grade, or chronic tear). Intact ACL graft/reconstruction = absent. (CAUTION: Do NOT confuse with PCL / Posterior Cruciate).
-2. MCL: Medial Collateral Ligament tear or sprain (grade 1, 2, or 3). (CAUTION: Do NOT confuse with LCL / Lateral Collateral. MPFL / Medial Patellofemoral Ligament or medial retinaculum tears are NOT MCL tears).
-3. Medial Meniscus: Medial meniscus tear (MM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, complex, or degenerative tear). (NOTE: Grade 1 or Grade 2 intrameniscal signal / myxoid degeneration WITHOUT articular surface extension/tear = absent. Only true articular surface extension tear (Grade 3) = present).
-4. Lateral Meniscus: Lateral meniscus tear (LM, anterior/posterior horn, body, root, horizontal, radial, flap, bucket-handle, or complex tear). (NOTE: Grade 1 or Grade 2 intrameniscal signal / myxoid degeneration WITHOUT articular surface extension/tear = absent. Only true articular surface extension tear (Grade 3) = present).
-5. Medial OA: Medial compartment osteoarthritis, cartilage loss, chondral thinning/defect, subchondral sclerosis/osteophytes of medial femoral condyle (MFC) or medial tibial plateau (MTP).
-6. Lateral OA: Lateral compartment osteoarthritis, cartilage loss, chondral thinning/defect, subchondral sclerosis/osteophytes of lateral femoral condyle (LFC) or lateral tibial plateau (LTP).
-7. PF OA: Patellofemoral osteoarthritis, chondromalacia patellae (CMP), patellar or trochlear cartilage defect / fissure / loss / thinning, patellofemoral joint space narrowing.
-8. Effusion: Joint effusion, suprapatellar effusion, intra-articular fluid distension (mild, moderate, or large). (NOTE: Physiological / minimal trace fluid within normal limits = absent. Only pathological joint effusion or distension = present).
-9. Synovitis: Synovial thickening, synovitis, synovial proliferation, hypervascular pannus, synovial enhancement.
-10. Baker's: Baker's cyst, popliteal cyst, gastrocnemius-semimembranosus bursal distension.
-11. Contusion: Bone bruise, bone contusion, trabecular microfracture, bone marrow edema / signal abnormality following trauma. (NOTE: Subchondral sclerosis or subchondral cysts from osteoarthritis without acute marrow edema = absent).
-12. Fracture: Cortical bone fracture, subchondral fracture, avulsion fracture, tibial plateau / femoral / patellar / fibular fracture. (NOTE: Old healed fracture without acute fracture = absent/not_stated).
+2. MCL: Medial Collateral Ligament tear or sprain. (NOTE: Peri-ligamentous edema for the MCL counts as present. MPFL tears are NOT MCL tears).
+3. Medial Meniscus: Medial meniscus tear. Post-operative states (meniscectomy, repairs) = absent. Grade 1/2 signal without articular extension = absent.
+4. Lateral Meniscus: Lateral meniscus tear. Post-operative states (meniscectomy) = absent. Grade 1/2 signal = absent.
+5. Medial OA: Tibiofemoral-compartment or patellofemoral osteoarthritis of the medial compartment.
+6. Lateral OA: Tibiofemoral-compartment or patellofemoral osteoarthritis of the lateral compartment.
+7. PF OA: Patellofemoral osteoarthritis, facet arthrosis.
+8. Effusion: Pathological joint effusion or intra-articular fluid distension. (NOTE: Physiological, trace, or "small" fluid within normal limits = absent).
+9. Synovitis: Synovial thickening, synovitis, synovial proliferation.
+10. Baker's: Baker's cyst, popliteal cyst.
+11. Contusion: Bone bruise, bone marrow edema following trauma.
+12. Fracture: Cortical bone fracture, avulsion fracture. (NOTE: Old healed fracture = absent).
 
-CLINICAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
-1. Output MUST be valid JSON matching the exact output schema.
-2. "reasoning": Think step-by-step. Analyze findings, compartments, and quotes carefully before determining state.
-3. "exact_quote": Copy/paste the EXACT verbatim sentence from the report in its ORIGINAL language (do NOT translate the quote). If the condition is not mentioned at all, write "None".
-4. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
-5. "present": Finding is explicitly present, torn, injured, seen, or described as abnormal.
-6. "absent": Finding is explicitly normal, intact, unremarkable, or without abnormality. Intact surgical graft = "absent".
-7. "not_stated": Omitted, hedged (e.g. "cannot exclude", "cannot rule out", "suspected", "questionable", "possible", "borderline", "differential"), or "None" quote.
-8. MULTI-LINGUAL: The report may be in any language (English, German, Spanish, Dutch, French, Greek, etc.). Translate mentally to extract findings accurately:
-   - German: Kreuzband=ACL, Innenmeniskus=Medial Meniscus, Knorpeldefekt/Gonarthrose=OA, Erguss=Effusion, Knochenmarködem=Contusion, keine Ruptur/intakt=absent.
-   - Spanish: LCA=ACL, derrame=effusion, edema óseo=contusion, sin rotura/conservado=absent.
-   - Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, beenmergoedeem=contusion, geen scheur/intact=absent.
-   - French: LCA=ACL, épanchement=effusion, sans fissure/intact=absent.
-   - Greek: ρήξη=tear, αρθρική συλλογή=effusion, οστεομυελικό οίδημα=contusion, ακέραιο/χωρίς ρήξη=absent.
-9. CROSS-TALK PREVENTION: PCL (Posterior Cruciate) and LCL (Lateral Collateral) are NOT targets! Never assign PCL findings to ACL, nor LCL/MPFL findings to MCL.
-10. CONSISTENCY: If exact_quote is "None", state MUST be "not_stated". Never mark "present" with "None" quote.
+GENERAL RULES:
+1. Output MUST be valid JSON matching the exact schema above.
+2. "reasoning": Think step-by-step. Keep it under 25 words.
+3. "exact_quote": Copy verbatim. If absent, you MUST provide the quote proving it is absent (e.g., "ligaments are intact"). Absent is NEVER allowed when the structure isn't addressed; use "not_stated" instead.
+4. "state": EXACTLY ONE of ["present", "absent", "not_stated"]. Mask prior-study comparisons as "not_stated".
+5. "confidence": EXACTLY ONE of ["high", "medium", "low"].
+
+MULTI-LINGUAL HINTS:
+- Turkish: yırtık/zedelenme=present, sağlam/normal/izlenmedi=absent.
+- Croatian/Serbian: ruptura/lezija=present, uredno/intaktno=absent.
+- Russian/Bulgarian: разрыв/повреждение=present, норма/без изменений=absent.
+- Greek: ρήξη=present, φυσιολογικό=absent.
+- German: Kreuzband=ACL, Erguss=Effusion, keine Ruptur/intakt=absent.
+- Spanish: LCA=ACL, derrame=effusion, sin rotura=absent.
+- Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, geen scheur=absent.
+- French: LCA=ACL, épanchement=effusion, sans fissure=absent.
 
 EXAMPLES:
-Report (Turkish): "Ön çapraz bağ sağlamdır. Medial menisküs arka boynuzunda yırtık izlendi. Eklem mesafesinde minimal efüzyon."
+Report (English): "Anterior cruciate ligament is completely torn. Menisci are unremarkable. Minimal physiological joint fluid."
 Output:
 {{
-  "ACL": {{"reasoning": "Ön çapraz bağ (ACL) is described as sağlamdır (intact/normal).", "exact_quote": "Ön çapraz bağ sağlamdır.", "state": "absent"}},
-  "Medial Meniscus": {{"reasoning": "Medial menisküs arka boynuzunda (medial meniscus posterior horn) has a yırtık (tear).", "exact_quote": "Medial menisküs arka boynuzunda yırtık izlendi.", "state": "present"}},
-  "Effusion": {{"reasoning": "Minimal efüzyon (minimal effusion) is present, which is trace/physiological.", "exact_quote": "Eklem mesafesinde minimal efüzyon.", "state": "absent"}},
-  "MCL": {{"reasoning": "No mention of medial collateral ligament.", "exact_quote": "None", "state": "not_stated"}}
+  "ACL": {{"reasoning": "Explicit complete tear stated.", "exact_quote": "Anterior cruciate ligament is completely torn.", "state": "present", "confidence": "high"}},
+  "Medial Meniscus": {{"reasoning": "Menisci stated as unremarkable.", "exact_quote": "Menisci are unremarkable.", "state": "absent", "confidence": "high"}},
+  "Effusion": {{"reasoning": "Fluid is minimal and physiological.", "exact_quote": "Minimal physiological joint fluid.", "state": "absent", "confidence": "high"}},
+  "PF OA": {{"reasoning": "Not mentioned.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
+}}
+
+Report (Turkish): "Ön çapraz bağ sağlamdır. Medial menisküs arka boynuzunda yırtık izlendi."
+Output:
+{{
+  "ACL": {{"reasoning": "Sağlam indicates intact ACL.", "exact_quote": "Ön çapraz bağ sağlamdır.", "state": "absent", "confidence": "high"}},
+  "Medial Meniscus": {{"reasoning": "Yırtık indicates tear in posterior horn.", "exact_quote": "Medial menisküs arka boynuzunda yırtık izlendi.", "state": "present", "confidence": "high"}},
+  "Effusion": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
+}}
+
+Report (Greek): "Ρήξη πρόσθιου χιαστού. Οπίσθιος χιαστός φυσιολογικός."
+Output:
+{{
+  "ACL": {{"reasoning": "Ρήξη means tear.", "exact_quote": "Ρήξη πρόσθιου χιαστού.", "state": "present", "confidence": "high"}},
+  "MCL": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
 }}
 
 REPORT:
 {report}
-
-OUTPUT SCHEMA:
-{{
-  "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "..."}},
-  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "..."}}
-}}
 """
 
 def clean_txt(s: str) -> str:
@@ -956,7 +971,37 @@ def auto_complete_extraction(
                 gpu_memory_utilization=gpu_util,
                 **llm_kwargs
             )
-            sampling_params = SamplingParams(temperature=0.0, max_tokens=4096)
+            import json
+            schema_dict = {
+                "type": "object",
+                "properties": {
+                    t: {
+                        "type": "object",
+                        "properties": {
+                            "reasoning": {"type": "string"},
+                            "exact_quote": {"type": "string"},
+                            "state": {"type": "string", "enum": ["present", "absent", "not_stated"]},
+                            "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+                        },
+                        "required": ["reasoning", "exact_quote", "state", "confidence"],
+                        "additionalProperties": False
+                    } for t in TARGETS
+                },
+                "required": TARGETS,
+                "additionalProperties": False
+            }
+            schema_str = json.dumps(schema_dict)
+            
+            try:
+                from vllm.sampling_params import GuidedDecodingParams
+                guided = GuidedDecodingParams(json=schema_str)
+                sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_decoding=guided)
+            except Exception:
+                try:
+                    sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_json=schema_str)
+                except Exception:
+                    sampling_params = SamplingParams(temperature=0.0, max_tokens=4096) # Fallback without JSON constraint if version incompatible
+
 
             global_failed_queue = []
             for i in range(0, len(remaining_df), chunk_size):
@@ -1016,7 +1061,16 @@ def auto_complete_extraction(
                 print(f"\n[INFO] Global Retry Pass {attempt + 1} / {max_global_retries} for {len(current_queue)} failed reports...")
                 
                 # We retry with temperature=0.0 to introduce microscopic variation that can un-stick the greedy decode without hallucinating
-                retry_params = SamplingParams(temperature=0.0, max_tokens=4096)
+                try:
+                    from vllm.sampling_params import GuidedDecodingParams
+                    guided_retry_p = GuidedDecodingParams(json=schema_str)
+                    retry_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_decoding=guided_retry_p)
+                except Exception:
+                    try:
+                        retry_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_json=schema_str)
+                    except Exception:
+                        retry_params = SamplingParams(temperature=0.0, max_tokens=4096)
+
                 next_queue = []
                 
                 for i in range(0, len(current_queue), chunk_size):

@@ -558,6 +558,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     results = existing_results
     CHUNK_SIZE = 50
     
+    global_failed_queue = []
     for i in range(0, len(to_extract), CHUNK_SIZE):
         chunk_df = to_extract.iloc[i:i+CHUNK_SIZE]
         raw_reports = [str(r)[:12000] for r in chunk_df[report_col]]
@@ -567,39 +568,13 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
         print(f"\n[INFO] Processing chunk {i//CHUNK_SIZE + 1} / {((len(to_extract)-1)//CHUNK_SIZE) + 1} ({len(chunk_df)} reports)...")
         outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
         
-        failed_queue = []
         for output, uid, report_str in zip(outputs, uids_chunk, raw_reports):
             text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
             res = parse_json_response(text, uid, original_report=report_str)
             if res:
                 results.append(res)
             else:
-                failed_queue.append((uid, report_str))
-                
-        # Retry logic for failed reports
-        retry_temp = 0.2
-        max_retries = 10
-        while failed_queue and max_retries > 0:
-            print(f"\n[INFO] Retrying {len(failed_queue)} failed reports at temperature {retry_temp}...")
-            sampling_params_retry = SamplingParams(temperature=retry_temp, max_tokens=2048)
-            retry_messages = [[{"role": "user", "content": build_prompt(item[1])}] for item in failed_queue]
-            retry_outputs = llm.chat(retry_messages, sampling_params_retry, use_tqdm=True)
-            
-            new_failed = []
-            for output, (uid, report_str) in zip(retry_outputs, failed_queue):
-                text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
-                res = parse_json_response(text, uid, original_report=report_str)
-                if res:
-                    results.append(res)
-                else:
-                    new_failed.append((uid, report_str))
-                    
-            failed_queue = new_failed
-            retry_temp += 0.2
-            max_retries -= 1
-
-        if failed_queue:
-            print(f"[ERROR] {len(failed_queue)} reports permanently failed extraction after all retries.")
+                global_failed_queue.append((uid, report_str))
                 
         # SOTA Fix: Atomic checkpoint write to prevent corrupted CSV files if killed mid-write
         df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
@@ -610,6 +585,40 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
         df_out.to_csv(tmp_csv, index=False)
         os.replace(tmp_csv, out_csv)
         print(f"[INFO] Checkpoint saved atomically. Total extracted: {len(df_out)}")
+        
+    # Global Retry Pass for Failed Reports
+    max_global_retries = 3
+    current_queue = global_failed_queue
+    for attempt in range(max_global_retries):
+        if not current_queue:
+            break
+            
+        print(f"\n[INFO] Global Retry Pass {attempt + 1} / {max_global_retries} for {len(current_queue)} failed reports...")
+        retry_params = SamplingParams(temperature=0.0, max_tokens=2048)
+        next_queue = []
+        
+        for i in range(0, len(current_queue), CHUNK_SIZE):
+            chunk_items = current_queue[i:i+CHUNK_SIZE]
+            retry_messages = [[{"role": "user", "content": build_prompt(item[1])}] for item in chunk_items]
+            retry_outputs = llm.chat(retry_messages, retry_params, use_tqdm=True)
+            
+            for output, (uid, report_str) in zip(retry_outputs, chunk_items):
+                text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                res = parse_json_response(text, uid, original_report=report_str)
+                if res:
+                    results.append(res)
+                else:
+                    next_queue.append((uid, report_str))
+                    
+        current_queue = next_queue
+        df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+        tmp_csv = f"{out_csv}.tmp"
+        df_out.to_csv(tmp_csv, index=False)
+        os.replace(tmp_csv, out_csv)
+        print(f"[INFO] Checkpoint saved atomically after retry pass {attempt + 1}. Total extracted: {len(df_out)}")
+
+    if current_queue:
+        print(f"[ERROR] {len(current_queue)} reports permanently failed extraction after all retries.")
     
     print(f"[SUCCESS] Processed {len(results)} reports in {time.time() - start_time:.2f} seconds.")
     print(f"[SUCCESS] Saved to {out_csv}. Ready for Phase 2 training pipeline.")
@@ -1088,6 +1097,7 @@ def auto_complete_extraction(
             )
             sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
 
+            global_failed_queue = []
             for i in range(0, len(remaining_df), chunk_size):
                 chunk = remaining_df.iloc[i:i+chunk_size]
                 full_reports = chunk["_report_text"].astype(str).tolist()
@@ -1098,7 +1108,6 @@ def auto_complete_extraction(
                 print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
                 outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
 
-                failed_queue = []
                 for output, uid, report_str, full_report in zip(outputs, uids_chunk, raw_reports, full_reports):
                     text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
                     res = parse_json_response(text, uid, original_report=report_str)
@@ -1112,39 +1121,7 @@ def auto_complete_extraction(
                         )
                         results.append(res)
                     else:
-                        failed_queue.append((uid, report_str, full_report))
-
-                # Retry logic for failed reports
-                retry_temp = 0.2
-                max_retries = 10
-                while failed_queue and max_retries > 0:
-                    print(f"\n[INFO] Retrying {len(failed_queue)} failed reports at temperature {retry_temp}...")
-                    sampling_params_retry = SamplingParams(temperature=retry_temp, max_tokens=2048)
-                    retry_messages = [[{"role": "user", "content": build_prompt(item[1])}] for item in failed_queue]
-                    retry_outputs = llm.chat(retry_messages, sampling_params_retry, use_tqdm=True)
-                    
-                    new_failed = []
-                    for output, (uid, report_str, full_report) in zip(retry_outputs, failed_queue):
-                        text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
-                        res = parse_json_response(text, uid, original_report=report_str)
-                        if res:
-                            res.update(
-                                report_sha256=_report_sha256(full_report),
-                                extractor_version=EXTRACTOR_VERSION,
-                                engine=selected_engine,
-                                model_id=resolved_model,
-                                prompt_sha256=prompt_sha256,
-                            )
-                            results.append(res)
-                        else:
-                            new_failed.append((uid, report_str, full_report))
-                            
-                    failed_queue = new_failed
-                    retry_temp += 0.2
-                    max_retries -= 1
-
-                if failed_queue:
-                    print(f"[ERROR] {len(failed_queue)} reports permanently failed extraction after all retries.")
+                        global_failed_queue.append((uid, report_str, full_report))
 
                 # Atomic checkpoint writes make both rows and provenance restart-safe.
                 df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
@@ -1165,6 +1142,56 @@ def auto_complete_extraction(
                     {**contract, "status": "in_progress", "completed_studies": len(saved_rows)},
                 )
                 print(f"[CHECKPOINT] Saved {len(df_out)} studies to {out_csv}")
+                
+            # Global Retry Pass for Failed Reports
+            max_global_retries = 3
+            current_queue = global_failed_queue
+            
+            for attempt in range(max_global_retries):
+                if not current_queue:
+                    break
+                    
+                print(f"\n[INFO] Global Retry Pass {attempt + 1} / {max_global_retries} for {len(current_queue)} failed reports...")
+                
+                # We retry with temperature=0.0 to introduce microscopic variation that can un-stick the greedy decode without hallucinating
+                retry_params = SamplingParams(temperature=0.0, max_tokens=2048)
+                next_queue = []
+                
+                for i in range(0, len(current_queue), chunk_size):
+                    chunk_items = current_queue[i:i+chunk_size]
+                    retry_messages = [[{"role": "user", "content": build_prompt(item[1])}] for item in chunk_items]
+                    retry_outputs = llm.chat(retry_messages, retry_params, use_tqdm=True)
+                    
+                    for output, (uid, report_str, full_report) in zip(retry_outputs, chunk_items):
+                        text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
+                        res = parse_json_response(text, uid, original_report=report_str)
+                        if res:
+                            res.update(
+                                report_sha256=_report_sha256(full_report),
+                                extractor_version=EXTRACTOR_VERSION,
+                                engine=selected_engine,
+                                model_id=resolved_model,
+                                prompt_sha256=prompt_sha256,
+                            )
+                            results.append(res)
+                        else:
+                            next_queue.append((uid, report_str, full_report))
+                            
+                current_queue = next_queue
+                
+                # Atomic save after retry pass
+                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                _atomic_csv(df_out, out_csv)
+                saved_rows = _validated_extraction_rows(
+                    df_out, needed_uids, report_hashes,
+                    {"extractor_version": EXTRACTOR_VERSION, "engine": selected_engine, "model_id": resolved_model, "prompt_sha256": prompt_sha256}
+                )
+                _atomic_json(manifest_path, {**contract, "status": "in_progress", "completed_studies": len(saved_rows)})
+                print(f"[CHECKPOINT] Saved {len(df_out)} studies after retry pass {attempt + 1}.")
+                
+            if current_queue:
+                print(f"[ERROR] {len(current_queue)} reports permanently failed after all global retries.")
+                raise RuntimeError(f"NLP extraction incomplete: {len(current_queue)} studies could not be extracted.")
         except Exception as vllm_err:
             _atomic_json(
                 manifest_path,

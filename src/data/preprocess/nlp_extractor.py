@@ -3,6 +3,7 @@ import json
 import re
 import hashlib
 import pandas as pd
+import numpy as np
 import torch
 import time
 
@@ -189,144 +190,6 @@ Output:
   "Baker's": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
   "Contusion": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
   "Fracture": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
-}}
-
-REPORT:
-{report}
-"""
-
-def _report_sha256(report: str) -> str:
-    return hashlib.sha256(str(report).encode("utf-8")).hexdigest()
-
-
-def _empty_extraction_frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "StudyInstanceUID",
-            *TARGETS,
-            *(f"{target}_weight" for target in TARGETS),
-            "report_sha256",
-            "extractor_version",
-            "engine",
-            "model_id",
-            "prompt_sha256",
-        ]
-    )
-
-
-def _validated_extraction_rows(
-    frame: pd.DataFrame,
-    expected_uids: set[str],
-    expected_report_hashes: dict[str, str] | None = None,
-    expected_provenance: dict[str, str] | None = None,
-) -> pd.DataFrame:
-    """Keep only complete, in-range extraction rows for the requested studies."""
-    required = {
-        "StudyInstanceUID",
-        *TARGETS,
-        *(f"{target}_weight" for target in TARGETS),
-    }
-    if expected_report_hashes is not None:
-        required.add("report_sha256")
-    if expected_provenance:
-        required.update(expected_provenance)
-    if not required.issubset(frame.columns):
-        return frame.iloc[0:0].copy()
-
-    clean = frame.copy()
-    clean["StudyInstanceUID"] = clean["StudyInstanceUID"].astype(str).str.strip()
-    clean = clean[clean["StudyInstanceUID"].isin(expected_uids)].copy()
-    valid = clean["StudyInstanceUID"].ne("")
-    for target in TARGETS:
-        values = pd.to_numeric(clean[target], errors="coerce")
-        valid &= values.notna() & values.between(0.0, 1.0)
-        clean[target] = values
-        weight_column = f"{target}_weight"
-        weights = pd.to_numeric(clean[weight_column], errors="coerce")
-        valid &= weights.notna() & weights.ge(0.0) & weights.le(1.0)
-        clean[weight_column] = weights
-    if expected_report_hashes is not None:
-        expected_hash = clean["StudyInstanceUID"].map(expected_report_hashes)
-        valid &= clean["report_sha256"].astype(str).eq(expected_hash.astype(str))
-    for column, expected in (expected_provenance or {}).items():
-        valid &= clean[column].astype(str).eq(str(expected))
-    return clean.loc[valid].drop_duplicates("StudyInstanceUID", keep="last")
-
-
-def build_prompt(report: str) -> str:
-    return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist. 
-Accurately extract the presence of the following 12 knee conditions from this MRI radiology report.
-
-OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT):
-{{
-  "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}}
-}}
-
-TARGETS & CLINICAL DEFINITIONS:
-1. ACL: Anterior Cruciate Ligament tear (complete, partial, high-grade, low-grade, or chronic tear). Intact ACL graft/reconstruction = absent. (CAUTION: Do NOT confuse with PCL / Posterior Cruciate).
-2. MCL: Medial Collateral Ligament tear or sprain. (NOTE: Peri-ligamentous edema for the MCL counts as present. MPFL tears are NOT MCL tears).
-3. Medial Meniscus: Medial meniscus tear. Post-operative states (meniscectomy, repairs) = absent. Grade 1/2 signal without articular extension = absent.
-4. Lateral Meniscus: Lateral meniscus tear. Post-operative states (meniscectomy) = absent. Grade 1/2 signal = absent.
-5. Medial OA: Medial tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
-6. Lateral OA: Lateral tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
-7. PF OA: Patellofemoral compartment osteoarthritis, patellar facet arthrosis, chondromalacia patellae.
-8. Effusion: Joint effusion. (NOTE: 'physiological fluid' or 'trace fluid' is absent. However, ANY explicit 'effusion' including 'small effusion' is PRESENT).
-9. Synovitis: Synovial thickening, synovitis, synovial proliferation. (NOTE: If not explicitly mentioned, it is not_stated. Do not assume synovitis just because effusion is present).
-10. Baker's: Baker's cyst, popliteal cyst.
-11. Contusion: Bone bruise, bone marrow edema following trauma.
-12. Fracture: Cortical bone fracture, avulsion fracture. (NOTE: Old healed fracture = absent).
-
-GENERAL RULES:
-1. Output MUST be valid JSON matching the exact schema above.
-2. "reasoning": Think step-by-step. Keep it under 25 words.
-3. "exact_quote": Copy verbatim. If absent, you MUST provide the quote proving it is absent (e.g., "ligaments are intact"). Absent is NEVER allowed when the structure isn't addressed; use "not_stated" instead.
-4. "state": EXACTLY ONE of ["present", "absent", "not_stated"]. Mask prior-study comparisons as "not_stated".
-5. "confidence": EXACTLY ONE of ["high", "medium", "low"].
-
-MULTI-LINGUAL HINTS:
-  - Turkish: yırtık/zedelenme=present, sağlam/normal/izlenmedi=absent.
-  - Croatian/Serbian: ruptura/lezija=present, uredno/intaktno=absent.
-  - Russian/Bulgarian: разрыв/повреждение=present, норма/интактный=absent.
-  - Greek: ρήξη=present, φυσιολογικό=absent.
-  - German: Kreuzband=ACL, Erguss=Effusion, keine Ruptur/intakt=absent.
-  - Spanish: LCA=ACL, derrame=effusion, sin rotura=absent.
-  - Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, geen scheur=absent.
-  - French: LCA=ACL, épanchement=effusion, sans fissure=absent.
-  
-  EXAMPLES:
-Report (English): "Anterior cruciate ligament is completely torn. Menisci are unremarkable. Minimal physiological joint fluid."
-Output:
-{{
-  "ACL": {{"reasoning": "Explicit complete tear stated.", "exact_quote": "Anterior cruciate ligament is completely torn.", "state": "present", "confidence": "high"}},
-  "Medial Meniscus": {{"reasoning": "Menisci stated as unremarkable.", "exact_quote": "Menisci are unremarkable.", "state": "absent", "confidence": "high"}},
-  "Effusion": {{"reasoning": "Fluid is minimal and physiological.", "exact_quote": "Minimal physiological joint fluid.", "state": "absent", "confidence": "high"}},
-  "PF OA": {{"reasoning": "Not mentioned.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
-}}
-
-Report (Turkish): "Ön çapraz bağ sağlamdır. Medial menisküs arka boynuzunda yırtık izlendi."
-Output:
-{{
-  "ACL": {{"reasoning": "Sağlam indicates intact ACL.", "exact_quote": "Ön çapraz bağ sağlamdır.", "state": "absent", "confidence": "high"}},
-  "Medial Meniscus": {{"reasoning": "Yırtık indicates tear in posterior horn.", "exact_quote": "Medial menisküs arka boynuzunda yırtık izlendi.", "state": "present", "confidence": "high"}},
-  "Effusion": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
-}}
-
-Report (Greek): "Ρήξη πρόσθιου χιαστού. Οπίσθιος χιαστός φυσιολογικός."
-Output:
-{{
-  "ACL": {{"reasoning": "Ρήξη means tear.", "exact_quote": "Ρήξη πρόσθιου χιαστού.", "state": "present", "confidence": "high"}},
-  "MCL": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
 }}
 
 REPORT:
@@ -1420,7 +1283,6 @@ def detect_language(report: str) -> str:
 
 if __name__ == '__main__':
     import argparse
-    import kagglehub
     import time
     from sklearn.metrics import roc_auc_score, f1_score
     

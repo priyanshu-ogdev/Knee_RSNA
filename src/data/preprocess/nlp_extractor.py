@@ -379,7 +379,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
                     out[t], out[f"{t}_weight"] = 0.0, 0.0 # Strict Mask
                 else:
-                    out[t], out[f"{t}_weight"] = 0.05, 0.1 # Soft Negative
+                    out[t], out[f"{t}_weight"] = -1.0, 0.1 # Soft Negative Marker
                     
         return out
     except Exception as e:

@@ -375,7 +375,7 @@ def evaluate(
     P, Y, W = np.concatenate(P), np.concatenate(Y), np.concatenate(W)
     per: dict[str, float] = {}
     for j, t in enumerate(config.TARGETS):
-        m = W[:, j] >= 0.99
+        m = W[:, j] >= 0.49
         y_eval = Y[m, j]
         if m.sum() > 1 and 0 < y_eval.sum() < m.sum():
             per[t] = float(roc_auc_score(y_eval, P[m, j]))

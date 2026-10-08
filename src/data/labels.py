@@ -65,6 +65,18 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
         w = np.where(np.isfinite(g), 1.0, 0.0)
         if ex is not None and t in ex.columns:
             e = ex[t].astype(float).values
+            
+            # SOTA Calibration: Estimate P(positive | not_stated) using Gold Studies
+            is_soft_neg = (e == -1.0)
+            if is_soft_neg.any():
+                gold_valid = g[np.isfinite(g)]
+                if len(gold_valid) > 0:
+                    gold_prevalence = np.mean(gold_valid)
+                else:
+                    gold_prevalence = 0.05
+                calibrated_prob = min(0.15, gold_prevalence * 0.8) # Conservative penalty
+                e[is_soft_neg] = calibrated_prob
+            
             if np.isinf(e).any():
                 raise ValueError(f"extra labels for {t!r} must be finite or missing")
             finite = e[np.isfinite(e)]

@@ -660,7 +660,7 @@ def run_oof_and_checkpoint_verification(
 
     for fold in requested_folds:
         fold_dir = os.path.join(model_dir, f"models_fold{fold}")
-        best_ckpt = os.path.join(fold_dir, f"fold{fold}_best.pt")
+        best_ckpt = os.path.join(fold_dir, f"fold{fold}_last.pt")
         oof_path = os.path.join(fold_dir, f"fold{fold}_oof.csv")
         if os.path.exists(best_ckpt):
             sz_mb = os.path.getsize(best_ckpt) / 1e6

@@ -296,13 +296,14 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
             # QUADRUPLE-LAYER CLINICAL HALLUCINATION SHIELD
             # =========================================================================
             q_low = exact_quote.lower().strip()
+            # ---------------------------------------------------------------------
+            # Shield 1: Discard ungrounded labels with empty or "None" quote
+            # ---------------------------------------------------------------------
+            if q_low in ["none", "null", "n/a", "", "not mentioned", "not stated", "none."]:
+                is_present = False
+                is_absent = False
+                
             if is_present:
-                # ---------------------------------------------------------------------
-                # Shield 1: Discard ungrounded "present" with empty or "None" quote
-                # ---------------------------------------------------------------------
-                if q_low in ["none", "null", "n/a", "", "not mentioned", "not stated", "none."]:
-                    is_present = False
-                    
                 # ---------------------------------------------------------------------
                 # Shield 2: Anatomical Cross-Talk Prevention
                 # ---------------------------------------------------------------------
@@ -388,7 +389,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 if (is_present or is_absent) and original_report:
                     clean_q = clean_txt(exact_quote)
                     clean_rep = clean_txt(original_report)
-                    if len(clean_q) > 10 and clean_q not in clean_rep:
+                    if len(clean_q) > 3 and clean_q not in clean_rep:
                         # Check word overlap if direct character substring fails
                         q_words = set(re.findall(r'\b\w{4,}\b', q_low, flags=re.UNICODE))
                         rep_words = set(re.findall(r'\b\w{4,}\b', original_report.lower(), flags=re.UNICODE))

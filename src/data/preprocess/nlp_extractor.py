@@ -146,11 +146,11 @@ TARGETS & CLINICAL DEFINITIONS:
 2. MCL: Medial Collateral Ligament tear or sprain. (NOTE: Peri-ligamentous edema for the MCL counts as present. MPFL tears are NOT MCL tears).
 3. Medial Meniscus: Medial meniscus tear. Post-operative states (meniscectomy, repairs) = absent. Grade 1/2 signal without articular extension = absent.
 4. Lateral Meniscus: Lateral meniscus tear. Post-operative states (meniscectomy) = absent. Grade 1/2 signal = absent.
-5. Medial OA: Tibiofemoral-compartment or patellofemoral osteoarthritis of the medial compartment.
-6. Lateral OA: Tibiofemoral-compartment or patellofemoral osteoarthritis of the lateral compartment.
-7. PF OA: Patellofemoral osteoarthritis, facet arthrosis.
-8. Effusion: Pathological joint effusion or intra-articular fluid distension. (NOTE: Physiological, trace, or "small" fluid within normal limits = absent).
-9. Synovitis: Synovial thickening, synovitis, synovial proliferation.
+5. Medial OA: Medial tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
+6. Lateral OA: Lateral tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
+7. PF OA: Patellofemoral compartment osteoarthritis, patellar facet arthrosis, chondromalacia patellae.
+8. Effusion: Joint effusion. (NOTE: 'physiological fluid' or 'trace fluid' is absent. However, ANY explicit 'effusion' including 'small effusion' is PRESENT).
+9. Synovitis: Synovial thickening, synovitis, synovial proliferation. (NOTE: If not explicitly mentioned, it is not_stated. Do not assume synovitis just because effusion is present).
 10. Baker's: Baker's cyst, popliteal cyst.
 11. Contusion: Bone bruise, bone marrow edema following trauma.
 12. Fracture: Cortical bone fracture, avulsion fracture. (NOTE: Old healed fracture = absent).
@@ -359,10 +359,21 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                             is_absent = False
             
             # Map verified findings to labels & confidence weights
+            conf_str = str(v.get('confidence', '')).lower()
             if is_present:
-                out[t], out[f"{t}_weight"] = 1.0, 0.5
+                if 'high' in conf_str:
+                    out[t], out[f"{t}_weight"] = 0.95, 0.5
+                elif 'low' in conf_str:
+                    out[t], out[f"{t}_weight"] = 0.65, 0.5
+                else:
+                    out[t], out[f"{t}_weight"] = 0.85, 0.5
             elif is_absent:
-                out[t], out[f"{t}_weight"] = 0.0, 0.5
+                if 'high' in conf_str:
+                    out[t], out[f"{t}_weight"] = 0.05, 0.5
+                elif 'low' in conf_str:
+                    out[t], out[f"{t}_weight"] = 0.35, 0.5
+                else:
+                    out[t], out[f"{t}_weight"] = 0.15, 0.5
             else:
                 # not_stated / hedged / missing
                 if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:

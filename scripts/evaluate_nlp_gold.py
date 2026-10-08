@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score
 import argparse
+from src.core.config import resolve_data_root
 import time
 from src.data.preprocess.nlp_extractor import auto_complete_extraction, TARGETS
 
@@ -32,6 +33,7 @@ def main():
     parser.add_argument("--engine", type=str, default="vllm", choices=["vllm"])
     args = parser.parse_args()
 
+    args.data_root = resolve_data_root(args.data_root)
     train_df = pd.read_csv(os.path.join(args.data_root, 'train.csv'))
     
     # Isolate 58 Gold studies

@@ -31,6 +31,7 @@ def _items_for(root, split, studies):
 
 def calibrate(root, split='train', n_studies=24, workers=None, preset='v2', scratch=None, step_seconds=1.0,
               batch_size=config.BATCH_SIZE, n_use=4):
+    root = config.resolve_data_root(root)
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing as mp
     cfg = config.get_cfg(preset)

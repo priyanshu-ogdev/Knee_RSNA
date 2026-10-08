@@ -107,9 +107,11 @@ def verify_hardware_and_environment():
 
 
 def resolve_data_root(cli_data_root: str | None = None) -> str:
-    if cli_data_root and os.path.exists(cli_data_root):
-        print(f"[SUCCESS] Dataset located via CLI argument: {cli_data_root}")
-        return os.path.abspath(cli_data_root)
+    if cli_data_root:
+        resolved = config.resolve_data_root(cli_data_root)
+        if os.path.exists(os.path.join(resolved, "train.csv")):
+            print(f"[SUCCESS] Dataset located via CLI argument: {resolved}")
+            return os.path.abspath(resolved)
 
     knee_env = os.environ.get("KNEE_DATA")
     if knee_env and os.path.exists(os.path.join(knee_env, "train.csv")):

@@ -77,6 +77,19 @@ N_SLOTS = len(SLOTS)
 CANON_ORIENT       = {"Sagittal": "PI", "Coronal": "LI", "Axial": "LP"}
 LAT_MIN_OFFSET_MM  = 20.0
 COMPETITION        = "rsna-knee-abnormality-detection"
+
+def resolve_data_root(provided_root: str) -> str:
+    """Resolves the actual dataset root containing train.csv."""
+    import os
+    if os.path.exists(os.path.join(provided_root, 'train.csv')):
+        return provided_root
+    
+    kagglehub_path = os.path.join(provided_root, 'competitions', COMPETITION)
+    if os.path.exists(os.path.join(kagglehub_path, 'train.csv')):
+        return kagglehub_path
+        
+    return provided_root
+
 ROOT_CANDIDATES    = [
     f"/kaggle/input/competitions/{COMPETITION}",
     f"/kaggle/input/{COMPETITION}",

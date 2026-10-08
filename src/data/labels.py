@@ -20,7 +20,10 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
+from src.core.config import resolve_data_root
+
 def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
+    root = resolve_data_root(root)
     """root: competition folder. extra_csv: same schema as train.csv (targets may be soft probabilities in [0,1]),
     optionally with '<target>_weight' columns (extractor confidence). -> DataFrame (and CSV if out_csv)."""
     if not np.isfinite(extra_weight) or not 0.0 <= extra_weight <= 1.0:

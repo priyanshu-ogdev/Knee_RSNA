@@ -423,12 +423,12 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         print(f"[ERROR] Failed to parse JSON for {uid}: {e}")
         return None
 
-def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"):
+def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "Qwen/Qwen2.5-72B-Instruct"):
     """Compatibility entry point using the provenance-checked, strict vLLM path."""
     return auto_complete_extraction(data_root, out_csv, model_id=model_id, engine="vllm")
 
 
-def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"):
+def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str = "Qwen/Qwen2.5-72B-Instruct"):
     print("=" * 80)
     print("PHASE 1: OFFLINE MASS-BATCH NLP EXTRACTION (vLLM)")
     print("=" * 80)
@@ -879,11 +879,11 @@ def auto_complete_extraction(
     selected_engine = engine.lower()
     requested_model = (
         model_id
-        or os.environ.get("LLM_MODEL_ID", "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF")
+        or os.environ.get("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct")
     )
     quantization = os.environ.get("VLLM_QUANTIZATION", "none").lower()
     large_unquantized_model = (
-        re.search(r"(?:^|[-_/])70b(?:[-_/]|$)", requested_model.lower()) is not None
+        re.search(r"(?:^|[-_/])7[0-9]b(?:[-_/]|$)", requested_model.lower()) is not None
         and quantization not in {"fp8", "fp8_e4m3", "fp8_e5m2"}
     )
     if selected_engine == "auto":
@@ -894,7 +894,7 @@ def auto_complete_extraction(
         )
         if large_unquantized_model:
             print(
-                "[SAFETY] Auto-selected clinical rules instead of unquantized 70B vLLM. "
+                "[SAFETY] Auto-selected clinical rules instead of unquantized 70B/72B vLLM. "
                 "Use an explicitly supported quantization or a smaller model to enable vLLM."
             )
     if selected_engine not in {"vllm", "rules"}:
@@ -903,7 +903,7 @@ def auto_complete_extraction(
         raise ImportError("vLLM was requested but is not installed; refusing to switch to rules labels")
     if selected_engine == "vllm" and large_unquantized_model:
         raise ValueError(
-            "Refusing to load the 70B NLP model without FP8 quantization: its unquantized "
+            "Refusing to load the 70B/72B NLP model without FP8 quantization: its unquantized "
             "weights alone exceed the DGX Spark's unified memory. Set VLLM_QUANTIZATION=fp8 "
             "or select a smaller model."
         )

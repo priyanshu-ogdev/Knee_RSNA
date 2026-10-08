@@ -15,6 +15,7 @@ import numpy as np
 import cv2
 
 from . import dicomio as dio
+from scipy.ndimage import label as _scipy_label, binary_closing as _scipy_binary_closing
 
 cv2.setNumThreads(0)                    # parallelism comes from worker processes; avoid oversubscription
 PS_FALLBACK = 0.3125                    # dataset median in-plane spacing (mm), only if the header has none
@@ -75,16 +76,37 @@ def _border_median(a):
 
 
 def _fg_center(raws):
-    """Foreground bbox centre (row, col) in full-frame pixels, from the mean of the decoded slices."""
-    ref = np.mean([np.maximum(a[::4, ::4].astype(np.float32), 0) for a in raws], axis=0)
-    p99 = np.percentile(ref, 99)
-    if p99 <= 0:
+    """Foreground bbox centre (row, col) in full-frame pixels, from the mean of the decoded slices.
+
+    Pedestal-resistant: subtracts outer border median before thresholding at 0.25 * (p99 - bg),
+    and applies morphological closing + significant connected component filtering to prevent
+    collapsing to the geometric frame centre on noisy or high-pedestal MRI scans.
+    """
+    if not raws:
         return None
-    fg = ref > 0.1 * p99
+    ref = np.mean([np.maximum(a[::4, ::4].astype(np.float32), 0) for a in raws], axis=0)
+    bg = _border_median(ref)
+    p99 = float(np.percentile(ref, 99))
+    span = p99 - bg
+    if span <= 1e-4:
+        return None
+    fg = (ref - bg) > 0.25 * span
     if not fg.any():
         return None
-    rr, cc = np.where(fg.any(1))[0], np.where(fg.any(0))[0]
-    return 4.0 * (rr[0] + rr[-1]) / 2.0, 4.0 * (cc[0] + cc[-1]) / 2.0
+    # Morphological closing (3x3) bridges joint spaces (femur/tibia) and fine trabecular gaps
+    fg_closed = _scipy_binary_closing(fg, structure=np.ones((3, 3), bool))
+    lbl, num = _scipy_label(fg_closed)
+    if num == 0:
+        return None
+    counts = np.bincount(lbl.ravel())[1:]
+    max_c = np.max(counts)
+    # Retain all components with significant volume (>= 15% of largest) to capture both femoral & tibial condyles
+    significant_labels = np.where(counts >= 0.15 * max_c)[0] + 1
+    sig_mask = np.isin(lbl, significant_labels)
+    rr, cc = np.where(sig_mask)
+    if len(rr) == 0 or len(cc) == 0:
+        return None
+    return 4.0 * float(rr.min() + rr.max()) / 2.0, 4.0 * float(cc.min() + cc.max()) / 2.0
 
 
 def crop_plan(shape, ps_row, ps_col, cfg, raws=None):

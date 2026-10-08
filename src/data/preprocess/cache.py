@@ -309,3 +309,36 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
     import gc
     gc.collect()
     return cache, stats
+
+
+def reset_wide_studies(cache_prefix, slot_rows, records, cfg=None):
+    """Selectively reset `done` flags to 0 only for studies containing wide or tall series
+    (aspect > wide_ratio or aspect < 1/wide_ratio).
+    
+    Allows resuming `build_cache` to re-center only the affected series without rebuilding
+    the entire dataset cache.
+    """
+    cache = StudyCache(cache_prefix, mode='r+')
+    wide_ratio = cfg.wide_ratio if cfg else config.get_cfg('v2').wide_ratio
+    reset_count = 0
+    for i, study in enumerate(cache.studies):
+        srow = slot_rows.get(study, {})
+        has_wide = False
+        for s_uid in srow.values():
+            if s_uid and s_uid in records:
+                rec = records[s_uid]
+                shape = rec.get('shape')
+                ps_row = float(rec.get('ps_row', np.nan))
+                ps_col = float(rec.get('ps_col', np.nan))
+                if shape and np.isfinite(ps_row) and np.isfinite(ps_col) and ps_row > 0 and ps_col > 0:
+                    H, W = shape
+                    aspect = (W * ps_col) / (H * ps_row)
+                    if aspect > wide_ratio or aspect < 1.0 / wide_ratio:
+                        has_wide = True
+                        break
+        if has_wide and cache.done[i] == 1:
+            cache.done[i] = 0
+            reset_count += 1
+    cache.flush()
+    print(f"[CACHE RESET] Selectively invalidated {reset_count} studies with wide series in '{cache_prefix}'.")
+    return reset_count

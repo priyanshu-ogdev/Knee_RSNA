@@ -381,12 +381,12 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         print(f"[ERROR] Failed to parse JSON for {uid}: {e}")
         return None
 
-def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "Qwen/Qwen2.5-72B-Instruct"):
+def run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
     """Compatibility entry point using the provenance-checked, strict vLLM path."""
     return auto_complete_extraction(data_root, out_csv, model_id=model_id, engine="vllm")
 
 
-def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str = "Qwen/Qwen2.5-72B-Instruct"):
+def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
     print("=" * 80)
     print("PHASE 1: OFFLINE MASS-BATCH NLP EXTRACTION (vLLM)")
     print("=" * 80)
@@ -803,10 +803,7 @@ def auto_complete_extraction(
     # Resolve the engine once per run. A runtime failure must not silently switch
     # labeling methodology part-way through the dataset.
     selected_engine = engine.lower()
-    requested_model = (
-        model_id
-        or os.environ.get("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct")
-    )
+    requested_model = model_id if model_id else os.environ.get("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct")
     quantization = os.environ.get("NLP_QUANTIZATION", "none").lower()
     large_unquantized_model = (
         re.search(r"(?:^|[-_/])7[0-9]b(?:[-_/]|$)", requested_model.lower()) is not None
@@ -1290,7 +1287,7 @@ if __name__ == '__main__':
     parser.add_argument("--evaluate", action="store_true", help="Run in gold-evaluation mode to output ROC-AUC metrics")
     parser.add_argument("--data_root", type=str, default="", help="Path to RSNA dataset directory")
     parser.add_argument("--engine", type=str, default="vllm", choices=["vllm"], help="LLM engine to use")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-72B-Instruct", help="LLM HuggingFace ID")
+    parser.add_argument("--model", type=str, default=os.environ.get("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct"), help="LLM HuggingFace ID")
     parser.add_argument("--force", action="store_true", help="Force complete regeneration of all labels")
     args = parser.parse_args()
 

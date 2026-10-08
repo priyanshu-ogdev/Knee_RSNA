@@ -367,62 +367,6 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                         is_present = False
 
                 # ---------------------------------------------------------------------
-                # Shield 4: Invert Contradictory Quotes Describing Normal / Intact Structure
-                # ---------------------------------------------------------------------
-                if is_present:
-                    explicit_normal_phrases = [
-                        # English
-                        "intact", "normal", "unremarkable", "preserved", "in continuity", "without tear",
-                        "no tear", "no fracture", "no acute tear", "no evidence of tear", "not torn", "no effusion",
-                        # Spanish
-                        "sin rotura", "sin desgarro", "sin signos de rotura", "sin lesiones", "sin alteraciones", 
-                        "conservado", "conservada", "íntegro", "integro", "sin derrame", "sin fractura", "sin edema", 
-                        "dentro de límites normales", "dentro de limites normales",
-                        # Dutch
-                        "geen scheur", "ongestoord", "geen afwijkingen", "geen meniscusletsel", "geen hydrops", 
-                        "geen kraakbeendefect", "slank en doorlopend", "zonder scheur", "zonder ruptuur", 
-                        "zonder afwijkingen", "geen fractuur",
-                        # German
-                        "keine ruptur", "kein riss", "intakt", "regelrecht", "unauffällig", "unauffaellig", 
-                        "ohne befund", "ohne riss", "ohne fraktur", "kein erguss", "kein knorpelschaden", "keine meniskusläsion",
-                        # French
-                        "sans rupture", "sans fissure", "sans anomalie", "sans lesion", "sans lésion", 
-                        "sans épanchement", "sans epanchement", "intégrité", "integrite",
-                        # Greek
-                        "χωρίς ρήξη", "χωρίς κάταγμα", "ακέραι", "φυσιολογικ", "χωρίς παθολογ", "χωρίς συλλογή"
-                    ]
-                    injury_words = [
-                        "tear", "torn", "ruptur", "rotur", "scheur", "riss", "sprain", "fractur", 
-                        "fracture", "fraktur", "edema", "oedeem", "ödem", "defect", "loss", "thinning", 
-                        "effusion", "erguss", "derrame", "hydrops", "cyst", "kyste", "zyste"
-                    ]
-                    has_normal = any(n in q_low for n in explicit_normal_phrases)
-                    has_injury = any(inj in q_low for inj in injury_words)
-                    
-                    if has_normal and not has_injury:
-                        # Clean normal quote: invert to absent
-                        is_present = False
-                        is_absent = True
-                    elif has_normal and has_injury:
-                        # Contains both (e.g. "no tear of the medial meniscus").
-                        # Check if injury is explicitly negated:
-                        explicit_neg = any(neg in q_low for neg in [
-                            "no tear", "without tear", "no acute tear", "sin rotura", "sin signos de rotura",
-                            "geen scheur", "zonder scheur", "keine ruptur", "ohne riss", "sans fissure",
-                            "sans rupture", "no fracture", "sin fractura", "geen fractuur", "ohne fraktur",
-                            "no effusion", "sin derrame", "geen hydrops", "kein erguss", "χωρίς ρήξη"
-                        ])
-                        pos_injuries = [
-                            "acute tear", "complete tear", "partial tear", "radial tear", "horizontal tear", 
-                            "bucket-handle", "rotura completa", "rotura parcial", "scheur van", "complexe scheur", 
-                            "knochenmarködem", "bone bruise", "joint effusion"
-                        ]
-                        has_pos_injury = any(p in q_low for p in pos_injuries)
-                        if explicit_neg and not has_pos_injury:
-                            is_present = False
-                            is_absent = True
-
-                # ---------------------------------------------------------------------
                 # Shield 5: Grounding Verification Against Original Report
                 # ---------------------------------------------------------------------
                 if is_present and original_report:

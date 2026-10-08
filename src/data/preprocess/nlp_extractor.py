@@ -20,10 +20,18 @@ def append_to_jsonl(uid, raw_output, out_csv):
 import psutil
 import src.core.config as config
 
-# SOTA Fix: Load .env so the HuggingFace token (HF_TOKEN) is available for downloading the gated Nemotron model.
+# SOTA Fix: Robustly load .env from project root so HF_TOKEN / HUGGING_FACE_HUB_TOKEN is always accessible.
 try:
     from dotenv import load_dotenv
+    _proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    _env_path = os.path.join(_proj_root, '.env')
+    if os.path.exists(_env_path):
+        load_dotenv(_env_path)
     load_dotenv()
+    if os.environ.get('HF_TOKEN') and not os.environ.get('HUGGING_FACE_HUB_TOKEN'):
+        os.environ['HUGGING_FACE_HUB_TOKEN'] = os.environ['HF_TOKEN']
+    elif os.environ.get('HUGGING_FACE_HUB_TOKEN') and not os.environ.get('HF_TOKEN'):
+        os.environ['HF_TOKEN'] = os.environ['HUGGING_FACE_HUB_TOKEN']
 except ImportError:
     pass
 
@@ -616,6 +624,21 @@ def auto_complete_extraction(
                 print("[INFO] Note: bitsandbytes quantization is not supported in vLLM v1 engine. Running unquantized native precision.")
             elif use_quant not in ["none", "null", "false", "fp16", "bf16"]:
                 llm_kwargs = {"quantization": use_quant}
+
+            # Pre-flight check: Verify AutoConfig and AutoTokenizer in 0.1s before heavy 170s vLLM engine initialization
+            try:
+                from transformers import AutoConfig, AutoTokenizer
+                print(f"[PRE-FLIGHT] Verifying model config and tokenizer for '{model_to_use}'...")
+                _cfg = AutoConfig.from_pretrained(model_to_use, trust_remote_code=True)
+                _tok = AutoTokenizer.from_pretrained(model_to_use, trust_remote_code=True)
+                print(f"[PRE-FLIGHT] Verified: model_type='{getattr(_cfg, 'model_type', 'unknown')}', tokenizer='{_tok.__class__.__name__}'.")
+            except Exception as _pf_err:
+                _hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
+                print(f"[PRE-FLIGHT WARNING] Fast tokenizer/config check failed for '{model_to_use}': {_pf_err}")
+                if not _hf_token and not os.path.exists(model_to_use):
+                    print("[DIAGNOSTIC] HF_TOKEN is NOT set in environment or .env file!")
+                    print("[DIAGNOSTIC] Unauthenticated HuggingFace requests on shared IPs frequently return HTTP 429/rate-limit error responses that corrupt config.json / tokenizer.json.")
+                    print("[DIAGNOSTIC] To fix: export HF_TOKEN='your_hf_token' or pass the local model folder to --model.")
 
             llm = LLM(
                 model=model_to_use,

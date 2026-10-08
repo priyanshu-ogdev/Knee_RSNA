@@ -517,7 +517,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     llm = LLM(
         model=model_id,
         enforce_eager=enforce_eager_flag,
-        max_model_len=8192,
+        max_model_len=16384,
         tensor_parallel_size=tp_size,
         gpu_memory_utilization=gpu_util,
         **llm_kwargs
@@ -530,12 +530,12 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     start_time = time.time()
     
     results = existing_results
-    CHUNK_SIZE = 500
+    CHUNK_SIZE = 100
     
     global_failed_queue = []
     for i in range(0, len(to_extract), CHUNK_SIZE):
         chunk_df = to_extract.iloc[i:i+CHUNK_SIZE]
-        raw_reports = [str(r)[:8000] for r in chunk_df[report_col]]
+        raw_reports = [str(r) for r in chunk_df[report_col]]
         messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
         uids_chunk = chunk_df['StudyInstanceUID'].tolist()
         
@@ -796,7 +796,7 @@ def auto_complete_extraction(
     model_id: str | None = None,
     engine: str = "vllm",
     force: bool = False,
-    chunk_size: int = 500,
+    chunk_size: int = 100,
     evaluate: bool = False,
 ) -> tuple[str, dict]:
     """Unified Auto-Detection & Completion Engine for NLP Pseudo-Labels.
@@ -1026,7 +1026,7 @@ def auto_complete_extraction(
             llm = LLM(
                 model=model_to_use,
                 enforce_eager=enforce_eager,
-                max_model_len=8192,
+                max_model_len=16384,
                 tensor_parallel_size=1,
                 gpu_memory_utilization=gpu_util,
                 **llm_kwargs
@@ -1037,7 +1037,7 @@ def auto_complete_extraction(
             for i in range(0, len(remaining_df), chunk_size):
                 chunk = remaining_df.iloc[i:i+chunk_size]
                 full_reports = chunk["_report_text"].astype(str).tolist()
-                raw_reports = [report[:8000] for report in full_reports]
+                raw_reports = [report for report in full_reports]
                 messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
                 uids_chunk = chunk['StudyInstanceUID'].tolist()
 

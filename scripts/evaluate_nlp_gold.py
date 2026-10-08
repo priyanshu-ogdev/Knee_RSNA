@@ -49,17 +49,14 @@ def main():
     print(f"Running NLP Extractor (Engine: {args.engine})...")
     start_time = time.time()
     
-    # Pass evaluate=True to bypass the fully_labeled_mask skip logic
-    if os.path.exists(out_csv):
-        out_path = out_csv
-    else:
-        out_path, stats = auto_complete_extraction(
-            data_root=temp_dir,
-            out_csv=out_csv,
-            engine=args.engine,
-            force=False,
-            evaluate=True
-        )
+    # Force full re-extraction with the new chunk size and GPU config
+    out_path, stats = auto_complete_extraction(
+        data_root=temp_dir,
+        out_csv=out_csv,
+        engine=args.engine,
+        force=True,
+        evaluate=True
+    )
     
     elapsed = time.time() - start_time
     extracted_df = pd.read_csv(out_path)

@@ -451,7 +451,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
             "quantization": use_quant,
         }
     
-    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.65"))
+    gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.95"))
     enforce_eager_flag = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
     
     llm = LLM(
@@ -926,7 +926,7 @@ def auto_complete_extraction(
         try:
             print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
             model_to_use = requested_model
-            requested_gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.65"))
+            requested_gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.95"))
             if not 0.0 < requested_gpu_util < 1.0:
                 raise ValueError("VLLM_GPU_MEMORY_UTILIZATION must be between 0 and 1")
             total_gpu_gb = (

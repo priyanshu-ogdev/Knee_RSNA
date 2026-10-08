@@ -430,7 +430,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     print(f"[INFO] Initializing vLLM Engine for {model_id} on DGX Spark GB10...")
     
     # Legacy extraction path; keep its default reservation conservative as well.
-    use_quant = os.environ.get("VLLM_QUANTIZATION", "bitsandbytes")
+    use_quant = os.environ.get("NLP_QUANTIZATION", "bitsandbytes")
     if use_quant.lower() in ["bitsandbytes", "bnb"]:
         tp_size = 1
         llm_kwargs = {
@@ -440,10 +440,10 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     elif use_quant.lower() in ["none", "null", "false", "fp16", "bf16"]:
         tp_size = 1
         llm_kwargs = {}
-    elif use_quant.lower() in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
+    elif use_quant.lower() in ["fp8_per_tensor", "fp8_e4m3", "fp8_e5m2"]:
         tp_size = 1
         llm_kwargs = {
-            "quantization": "fp8",
+            "quantization": "fp8_per_tensor",
         }
     else:
         tp_size = 1
@@ -800,10 +800,10 @@ def auto_complete_extraction(
         model_id
         or os.environ.get("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct")
     )
-    quantization = os.environ.get("VLLM_QUANTIZATION", "none").lower()
+    quantization = os.environ.get("NLP_QUANTIZATION", "none").lower()
     large_unquantized_model = (
         re.search(r"(?:^|[-_/])7[0-9]b(?:[-_/]|$)", requested_model.lower()) is not None
-        and quantization not in {"fp8", "fp8_e4m3", "fp8_e5m2"}
+        and quantization not in {"fp8_per_tensor", "fp8_e4m3", "fp8_e5m2"}
     )
     if selected_engine != "vllm":
         raise ValueError("Only 'vllm' engine is supported. Rules engine has been removed for accuracy.")
@@ -814,8 +814,8 @@ def auto_complete_extraction(
             "[WARNING] Auto-enabling FP8 quantization for 70B/72B model. Unquantized "
             "weights exceed DGX memory."
         )
-        os.environ["VLLM_QUANTIZATION"] = "fp8"
-        quantization = "fp8"
+        os.environ["NLP_QUANTIZATION"] = "fp8_per_tensor"
+        quantization = "fp8_per_tensor"
         large_unquantized_model = False
 
     resolved_model = (
@@ -956,8 +956,8 @@ def auto_complete_extraction(
             use_quant = quantization
 
             llm_kwargs = {}
-            if use_quant in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
-                llm_kwargs = {"quantization": "fp8"}
+            if use_quant in ["fp8_per_tensor", "fp8_e4m3", "fp8_e5m2"]:
+                llm_kwargs = {"quantization": "fp8_per_tensor"}
             elif use_quant in ["bitsandbytes", "bnb"]:
                 print("[INFO] Note: bitsandbytes quantization is not supported in vLLM v1 engine. Running unquantized native precision.")
             elif use_quant not in ["none", "null", "false", "fp16", "bf16"]:

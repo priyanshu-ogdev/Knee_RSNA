@@ -842,11 +842,13 @@ def auto_complete_extraction(
     if LLM is None:
         raise ImportError("vLLM is required but not installed.")
     if selected_engine == "vllm" and large_unquantized_model:
-        raise ValueError(
-            "Refusing to load the 70B/72B NLP model without FP8 quantization: its unquantized "
-            "weights alone exceed the DGX Spark's unified memory. Set VLLM_QUANTIZATION=fp8 "
-            "or select a smaller model."
+        print(
+            "[WARNING] Auto-enabling FP8 quantization for 70B/72B model. Unquantized "
+            "weights exceed DGX memory."
         )
+        os.environ["VLLM_QUANTIZATION"] = "fp8"
+        quantization = "fp8"
+        large_unquantized_model = False
 
     resolved_model = (
         requested_model if selected_engine == "vllm" else "clinical-rules-v1"

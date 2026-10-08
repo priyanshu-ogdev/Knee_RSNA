@@ -169,11 +169,18 @@ def clean_txt(s: str) -> str:
     # SOTA Fix: Unicode-aware stripping keeps Greek, Spanish, German, French, Dutch letters
     return re.sub(r'[^\w]', '', str(s).lower(), flags=re.UNICODE)
 
+def _get_fallback_row(uid: str) -> dict:
+    print(f"[WARNING] Unrecoverable NLP parse failure for {uid}. Generating masked fallback row.")
+    out = {"StudyInstanceUID": str(uid).strip()}
+    for t in TARGETS:
+        out[t], out[f"{t}_weight"] = 0.0, 0.0
+    return out
+
 def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> dict:
     """Safely extracts JSON from the LLM output with a Quadruple-Layer Clinical Hallucination Shield."""
     if not raw_text or not isinstance(raw_text, str):
         print(f"[ERROR] Empty raw_text for {uid}")
-        return None
+        return _get_fallback_row(uid)
         
     clean_json = None
     # SOTA Fix: Case-insensitive and optional 'json' tag for markdown blocks
@@ -189,7 +196,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
             
     if not clean_json:
         print(f"[ERROR] No JSON block found in output for {uid}")
-        return None
+        return _get_fallback_row(uid)
         
     try:
         # SOTA Fix: Remove trailing commas before closing braces/brackets which frequently crash json.loads
@@ -459,7 +466,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         return out
     except Exception as e:
         print(f"[ERROR] Failed to parse JSON for {uid}: {e}")
-        return None
+        return _get_fallback_row(uid)
 
 def run_offline_extraction(data_root: str, out_csv: str, model_id: str = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"):
     """Compatibility entry point using the provenance-checked, strict vLLM path."""
@@ -556,7 +563,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     start_time = time.time()
     
     results = existing_results
-    CHUNK_SIZE = 500
+    CHUNK_SIZE = 50
     
     for i in range(0, len(to_extract), CHUNK_SIZE):
         chunk_df = to_extract.iloc[i:i+CHUNK_SIZE]
@@ -815,7 +822,7 @@ def auto_complete_extraction(
     model_id: str | None = None,
     engine: str = "auto",
     force: bool = False,
-    chunk_size: int = 500,
+    chunk_size: int = 50,
 ) -> tuple[str, dict]:
     """Unified Auto-Detection & Completion Engine for NLP Pseudo-Labels.
     

@@ -333,7 +333,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 is_present = False
                 is_absent = False
                 
-            if is_present:
+            if (is_present or is_absent) and original_report:
                 # ---------------------------------------------------------------------
                   # Shield 5: Grounding Verification Against Original Report
                 # ---------------------------------------------------------------------
@@ -360,7 +360,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
             
             # Map verified findings to labels & confidence weights
             conf_str = str(v.get('confidence', '')).lower()
-            if is_present:
+            if (is_present or is_absent) and original_report:
                 if 'high' in conf_str:
                     out[t], out[f"{t}_weight"] = 0.95, 1.0
                 elif 'low' in conf_str:
@@ -379,7 +379,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
                     out[t], out[f"{t}_weight"] = 0.0, 0.0 # Strict Mask
                 else:
-                    out[t], out[f"{t}_weight"] = 0.0, 0.0 # Soft Negative
+                    out[t], out[f"{t}_weight"] = 0.05, 0.1 # Soft Negative
                     
         return out
     except Exception as e:
@@ -451,10 +451,10 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     elif use_quant.lower() in ["none", "null", "false", "fp16", "bf16"]:
         tp_size = 1
         llm_kwargs = {}
-    elif use_quant.lower() in ["fp8_per_tensor", "fp8_e4m3", "fp8_e5m2"]:
+    elif use_quant.lower() in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
         tp_size = 1
         llm_kwargs = {
-            "quantization": "fp8_per_tensor",
+            "quantization": "fp8",
         }
     else:
         tp_size = 1
@@ -815,7 +815,7 @@ def auto_complete_extraction(
     quantization = os.environ.get("NLP_QUANTIZATION", "none").lower()
     large_unquantized_model = (
         re.search(r"(?:^|[-_/])7[0-9]b(?:[-_/]|$)", requested_model.lower()) is not None
-        and quantization not in {"fp8_per_tensor", "fp8_e4m3", "fp8_e5m2"}
+        and quantization not in {"fp8", "fp8_e4m3", "fp8_e5m2"}
     )
     if selected_engine != "vllm":
         raise ValueError("Only 'vllm' engine is supported. Rules engine has been removed for accuracy.")
@@ -826,8 +826,8 @@ def auto_complete_extraction(
             "[WARNING] Auto-enabling FP8 quantization for 70B/72B model. Unquantized "
             "weights exceed DGX memory."
         )
-        os.environ["NLP_QUANTIZATION"] = "fp8_per_tensor"
-        quantization = "fp8_per_tensor"
+        os.environ["NLP_QUANTIZATION"] = "fp8"
+        quantization = "fp8"
         large_unquantized_model = False
 
     resolved_model = (
@@ -968,8 +968,8 @@ def auto_complete_extraction(
             use_quant = quantization
 
             llm_kwargs = {}
-            if use_quant in ["fp8_per_tensor", "fp8_e4m3", "fp8_e5m2"]:
-                llm_kwargs = {"quantization": "fp8_per_tensor"}
+            if use_quant in ["fp8", "fp8_e4m3", "fp8_e5m2"]:
+                llm_kwargs = {"quantization": "fp8"}
             elif use_quant in ["bitsandbytes", "bnb"]:
                 print("[INFO] Note: bitsandbytes quantization is not supported in vLLM v1 engine. Running unquantized native precision.")
             elif use_quant not in ["none", "null", "false", "fp16", "bf16"]:
@@ -1006,14 +1006,42 @@ def auto_complete_extraction(
             schema_str = json.dumps(schema_dict)
             
             try:
+
+            
                 from vllm.sampling_params import GuidedDecodingParams
+
+            
                 guided = GuidedDecodingParams(json=schema_str)
+
+            
                 sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_decoding=guided)
+
+            
+                decoding_mode = "GuidedDecodingParams"
+
+            
             except Exception:
+
+            
                 try:
+
+            
                     sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_json=schema_str)
+
+            
+                    decoding_mode = "guided_json"
+
+            
                 except Exception:
-                    sampling_params = SamplingParams(temperature=0.0, max_tokens=4096) # Fallback without JSON constraint if version incompatible
+
+            
+                    sampling_params = SamplingParams(temperature=0.0, max_tokens=4096)
+
+            
+                    decoding_mode = "unconstrained"
+
+            
+                    print("[WARNING] vLLM JSON guided decoding failed to initialize. Falling back to unconstrained decoding.")
 
 
             global_failed_queue = []
@@ -1075,14 +1103,22 @@ def auto_complete_extraction(
                 
                 # We retry with temperature=0.0 to introduce microscopic variation that can un-stick the greedy decode without hallucinating
                 try:
+
                     from vllm.sampling_params import GuidedDecodingParams
+
                     guided_retry_p = GuidedDecodingParams(json=schema_str)
-                    retry_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_decoding=guided_retry_p)
+
+                    retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096, guided_decoding=guided_retry_p)
+
                 except Exception:
+
                     try:
-                        retry_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_json=schema_str)
+
+                        retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096, guided_json=schema_str)
+
                     except Exception:
-                        retry_params = SamplingParams(temperature=0.0, max_tokens=4096)
+
+                        retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096)
 
                 next_queue = []
                 

@@ -840,8 +840,8 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None, help="Directory for model checkpoints (defaults to work_dir)")
     
     # NLP Options
-    parser.add_argument("--nlp_engine", type=str, default="auto", choices=["auto", "vllm", "rules"], help="NLP engine; auto uses rules when the configured vLLM model is outside the memory policy")
-    parser.add_argument("--nlp_model", type=str, default="nvidia/Llama-3.1-Nemotron-70B-Instruct-HF", help="vLLM model ID for report extraction")
+    parser.add_argument("--nlp_engine", type=str, default="vllm", choices=["vllm"], help="NLP engine; auto uses rules when the configured vLLM model is outside the memory policy")
+    parser.add_argument("--nlp_model", type=str, default="Qwen/Qwen2.5-72B-Instruct", help="vLLM model ID for report extraction")
     parser.add_argument("--force_nlp", action="store_true", help="Force re-extraction of pseudo-labels from scratch")
     parser.add_argument(
         "--fresh_preprocessing",

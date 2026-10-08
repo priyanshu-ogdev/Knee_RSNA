@@ -553,9 +553,8 @@ def run_training(
         .ge(0.99)
         .any(axis=1)
     ) if len(va) else pd.Series(dtype=bool)
-    va_gold = va.loc[gold_mask].reset_index(drop=True) if len(va) else va
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
-    ds_va = RSNADataset(va_gold, cache_prefix, cfg, False, None, seed, aug=False) if len(va_gold) else None
+    ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
     ds_oof = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
     if len(ds_tr) != len(tr):
         raise RuntimeError(
@@ -759,11 +758,11 @@ def run_training(
                 swa_model.update_parameters(model)
 
             # ── Best-checkpoint saving ────────────────────────────────────────
-            save = (ds_va is None) or (np.isfinite(score) and score > best)
+            save = True
             if save:
-                best = score if ds_va is not None else best
+                best = score
                 epochs_no_improve = 0
-                ckpt_file = os.path.join(out_dir, f"fold{fold}_best.pt")
+                ckpt_file = os.path.join(out_dir, f"fold{fold}_last.pt")
                 _atomic_torch_save(
                     dict(
                         model=inner_model.state_dict(),
@@ -857,7 +856,7 @@ def run_training(
         _shutdown_loader(dl_tr)
         active_loaders = []
         if ds_oof is not None:
-            best_path = os.path.join(out_dir, f"fold{fold}_best.pt")
+            best_path = os.path.join(out_dir, f"fold{fold}_last.pt")
             best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
             inner_model.load_state_dict(best_checkpoint["model"], strict=True)
             inner_model.eval()

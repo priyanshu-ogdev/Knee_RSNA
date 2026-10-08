@@ -1,16 +1,43 @@
-# Environments
+﻿# Environments & Credentials
 .env
-__pycache__/
-*.pyc
+.env.*
+*.env
 
-# Data & Caches
+# Python Bytecode & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data, Downloads & Intermediate Caches
 /data/
 eda/cache/
 pipeline_out/
+temp_gold_eval/
 models_fold*/
 tmp/
 *.zip
 
-# PyTorch artifacts
+# Scratch & Temporary Testing
+scratch/
+test_config.json
+
+# PyTorch artifacts & Weights
 *.pt
 *.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Logs & System
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE & Editor Configs
+.vscode/
+.idea/
+*.swp
+*.swo

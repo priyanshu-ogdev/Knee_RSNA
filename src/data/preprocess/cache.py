@@ -74,11 +74,9 @@ class StudyCache:
         self.padded = np.memmap(p['padded'], np.uint8, m, shape=(N, S))
         self.ps_missing = np.memmap(p['ps_missing'], np.uint8, m, shape=(N, S))
         self.index = {s: i for i, s in enumerate(self.studies)}
-        # LINUX / GB10 SPEEDUP: Hint kernel for standard cached access so RAM buffers active studies
+        # Hint random-access memmaps to avoid excessive read-ahead; this is advisory.
         try:
             import mmap as _py_mmap
-            # SOTA Memory Optimization: For read mode (training/workers), use MADV_RANDOM.
-            # This prevents the Linux kernel page-cache from locking 65GB of disk pages in RAM.
             adv_flag = getattr(_py_mmap, 'MADV_RANDOM', getattr(_py_mmap, 'MADV_NORMAL', None)) if mode == 'r' else getattr(_py_mmap, 'MADV_NORMAL', None)
             if adv_flag is not None:
                 for a in (self.images, self.valid, self.slot, self.done):

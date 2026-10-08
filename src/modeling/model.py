@@ -18,7 +18,7 @@ import os
 import math
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 import src.core.config as config
 from src.modeling.mil import build_timm_attention_mil
@@ -100,8 +100,9 @@ def inject_lora(
 class CrossSlotTransformer(nn.Module):
     """2-layer Transformer Encoder over the 6 anatomical slot embeddings.
 
-    Source: TransMIL (Shao et al., NeurIPS 2021) — cross-instance attention
-    in multi-instance learning consistently outperforms independent slot pooling.
+    This cross-instance attention layer lets the six anatomical slots exchange
+    information before target-specific pooling; its value for this dataset
+    requires a matched ablation.
 
     Input : slot_feats [B, S, D], slot_mask [B, S]  (1=valid, 0=padding)
     Output: slot_feats [B, S, D]  (cross-slot-enriched)
@@ -133,8 +134,15 @@ class CrossSlotTransformer(nn.Module):
         """
         # nn.Transformer uses src_key_padding_mask where True = IGNORE
         pad_mask = mask < 0.5          # [B, S] bool; True where slot is absent
+        all_missing = pad_mask.all(dim=1)
+        if all_missing.any():
+            pad_mask = pad_mask.clone()
+            pad_mask[all_missing, 0] = False
         x = x + self.pos_embed[:, :x.size(1), :]
-        return self.out_drop(self.encoder(x, src_key_padding_mask=pad_mask))
+        encoded = self.encoder(x, src_key_padding_mask=pad_mask)
+        if all_missing.any():
+            encoded = encoded.masked_fill(all_missing[:, None, None], 0.0)
+        return self.out_drop(encoded)
 
 
 # ─────────────────────────────────────────────────────────── SlotHead ─────────
@@ -169,7 +177,10 @@ class SlotHead(nn.Module):
         h = self.proj(x) + self.slot_emb                          # [B, S, hidden]
         att = torch.einsum("bsh,oh->bos", h, self.query) / self.hidden ** 0.5
         att = att + self.slot_prior.unsqueeze(0)   # anatomical plane bias
-        att = att.masked_fill(mask.unsqueeze(1) < 0.5, -10000.0).softmax(-1)
+        valid_slots = mask.unsqueeze(1) >= 0.5
+        att = att.masked_fill(~valid_slots, -10000.0).softmax(-1)
+        has_slot = valid_slots.any(dim=-1, keepdim=True)
+        att = att.masked_fill(~has_slot, 0.0)
         ctx = self.drop(torch.einsum("bos,bsh->boh", att, h))     # [B, n_out, hidden]
         return (ctx * self.out.weight.unsqueeze(0)).sum(-1) + self.out.bias
 
@@ -211,7 +222,8 @@ class Model(nn.Module):
                  use_cross_slot: bool = True,
                  cross_slot_nhead: int = 8,
                  cross_slot_layers: int = 2,
-                 cross_slot_dropout: float = 0.1):
+                 cross_slot_dropout: float = 0.1,
+                 use_slot_prior: bool = True):
         super().__init__()
         self.backbone = backbone
         # CLS + mean-patch + focal-topk concat -> dim * 3 (IMPROVEMENT 1)
@@ -226,7 +238,12 @@ class Model(nn.Module):
                 n_layers=cross_slot_layers,
                 dropout=cross_slot_dropout,
             )
-        self.head = SlotHead(feat_dim, config.N_SLOTS, len(config.TARGETS))
+        self.head = SlotHead(
+            feat_dim,
+            config.N_SLOTS,
+            len(config.TARGETS),
+            use_prior=use_slot_prior,
+        )
         # ImageNet normalisation (used by DINOv2 preprocessing)
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
@@ -281,7 +298,7 @@ class Model(nn.Module):
             x_valid = x_valid.div_(255.0)
             x_valid.sub_(self.mean.to(dtype=dtype)).div_(self.std.to(dtype=dtype))
 
-            # Hardware-adaptive chunk size: 128 on 130GB Blackwell GB10 / A100, 48 on 16GB Kaggle T4
+            # Use larger encoder chunks on devices reporting at least 24 GiB.
             chunk_size = self._get_chunk_size()
             f_list = []
             for c_start in range(0, len(x_valid), chunk_size):
@@ -336,6 +353,9 @@ def build_model(
     input_size: int = config.COATNET_INPUT_SIZE,
     encode_chunk_size: int = config.COATNET_ENCODE_CHUNK,
     pretrained: bool = True,
+    timm_pooling: str = "flat",
+    use_slot_prior: bool = True,
+    backbone_config: dict | None = None,
 ) -> nn.Module:
     # Polymorphic argument resolution for backward compatibility
     if isinstance(variant, int):
@@ -366,29 +386,48 @@ def build_model(
             pretrained=pretrained,
             input_size=input_size,
             encode_chunk_size=encode_chunk_size,
+            pooling_mode=timm_pooling,
+            model_type=model_type,
         )
     if model_type not in ("dinov2", "coatnet_mil", "timm_mil"):
         raise ValueError(f"Unknown model_type {model_type!r}; expected 'dinov2', 'coatnet_mil', or 'timm_mil'")
 
     src = variant if os.path.isdir(variant) else f"facebook/{variant}"
-    try:
-        bb = AutoModel.from_pretrained(src, drop_path_rate=0.2, attn_implementation="sdpa", local_files_only=os.path.isdir(src))  # SOTA FlashAttention-2 speedup  # Extreme regularization to prevent overfitting on pseudo-labels
-    except Exception:
-        # Offline fallback: if pretrained weights cannot be fetched (e.g. Kaggle offline submission),
-        # instantiate directly from config since full weights will be loaded from checkpoint state_dict
-        from transformers import AutoConfig
-        local_cfg_dir = os.path.join(os.path.dirname(__file__), "configs")
-        if os.path.isdir(src) and os.path.exists(os.path.join(src, "config.json")):
-            cfg_obj = AutoConfig.from_pretrained(src)
-        elif os.path.exists(os.path.join(local_cfg_dir, "config.json")):
-            cfg_obj = AutoConfig.from_pretrained(local_cfg_dir)
+    if pretrained:
+        try:
+            bb = AutoModel.from_pretrained(
+                src,
+                drop_path_rate=0.2,
+                attn_implementation="sdpa",
+                local_files_only=os.path.isdir(src),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load pretrained DINOv2 weights for {src!r}; "
+                "refusing to silently train with random initialization."
+            ) from exc
+    else:
+        if backbone_config is not None:
+            config_values = dict(backbone_config)
+            config_type = config_values.pop("model_type", None)
+            if not config_type:
+                raise ValueError("saved backbone_config must include model_type")
+            config_values.pop("transformers_version", None)
+            cfg_obj = AutoConfig.for_model(config_type, **config_values)
+        elif os.path.isdir(src) and os.path.exists(os.path.join(src, "config.json")):
+            cfg_obj = AutoConfig.from_pretrained(src, local_files_only=True)
         else:
-            cfg_obj = AutoConfig.from_pretrained(src)
-        bb = AutoModel.from_config(cfg_obj)
+            local_cfg_dir = os.path.join(os.path.dirname(__file__), "configs")
+            local_config = os.path.join(local_cfg_dir, "config.json")
+            if not os.path.isfile(local_config):
+                raise FileNotFoundError(
+                    f"No local DINOv2 config is available to reconstruct {variant!r}"
+                )
+            cfg_obj = AutoConfig.from_pretrained(local_cfg_dir, local_files_only=True)
+        bb = AutoModel.from_config(cfg_obj, attn_implementation="sdpa")
     
-    # SOTA Memory Protection: PyTorch 2.x Non-Reentrant Gradient Checkpointing
-    # Strictly bounds activation memory (~8-15 GB) across all batch sizes.
-    # MANDATORY on DGX to prevent the GPU from silently spilling >50GB of backprop graphs into System RAM!
+    # Gradient checkpointing trades additional compute for lower activation
+    # storage. Its memory impact still depends on batch size and input geometry.
     bb.config.use_cache = False
     bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     
@@ -425,7 +464,12 @@ def build_model(
         prm.requires_grad_(True)
 
     dim = bb.config.hidden_size  # 384 for Small, 768 for Base, 1024 for Large
-    return Model(bb, dim, use_cross_slot=use_cross_slot)
+    return Model(
+        bb,
+        dim,
+        use_cross_slot=use_cross_slot,
+        use_slot_prior=use_slot_prior,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -434,11 +478,16 @@ def build_model(
 # -----------------------------------------------------------------------------
 
 def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") -> nn.Module:
-    """Load a trained model checkpoint (fold*_ema.pt, fold*_best.pt, or fold*_swa.pt).
+    """Load a trained model checkpoint (fold*_best.pt or fold*_swa.pt).
     Reconstructs the model architecture with the exact saved configuration and loads weights.
     Safely strips torch.compile (_orig_mod.) and DataParallel (module.) prefixes if present.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    saved_targets = ckpt.get("targets")
+    if saved_targets is not None and list(saved_targets) != config.TARGETS:
+        raise ValueError(
+            "Checkpoint target order does not match the current config.TARGETS"
+        )
     state_dict = ckpt["model"]
     model_config = dict(ckpt.get("model_config", {}))
     model_config.setdefault("variant", ckpt.get("variant", "dinov2-base"))
@@ -447,6 +496,7 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
         ckpt.get("model_type", "coatnet_mil" if model_config["variant"].startswith("coatnet") else ("timm_mil" if not model_config["variant"].startswith("dinov2") else "dinov2")),
     )
     model_config.setdefault("use_cross_slot", ckpt.get("use_cross_slot", True))
+    model_config.setdefault("use_slot_prior", True)
     if "lora_rank" not in model_config:
         lora_a = next((v for k, v in state_dict.items() if k.endswith(".A")), None)
         model_config["lora_rank"] = int(lora_a.shape[-1]) if lora_a is not None else 0
@@ -455,7 +505,11 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
     model_config.setdefault("truncate_blocks", 0)
     model_config.setdefault("input_size", config.COATNET_INPUT_SIZE)
     model_config.setdefault("encode_chunk_size", config.COATNET_ENCODE_CHUNK)
+    # Checkpoints predating slot-aware MIL used one flat distribution across windows.
+    model_config.setdefault("timm_pooling", "flat")
     model_config.setdefault("pretrained", False)
+    if "backbone_config" not in model_config and "backbone_config" in ckpt:
+        model_config["backbone_config"] = ckpt["backbone_config"]
 
     model = build_model(**model_config).to(device)
     cleaned_state_dict = {}

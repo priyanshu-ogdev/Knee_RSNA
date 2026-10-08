@@ -3,20 +3,13 @@
 Implementations
 ---------------
 AsymmetricLoss  Ridnik et al., ICCV 2021 (arXiv:2009.14119).
-                De-facto SOTA for multi-label classification.
-                Outperforms BCE on MS-COCO (+2.5pp mAP), Open Images (+1.4pp),
-                and Focal Loss on every tested benchmark.
-                Mechanism: decoupled gamma+/gamma- focusing + probability-shift
-                that discards easy/mislabelled negatives (directly relevant to our
-                NLP-derived noisy labels where some negative labels are unreliable).
+                Uses separate positive and negative focusing exponents and an
+                optional negative-probability clip. Its effect on this dataset
+                must be compared empirically with BCE.
 
-                UPGRADE (v3): gamma_neg now accepts a per-target list/tensor [C].
-                Using per-target gammas aligns the negative-suppression strength
-                with empirical label prevalence:
-                  - Rare positives (MCL 15%, Baker's 21%) get high gamma_neg (4.0)
-                    so the loss focuses hard on their rare positive samples.
-                  - Common positives (Effusion 60%) get low gamma_neg (1.0)
-                    so we do not suppress the informative negative gradient.
+                gamma_neg may be shared across targets or supplied per target.
+                A larger negative focusing exponent suppresses easy negative
+                examples; it does not directly upweight positive examples.
 
 WeightedBCE     Legacy for A/B ablation; kept as a drop-in alternative.
 
@@ -52,14 +45,20 @@ class AsymmetricLoss(nn.Module):
         super().__init__()
         if isinstance(gamma_neg, (list, tuple)):
             # Register as buffer so it moves to GPU with .to(device) automatically
-            self.register_buffer(
-                "gamma_neg_vec",
-                torch.tensor(gamma_neg, dtype=torch.float32)
-            )
+            gamma_tensor = torch.tensor(gamma_neg, dtype=torch.float32)
+            if not torch.isfinite(gamma_tensor).all() or (gamma_tensor < 0).any():
+                raise ValueError("gamma_neg values must be finite and non-negative")
+            self.register_buffer("gamma_neg_vec", gamma_tensor)
             self._gamma_neg_scalar = None
         else:
+            if not torch.isfinite(torch.tensor(float(gamma_neg))) or gamma_neg < 0:
+                raise ValueError("gamma_neg must be finite and non-negative")
             self.gamma_neg_vec = None
             self._gamma_neg_scalar = float(gamma_neg)
+        if not torch.isfinite(torch.tensor(float(gamma_pos))) or gamma_pos < 0:
+            raise ValueError("gamma_pos must be finite and non-negative")
+        if not torch.isfinite(torch.tensor(float(clip))) or not 0 <= clip < 1:
+            raise ValueError("clip must be finite and in [0, 1)")
         self.gamma_pos = float(gamma_pos)
         self.clip = float(clip)
         self.eps = eps
@@ -87,6 +86,11 @@ class AsymmetricLoss(nn.Module):
         # gamma_neg: scalar or [C] tensor (broadcasts correctly either way)
         # SOTA Bugfix: ensure g_neg always matches targets.device and targets.dtype
         if self.gamma_neg_vec is not None:
+            if self.gamma_neg_vec.numel() != logits.shape[1]:
+                raise ValueError(
+                    f"gamma_neg has {self.gamma_neg_vec.numel()} values for "
+                    f"{logits.shape[1]} targets"
+                )
             g_neg = self.gamma_neg_vec.to(device=targets.device, dtype=targets.dtype)
         else:
             g_neg = logits.new_full((1,), self._gamma_neg_scalar, device=targets.device, dtype=targets.dtype)
@@ -97,11 +101,16 @@ class AsymmetricLoss(nn.Module):
         loss = -loss  # minimise
 
         if weights is not None:
+            if weights.shape != loss.shape:
+                raise ValueError(
+                    f"weights shape {tuple(weights.shape)} must match loss shape "
+                    f"{tuple(loss.shape)}"
+                )
             loss = loss * weights
-            # Compute loss independently per class first, then average across all C targets (1/C per target).
-            # This bounds each target head's gradient contribution at 1/C, preventing sparse batches
-            # from causing destructive gradient spikes (up to 12x) on the shared ViT backbone.
-            class_losses = loss.sum(dim=0) / weights.sum(dim=0).clamp_min(1.0)
+            # Normalize by labeled entries, not confidence-weight sum: confidence
+            # then scales the loss as intended rather than canceling itself out.
+            labeled_count = (weights > 0).sum(dim=0).clamp_min(1)
+            class_losses = loss.sum(dim=0) / labeled_count
             return class_losses.mean()
         return loss.mean()
 
@@ -113,11 +122,14 @@ class WeightedBCE(nn.Module):
         loss = F.binary_cross_entropy_with_logits(logits.float(), targets,
                                                   reduction="none")
         if weights is not None:
+            if weights.shape != loss.shape:
+                raise ValueError(
+                    f"weights shape {tuple(weights.shape)} must match loss shape "
+                    f"{tuple(loss.shape)}"
+                )
             loss = loss * weights
-            # Compute loss independently per class first, then average across all C targets (1/C per target).
-            # This bounds each target head's gradient contribution at 1/C, preventing sparse batches
-            # from causing destructive gradient spikes (up to 12x) on the shared ViT backbone.
-            class_losses = loss.sum(dim=0) / weights.sum(dim=0).clamp_min(1.0)
+            labeled_count = (weights > 0).sum(dim=0).clamp_min(1)
+            class_losses = loss.sum(dim=0) / labeled_count
             return class_losses.mean()
         return loss.mean()
 

@@ -1,23 +1,4 @@
-"""Pipelined inference ? v2 upgrade layer.
-
-Upgrades implemented vs. baseline (0.943):
-  H  Temperature calibration (Guo et al. ICML 2017)
-       Accepts per-model or per-target temperature scalars (T) fitted on OOF data.
-       Applied as: sigmoid(logits / T).
-  -  N-Arm Blending
-       Replaces the legacy 2-arm rank_ensemble with rank_ensemble_n from
-       ensemble.py, supporting DINOv2, CoAtNet, and the new ConvNeXt arm.
-  -  Cache-Warm Inverted TTA Pipeline
-       Loads memmap studies into RAM once per batch, generating all N-pass
-       deterministic TTA views (zero horizontal flips) sequentially to avoid
-       4x redundant disk I/O thrashing.
-  -  Multi-Candidate Test Directory Resolution
-       Resolves test_series, test, or test_images seamlessly for hidden rerun safety.
-
-Hidden-rerun rules (public notebooks' failure history): nothing here may raise
-on data conditions. Missing series/flags degrade to masked slots; studies with
-no usable slot fall back to median prediction. Submission is ALWAYS written.
-"""
+"""Inference, test-time augmentation, and family-level rank blending."""
 from __future__ import annotations
 
 import os
@@ -220,6 +201,49 @@ def prepare_test_tables(root: str, cfg: config.PreCfg, workers: int | None = Non
     return ann, tab, pipeline.study_sides(idx), pipeline.index_to_records(ann)
 
 
+def _validate_prediction_options(
+    models: list[torch.nn.Module],
+    temperatures: list | None,
+    batch: int,
+    n_tta: int | None = None,
+) -> list:
+    if not models:
+        raise ValueError("At least one model is required for prediction")
+    if batch < 1:
+        raise ValueError("batch must be positive")
+    if n_tta is not None and n_tta < 1:
+        raise ValueError("n_tta must be positive")
+    values = [1.0] * len(models) if temperatures is None else list(temperatures)
+    if len(values) != len(models):
+        raise ValueError(
+            f"received {len(values)} temperatures for {len(models)} models"
+        )
+    validated = []
+    for value in values:
+        temperature = np.asarray(value, dtype=np.float64)
+        if temperature.ndim == 0:
+            if not np.isfinite(temperature) or temperature <= 0:
+                raise ValueError("temperatures must be finite and positive")
+            validated.append(float(temperature))
+        elif temperature.shape == (len(config.TARGETS),):
+            if not np.isfinite(temperature).all() or (temperature <= 0).any():
+                raise ValueError("per-target temperatures must be finite and positive")
+            validated.append(temperature)
+        else:
+            raise ValueError(
+                f"temperature must be scalar or have shape ({len(config.TARGETS)},)"
+            )
+    return validated
+
+
+def _scale_logits(logits: torch.Tensor, temperature) -> torch.Tensor:
+    if np.isscalar(temperature):
+        return logits / float(temperature)
+    return logits / torch.as_tensor(
+        temperature, device=logits.device, dtype=logits.dtype
+    )
+
+
 @torch.inference_mode()
 def predict_chunk_tta(
     models: list,
@@ -235,7 +259,7 @@ def predict_chunk_tta(
     tta_seed: int = 42,
     return_models: bool = False,
 ) -> np.ndarray | list[np.ndarray]:
-    """TTA: average predictions over N augmented views ? strictly NO horizontal flips.
+    """Average predictions over deterministic test-time views without horizontal flips.
 
     Batch-Inverted Cache Optimization:
     Loops over study batches on the outer axis. Each study batch is loaded from the
@@ -245,11 +269,9 @@ def predict_chunk_tta(
     NO FLIPS: knees are laterality-canonicalised to 'left' at preprocessing time;
     horizontal flips destroy medial/lateral consistency in the slot head.
 
-    AUC improvement: averaging reduces logit variance without adding bias.
-    Expected gain: +0.002 to +0.005 AUC (standard for 4-pass TTA on MRI).
     """
+    T = _validate_prediction_options(models, temperatures, batch, n_tta)
     out = []
-    T = temperatures or [1.0] * len(models)
 
     for lo in range(a, b, batch):
         rows = list(range(lo, min(lo + batch, b)))
@@ -260,13 +282,12 @@ def predict_chunk_tta(
             rng_seed = tta_seed + tta_pass * 1000
 
             def _make(i):
-                # ANTI-DEGRADATION FIX: Seed each thread worker deterministically
-                # to prevent shared-RNG race conditions in multi-threaded TTA
+                # Give each study/view an independent, reproducible augmentation.
                 row_rng = np.random.default_rng(rng_seed + i)
                 return loader.make_sample(
                     cache, i, cfg,
                     train=False,          # always use eval-mode window selection (evenly spaced)
-                    n_use=n_use,          # DO NOT sub-sample. Use full density to prevent recall degradation.
+                    n_use=n_use,
                     rng=row_rng,
                     aug=use_aug,          # augmentation applied only for TTA passes 1+
                 )
@@ -277,6 +298,7 @@ def predict_chunk_tta(
             imgs = torch.from_numpy(np.stack([s[0] for s in smp]))
             slot = torch.from_numpy(np.stack([s[1] for s in smp])).float()
             wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float()
+            del smp
             
             if device.type == "cuda":
                 # T4 GPU (Turing) Efficiency Fixes
@@ -297,12 +319,7 @@ def predict_chunk_tta(
                                      enabled=(device.type == "cuda"))
                 with ctx:
                     logits = m(imgs, slot, wm).float()
-                    # Temperature scaling (scalar or per-target vector)
-                    if isinstance(t_val, (int, float)):
-                        scaled = logits / max(t_val, 1e-6)
-                    else:
-                        t_tensor = torch.as_tensor(t_val, device=logits.device, dtype=logits.dtype)
-                        scaled = logits / torch.clamp(t_tensor, min=1e-6)
+                    scaled = _scale_logits(logits, t_val)
                     ps.append(torch.sigmoid(scaled).cpu().numpy())
 
             # Model ensemble mean for this TTA view: [batch_size, n_targets]
@@ -339,8 +356,8 @@ def predict_chunk(
     If temperatures are provided, logits are scaled by T before sigmoid.
     Returns: [b-a, n_targets] average probabilities.
     """
+    T = _validate_prediction_options(models, temperatures, batch)
     out = []
-    T = temperatures or [1.0] * len(models)
 
     for lo in range(a, b, batch):
         rows = list(range(lo, min(lo + batch, b)))
@@ -350,11 +367,13 @@ def predict_chunk(
         imgs = torch.from_numpy(np.stack([s[0] for s in smp]))
         slot = torch.from_numpy(np.stack([s[1] for s in smp])).float()
         wm   = torch.from_numpy(np.stack([s[2] for s in smp])).float()
+        del smp
 
-        # Keep a pinned CPU copy for the background threads to stream to their specific GPUs
-        imgs_cpu = imgs.pin_memory() if device.type == "cuda" else imgs
-        slot_cpu = slot.pin_memory() if device.type == "cuda" else slot
-        wm_cpu   = wm.pin_memory() if device.type == "cuda" else wm
+        if device.type == "cuda":
+            imgs, slot, wm = imgs.pin_memory(), slot.pin_memory(), wm.pin_memory()
+        imgs = imgs.to(device, non_blocking=device.type == "cuda")
+        slot = slot.to(device, non_blocking=device.type == "cuda")
+        wm = wm.to(device, non_blocking=device.type == "cuda")
 
         ps = []
         for m, t_val in zip(models, T):
@@ -363,11 +382,7 @@ def predict_chunk(
                                  enabled=(device.type == "cuda"))
             with ctx:
                 logits = m(imgs, slot, wm).float()
-                if isinstance(t_val, (int, float)):
-                    scaled = logits / max(t_val, 1e-6)
-                else:
-                    t_tensor = torch.as_tensor(t_val, device=logits.device, dtype=logits.dtype)
-                    scaled = logits / torch.clamp(t_tensor, min=1e-6)
+                scaled = _scale_logits(logits, t_val)
                 ps.append(torch.sigmoid(scaled).cpu().numpy())
 
         out.append(ps)
@@ -398,6 +413,7 @@ def run_inference(
     use_d4_target_weights: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """Build the cache and run predictions in a pipelined fashion."""
+    _validate_prediction_options(models, temperatures, batch, n_tta if use_tta else None)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Auto-load checkpoint files if paths were passed instead of module instances
     loaded_models = [load_checkpoint(m, device) if isinstance(m, str) else m for m in models]
@@ -443,7 +459,10 @@ def run_inference(
         if not state["moved"]:
             for i, m in enumerate(loaded_models):
                 # 1. Native FP16 Casting (Faster than autocast overhead)
-                m = m.eval().half().to(device, non_blocking=True)
+                m = m.eval()
+                if device.type == "cuda":
+                    m = m.half()
+                m = m.to(device, non_blocking=device.type == "cuda")
                 
                 # 2. PyTorch 2.x Compiler with CUDA Graphs
                 try:
@@ -482,7 +501,7 @@ def run_inference(
     )
     print("cache stats:", stats)
 
-    # Rank-Percentile Normalization across folds (UPGRADE: optimal ROC-AUC ensembling)
+    # Normalize model-family scales before the optional family ensemble.
     if multi_model:
         if use_d4_target_weights:
             preds = d4_family_rank_blend(per_model_preds, model_types)
@@ -496,7 +515,8 @@ def run_inference(
     preds[empty] = fill
     preds = np.where(np.isfinite(preds), preds, fill)
 
-    # Output natively calibrated Sigmoid probabilities (Macro-AUC optimal)
+    # A single family remains on its probability scale; multi-family blends are
+    # percentile-rank scores and should not be described as calibrated probabilities.
     sub = pd.DataFrame(preds, columns=config.TARGETS)
     sub.insert(0, "StudyInstanceUID", studies)
     if order is not None:
@@ -523,7 +543,7 @@ def main() -> None:
         "--checkpoints",
         nargs="+",
         required=True,
-        help="Trained fold checkpoint paths; mixing DINOv2 and CoAtNet activates the d4 family blend",
+        help="Trained fold checkpoint paths; model families receive equal rank-blend weight by default",
     )
     parser.add_argument("--out", default="submission.csv", help="Output submission CSV")
     parser.add_argument("--cache_dir", default=None, help="Optional test cache directory")

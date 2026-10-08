@@ -42,7 +42,7 @@ import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from torch.optim.swa_utils import AveragedModel
 
 import src.core.config as config
 from src.modeling.losses import build_loss
@@ -129,6 +129,12 @@ def _shutdown_loader(loader) -> None:
         loader._iterator = None
 
 
+def _atomic_torch_save(payload: dict, path: str) -> None:
+    temporary_path = f"{path}.tmp"
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, path)
+
+
 def _loader_batch_bytes(cfg, windows: int, batch_size: int) -> int:
     return (
         config.N_SLOTS * windows * cfg.group * cfg.img_size * cfg.img_size
@@ -166,18 +172,22 @@ def handle_memory_circuit_breaker(
                 out_dir, f"fold{fold}_emergency_{exc.threshold_gb:.0f}gb_checkpoint.pt"
             )
             base_m = model.module if isinstance(model, nn.DataParallel) else model
-            torch.save({
-                "model": base_m.state_dict(),
-                "cfg": dataclasses.asdict(cfg) if cfg and hasattr(cfg, "__dataclass_fields__") else cfg,
-                "fold": fold,
-                "epoch": epoch,
-                "step": step,
-                "used_gb": exc.used_gb,
-                "variant": variant,
-                "use_cross_slot": use_cross_slot,
-                "model_type": (model_config or {}).get("model_type", "dinov2"),
-                "model_config": model_config or {},
-            }, emerg_ckpt)
+            _atomic_torch_save(
+                {
+                    "model": base_m.state_dict(),
+                    "cfg": dataclasses.asdict(cfg) if cfg and hasattr(cfg, "__dataclass_fields__") else cfg,
+                    "targets": config.TARGETS,
+                    "fold": fold,
+                    "epoch": epoch,
+                    "step": step,
+                    "used_gb": exc.used_gb,
+                    "variant": variant,
+                    "use_cross_slot": use_cross_slot,
+                    "model_type": (model_config or {}).get("model_type", "dinov2"),
+                    "model_config": model_config or {},
+                },
+                emerg_ckpt,
+            )
             print(f" [CHECKPOINT] Emergency state saved to: {emerg_ckpt}", flush=True)
         except Exception as save_err:
             print(f" [WARNING] Could not write emergency checkpoint: {save_err}", flush=True)
@@ -202,27 +212,6 @@ def _autocast(device: torch.device):
         return torch.autocast("cpu", enabled=False), False
     use_bf16 = torch.cuda.is_bf16_supported()
     return torch.autocast("cuda", dtype=torch.bfloat16 if use_bf16 else torch.float16), not use_bf16
-
-
-# ──────────────────────────────────────── Mixup (feature-space) ───────────────
-def mixup_features(feats: torch.Tensor, targets: torch.Tensor,
-                   weights: torch.Tensor, alpha: float) -> tuple:
-    """Feature-space Mixup (Zhang et al., ICLR 2018).
-
-    Applied AFTER the backbone forward pass so that raw pixel anatomy is
-    never distorted (safe for MRI).  Returns mixed (feats, targets, weights).
-    lambda ~ Beta(alpha, alpha); alpha=0.2 from config.MIXUP_ALPHA.
-    """
-    if alpha <= 0.0:
-        return feats, targets, weights
-    lam = float(np.random.beta(alpha, alpha))
-    B = feats.size(0)
-    idx = torch.randperm(B, device=feats.device)
-    mixed_f = lam * feats + (1.0 - lam) * feats[idx]
-    mixed_t = lam * targets + (1.0 - lam) * targets[idx]
-    # Weight: take the max of the two weights (retain supervision signal)
-    mixed_w = torch.maximum(weights, weights[idx])
-    return mixed_f, mixed_t, mixed_w
 
 
 # ─────────────────────────────────────────── build LR schedule ────────────────
@@ -257,21 +246,17 @@ def train_epoch(
     epoch: int = 1,
     total_epochs: int = 20,
     label_smoothing: float = 0.0,
-    mixup_alpha: float = 0.0,
     grad_accum: int = 1,
-    ema_model = None,
-    gold_weight_mult: float = 1.0,   # UPGRADE 2: upweight gold-labeled studies
+    gold_weight_mult: float = 1.0,
 ) -> float:
+    if grad_accum < 1:
+        raise ValueError("grad_accum must be at least 1")
     model.train()
     total_loss_tensor = torch.tensor(0.0, device=device)
-    n, opt_step = 0, 0
+    n = 0
     # Pre-cache trainable parameters to avoid scanning module tree at every micro-step
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     
-    # Pre-allocate rare vector OUTSIDE the loop to prevent VRAM fragmentation
-    _rare_mults = [config.RARE_TARGET_WEIGHTS.get(t, 1.0) for t in config.TARGETS]
-    _rare_vec = torch.tensor(_rare_mults, device=device).unsqueeze(0)  # [1, C]
-
     step_t0 = time.time()
     total_batches = len(dataloader)
     for micro_step, batch in enumerate(dataloader):
@@ -292,27 +277,25 @@ def train_epoch(
         with ctx:
             logits = model(imgs, masks, wmasks)  # [B, C]
 
-        # Gold upweighting: gold-labeled studies (w=1.0) get 1.5x multiplier.
+        accumulation_steps = min(
+            grad_accum,
+            total_batches - (micro_step // grad_accum) * grad_accum,
+        )
+        # Scale only verified gold entries; pseudo-labels in the same study
+        # retain their confidence weights.
         if gold_weight_mult > 1.0:
-            has_gold = (weights >= 0.99).any(dim=1, keepdim=True).float()  # [B, 1]
-            weights = weights * (1.0 + (gold_weight_mult - 1.0) * has_gold)
-
-        # Apply pre-allocated rare target upweighting
-        weights = weights * _rare_vec
+            verified_gold = weights >= 0.99
+            weights = weights * (
+                1.0 + (gold_weight_mult - 1.0) * verified_gold
+            )
 
         # Optional label smoothing
         if label_smoothing > 0.0:
             targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
 
-        # Feature-space Mixup (Upgrade I): mix logits as a proxy for features
-        # [ANTI-DEGRADATION FIX]: Logit mixing heavily distorts sigmoid probability 
-        # calibration and actively harms the ASL loss gradients. Disabled to protect AUC.
-        # if mixup_alpha > 0.0:
-        #     logits, targets, weights = mixup_features(logits, targets, weights, mixup_alpha)
-
         with ctx:
             loss = criterion(logits.float(), targets, weights)
-            loss = loss / grad_accum
+            loss = loss / accumulation_steps
 
         scaler.scale(loss).backward()
 
@@ -320,16 +303,14 @@ def train_epoch(
         if (micro_step + 1) % grad_accum == 0 or is_last:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, 0.5, foreach=True)
+            scale_before_step = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            if ema_model is not None:
-                base_m = model.module if isinstance(model, nn.DataParallel) else model
-                ema_model.update_parameters(base_m)
-            opt_step += 1
+            if not scaler.is_enabled() or scaler.get_scale() >= scale_before_step:
+                scheduler.step()
 
-        total_loss_tensor += loss.detach() * grad_accum  # Fully async logging
+        total_loss_tensor += loss.detach() * accumulation_steps
         n += 1
 
         if (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:
@@ -357,7 +338,7 @@ def train_epoch(
 
     ret_loss = float(total_loss_tensor.item()) / max(n, 1)
     # UNIFIED MEMORY AUDIT: Purge all batch and intermediate tensors from local scope
-    del total_loss_tensor, _rare_vec, trainable_params
+    del total_loss_tensor, trainable_params
     if 'batch' in locals():
         del batch, imgs, masks, wmasks, targets, weights
     if 'logits' in locals():
@@ -434,9 +415,10 @@ def run_training(
     # training recipe
     batch_size: int = config.BATCH_SIZE,
     grad_accum: int = config.GRAD_ACCUM,
-    mixup_alpha: float = config.MIXUP_ALPHA,  # Upgrade I
     swa_epochs: int = config.SWA_EPOCHS,       # Upgrade E
     early_stop_patience: int = config.EARLY_STOP_PATIENCE,
+    timm_pooling: str = "hierarchical",
+    use_slot_prior: bool = True,
 ) -> float:
     """Train one fold and save the best checkpoint + optional SWA checkpoint.
 
@@ -455,18 +437,61 @@ def run_training(
         raise ValueError(f"Unsupported model_type: {model_type}")
 
     if folds_csv:
-        df = df.merge(pd.read_csv(folds_csv)[["StudyInstanceUID", "fold"]],
-                      on="StudyInstanceUID", how="inner")
+        fold_table = pd.read_csv(
+            folds_csv, dtype={"StudyInstanceUID": str}
+        )[["StudyInstanceUID", "fold"]]
+        if fold_table["StudyInstanceUID"].duplicated().any():
+            raise ValueError("folds manifest contains duplicate StudyInstanceUID values")
+        if set(fold_table["StudyInstanceUID"]) != set(df["StudyInstanceUID"].astype(str)):
+            raise ValueError("folds manifest must cover the label table exactly")
+        fold_values = pd.to_numeric(fold_table["fold"], errors="raise")
+        if (
+            fold_values.isna().any()
+            or not np.equal(fold_values, fold_values.astype(int)).all()
+            or not set(fold_values.astype(int)).issubset(set(range(5)))
+        ):
+            raise ValueError("folds manifest must assign integer fold IDs in 0..4")
+        fold_table["fold"] = fold_values.astype(int)
+        df["StudyInstanceUID"] = df["StudyInstanceUID"].astype(str)
+        df = df.merge(
+            fold_table,
+            on="StudyInstanceUID",
+            how="inner",
+            validate="one_to_one",
+        )
         tr, va = df[df.fold != fold], df[df.fold == fold]
     else:
         tr, va = df, df.iloc[:0]
 
-    n_ep = epochs or config.EPOCHS
+    n_ep = config.EPOCHS if epochs is None else epochs
+    if not 0 <= fold < 5:
+        raise ValueError(f"fold must be in 0..4, got {fold}")
+    if n_ep < 1 or n_windows_train < 1 or early_stop_patience < 1:
+        raise ValueError(
+            "epochs, n_windows_train, and early_stop_patience must be positive"
+        )
+    if swa_epochs < 0 or swa_epochs > n_ep:
+        raise ValueError(f"swa_epochs must be in 0..{n_ep}, got {swa_epochs}")
+    if label_smoothing < 0 or label_smoothing >= 1:
+        raise ValueError("label_smoothing must be in [0, 1)")
+    if (
+        batch_size < 1
+        or grad_accum < 1
+        or num_workers < 0
+        or prefetch_factor < 1
+        or eval_batch_size < 1
+    ):
+        raise ValueError(
+            "batch_size, grad_accum, prefetch_factor, and eval_batch_size must be "
+            ">= 1; num_workers must be >= 0"
+        )
+    if tr.empty:
+        raise ValueError(f"fold {fold} has no training studies")
     print(
         f"device={device}  train={len(tr)}  val={len(va)}  fold={fold}  "
         f"preset={cfg.name}  D={cfg.stack_depth}  img={cfg.img_size}  "
         f"model={model_type}/{variant}  epochs={n_ep}  loss={loss_name}  "
-        f"mixup={mixup_alpha}  swa={swa_epochs}ep"
+        f"swa={swa_epochs}ep"
     )
 
     # ── Model ────────────────────────────────────────────────────────────────
@@ -474,11 +499,13 @@ def run_training(
         variant=variant,
         unfreeze_last=unfreeze_last,
         use_cross_slot=use_cross_slot,
+        use_slot_prior=use_slot_prior,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         model_type=model_type,
         input_size=model_input_size,
         encode_chunk_size=encode_chunk_size,
+        timm_pooling=timm_pooling,
         pretrained=pretrained,
     ).to(device)
     if model_type in ("coatnet_mil", "timm_mil"):
@@ -487,6 +514,7 @@ def run_training(
             "variant": variant,
             "input_size": model_input_size,
             "encode_chunk_size": encode_chunk_size,
+            "timm_pooling": timm_pooling,
             "pretrained": False,
         }
     else:
@@ -495,10 +523,12 @@ def run_training(
             "variant": variant,
             "unfreeze_last": unfreeze_last,
             "use_cross_slot": use_cross_slot,
+            "use_slot_prior": use_slot_prior,
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "truncate_blocks": 0,
         }
+        model_config["backbone_config"] = model.backbone.config.to_dict()
 
     # Multi-GPU DataParallel for extreme throughput on DGX systems
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
@@ -508,24 +538,14 @@ def run_training(
     else:
         model_train = model
 
-    # ── Loss (Upgrade B) ─────────────────────────────────────────────────────
-    # Use per-target gamma_neg if configured; fall back to scalar if run_training
-    # is called with an explicit asl_gamma_neg override.
-    _gamma_neg = (
-        config.ASL_GAMMA_NEG_PER_TARGET
-        if (loss_name == "asl" and asl_gamma_neg == config.ASL_GAMMA_NEG
-            and hasattr(config, "ASL_GAMMA_NEG_PER_TARGET"))
-        else asl_gamma_neg
-    )
+    # ── Loss ─────────────────────────────────────────────────────────────────
     criterion = build_loss(
         loss_name,
-        **({"gamma_neg": _gamma_neg, "gamma_pos": asl_gamma_pos, "clip": asl_clip}
+        **({"gamma_neg": asl_gamma_neg, "gamma_pos": asl_gamma_pos, "clip": asl_clip}
            if loss_name == "asl" else {}),
     ).to(device)
 
     # ── Datasets ─────────────────────────────────────────────────────────────
-    if num_workers < 0 or prefetch_factor < 1 or eval_batch_size < 1:
-        raise ValueError("num_workers must be >= 0, prefetch_factor and eval_batch_size must be >= 1")
     num_workers = min(num_workers, os.cpu_count() or 1)
     gold_mask = (
         va[[f"{target}_weight" for target in config.TARGETS]]
@@ -537,6 +557,15 @@ def run_training(
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
     ds_va = RSNADataset(va_gold, cache_prefix, cfg, False, None, seed, aug=False) if len(va_gold) else None
     ds_oof = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
+    if len(ds_tr) != len(tr):
+        raise RuntimeError(
+            f"training cache is missing {len(tr) - len(ds_tr)} studies from fold {fold}"
+        )
+    if ds_oof is not None and len(ds_oof) != len(va):
+        raise RuntimeError(
+            f"training cache is missing {len(va) - len(ds_oof)} held-out studies "
+            f"from fold {fold}"
+        )
     queued_train_gb = (
         _loader_batch_bytes(cfg, n_windows_train, batch_size)
         * num_workers * prefetch_factor / (1024 ** 3)
@@ -553,7 +582,10 @@ def run_training(
     # IMPROVEMENT 3: WD=0 for biases and norm layers (standard ViT recipe).
     # DINOv2 Pre-LayerNorm scale params must not be decayed.
     def _is_no_decay(name):
-        return name.endswith('.bias') or 'norm' in name.lower()
+        components = name.lower().split(".")
+        return name.endswith(".bias") or any(
+            component.startswith(("norm", "bn")) for component in components
+        )
 
     # FIX: inner_model was never defined; the variable is just `model`.
     inner_model = model  # alias for clarity in checkpoint saving below
@@ -639,10 +671,32 @@ def run_training(
         + backbone_params
     )
     optimizer = torch.optim.AdamW(optimizer_groups, fused=(device.type == "cuda"))
+    optimizer_parameter_ids = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    trainable_parameter_ids = {
+        id(parameter)
+        for parameter in inner_model.parameters()
+        if parameter.requires_grad
+    }
+    if (
+        len(optimizer_parameter_ids) != len(set(optimizer_parameter_ids))
+        or set(optimizer_parameter_ids) != trainable_parameter_ids
+    ):
+        raise RuntimeError(
+            "Optimizer parameter groups must contain every trainable parameter "
+            "exactly once"
+        )
 
     # ?? LR Schedule (Upgrade J: cosine with warmup) ??????????????????????????
-    dl_tr_len = len(tr) // batch_size if len(tr) > batch_size else len(tr)
-    steps_per_epoch = math.ceil(dl_tr_len / grad_accum) if dl_tr_len > 0 else 1
+    train_batches = (
+        len(tr) // batch_size
+        if len(tr) > batch_size
+        else int(len(tr) > 0)
+    )
+    steps_per_epoch = math.ceil(train_batches / grad_accum) if train_batches else 1
     total_steps = n_ep * max(steps_per_epoch, 1)
     scheduler = _build_schedule(optimizer, total_steps, warmup_frac=0.08)
 
@@ -655,13 +709,6 @@ def run_training(
     swa_model: AveragedModel | None = None
     if swa_epochs > 0:
         swa_model = AveragedModel(model)
-
-    # FIX 2: EMA model — exponential moving average (decay=0.9998 per step).
-    # EMA gives a continuous smooth average of the weights, providing better
-    # generalization than the instantaneous best checkpoint (verified across
-    # ViT fine-tuning literature). Previously computed but never saved — fixed.
-    # Fix: 0.995 decay gives a half-life of ~1 epoch (146 steps), perfectly erasing the ghost weights of Epoch 1.
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.995))
 
     os.makedirs(out_dir, exist_ok=True)
     best, t0 = -1.0, time.time()
@@ -684,19 +731,15 @@ def run_training(
         for ep in range(n_ep):
             ds_tr.set_epoch(ep)
 
-            # Gold upweighting: constant 1.5× throughout training.
-            # Constant (not curriculum) avoids Adam momentum destabilization from
-            # hard weight-schedule flips mid-training. 1.5× is moderate enough not
-            # to overfit to the small gold set, but enough to prioritize verified labels.
+            # Gold upweighting is a fixed heuristic and has not been isolated
+            # in a matched validation ablation.
             loss_val = train_epoch(
                 model_train, dl_tr, optimizer, scaler, scheduler, device,
                 criterion,
                 epoch=ep + 1,
                 total_epochs=n_ep,
                 label_smoothing=label_smoothing,
-                mixup_alpha=mixup_alpha,
                 grad_accum=grad_accum,
-                ema_model=ema_model,
                 gold_weight_mult=1.5,
             )
 
@@ -721,13 +764,18 @@ def run_training(
                 best = score if ds_va is not None else best
                 epochs_no_improve = 0
                 ckpt_file = os.path.join(out_dir, f"fold{fold}_best.pt")
-                torch.save(
-                    dict(model=inner_model.state_dict(),
-                         cfg=dataclasses.asdict(cfg),
-                         model_config=model_config,
-                         fold=fold, epoch=ep + 1, val=score,
-                         variant=variant,
-                         use_cross_slot=use_cross_slot),
+                _atomic_torch_save(
+                    dict(
+                        model=inner_model.state_dict(),
+                        cfg=dataclasses.asdict(cfg),
+                        model_config=model_config,
+                        targets=config.TARGETS,
+                        fold=fold,
+                        epoch=ep + 1,
+                        val=score,
+                        variant=variant,
+                        use_cross_slot=use_cross_slot,
+                    ),
                     ckpt_file,
                 )
                 print(f"  [CHECKPOINT] New best validation AUC: {best:.4f} -> Saved {ckpt_file}", flush=True)
@@ -789,29 +837,22 @@ def run_training(
             safe_update_bn(dl_swa, swa_model, device=device)
             active_loaders = []
             del dl_swa
-            torch.save(
-                dict(model=swa_model.module.state_dict(),
-                     cfg=dataclasses.asdict(cfg),
-                     model_config=model_config,
-                     fold=fold, epoch=ep + 1, val=best,
-                     swa=True, variant=variant,
-                     use_cross_slot=use_cross_slot),
+            _atomic_torch_save(
+                dict(
+                    model=swa_model.module.state_dict(),
+                    cfg=dataclasses.asdict(cfg),
+                    model_config=model_config,
+                    targets=config.TARGETS,
+                    fold=fold,
+                    epoch=ep + 1,
+                    val=best,
+                    swa=True,
+                    variant=variant,
+                    use_cross_slot=use_cross_slot,
+                ),
                 os.path.join(out_dir, f"fold{fold}_swa.pt"),
             )
             print(f"SWA checkpoint saved → fold{fold}_swa.pt")
-
-        # FIX 2: Save EMA checkpoint — this is the primary checkpoint for inference.
-        # EMA weights are strictly better than instantaneous best for ViTs.
-        torch.save(
-            dict(model=ema_model.module.state_dict(),
-                 cfg=dataclasses.asdict(cfg),
-                 model_config=model_config,
-                 fold=fold, epoch=ep + 1, val=best,
-                 ema=True, variant=variant,
-                 use_cross_slot=use_cross_slot),
-            os.path.join(out_dir, f"fold{fold}_ema.pt"),
-        )
-        print(f"EMA checkpoint saved → fold{fold}_ema.pt")
 
         _shutdown_loader(dl_tr)
         active_loaders = []
@@ -904,8 +945,6 @@ def run_training(
         del ds_va
     if swa_model is not None:
         del swa_model
-    if ema_model is not None:
-        del ema_model
     import gc
     gc.collect()
     if device.type == "cuda":

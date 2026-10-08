@@ -540,6 +540,8 @@ def run_all_folds(
     variant: str = "dinov2-base",
     model_type: str = "dinov2",
     pretrained: bool = True,
+    timm_pooling: str = "hierarchical",
+    use_slot_prior: bool = True,
 ) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
@@ -590,6 +592,8 @@ def run_all_folds(
                 n_windows_train=n_windows_train,
                 variant=variant,
                 model_type=model_type,
+                timm_pooling=timm_pooling,
+                use_slot_prior=use_slot_prior,
                 pretrained=pretrained,
                 use_cross_slot=True,
                 swa_epochs=config.SWA_EPOCHS,
@@ -857,7 +861,22 @@ def main():
     parser.add_argument("--folds", type=str, default="0,1,2,3,4", help="Comma-separated list of folds to train (e.g. '0,1,2,3,4')")
     parser.add_argument("--model_type", choices=["dinov2", "coatnet_mil", "timm_mil"], default="dinov2", help="Training architecture family")
     parser.add_argument("--variant", type=str, default=None, help="Backbone variant or timm architecture name (defaults by model family)")
-    parser.add_argument("--random_init", action="store_true", help="Do not load timm pretrained weights (CoAtNet MIL only)")
+    parser.add_argument(
+        "--timm_pooling",
+        choices=["hierarchical", "flat"],
+        default="hierarchical",
+        help="timm MIL pooling: target-specific windows within each slot, then target-specific slot fusion; flat preserves the legacy design",
+    )
+    parser.add_argument(
+        "--no_slot_prior",
+        action="store_true",
+        help="Disable the hand-coded anatomical attention prior in the DINOv2 slot head",
+    )
+    parser.add_argument(
+        "--random_init",
+        action="store_true",
+        help="Do not load pretrained weights (timm-based MIL models only)",
+    )
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
     parser.add_argument(
         "--prepare_only",
@@ -874,7 +893,7 @@ def main():
         "--ensemble_checkpoints",
         nargs="+",
         default=None,
-        help="Additional trained checkpoints; with DINOv2 and CoAtNet, applies the d4 target-specific rank blend",
+        help="Additional trained checkpoints; families receive equal rank-blend weight unless --d4_target_weights is set",
     )
     parser.add_argument("--max_ram_gb", type=float, default=config.CIRCUIT_BREAKER_MAX_RAM_GB, help="Unified-memory hard safety ceiling in GiB (default: 100 GiB)")
     args = parser.parse_args()
@@ -903,6 +922,8 @@ def main():
             if args.model_type in ("coatnet_mil", "timm_mil")
             else "dinov2-base"
         )
+    if args.random_init and args.model_type == "dinov2":
+        parser.error("--random_init is supported only for timm-based MIL models")
     if args.ensemble_checkpoints:
         missing_checkpoints = [p for p in args.ensemble_checkpoints if not os.path.isfile(p)]
         if missing_checkpoints:
@@ -1001,6 +1022,8 @@ def main():
                 n_windows_train=args.n_windows_train,
                 variant=args.variant,
                 model_type=args.model_type,
+                timm_pooling=args.timm_pooling,
+                use_slot_prior=not args.no_slot_prior,
                 pretrained=not args.random_init,
             )
 

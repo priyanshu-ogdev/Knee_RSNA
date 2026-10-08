@@ -19,11 +19,12 @@ Only valid windows are sent through the image backbone.
 
 ## 2. DINOv2 feature extraction
 
-`build_model()` uses a Hugging Face DINOv2 backbone (Base by default). Training
-freezes the backbone initially, then applies the configured LoRA adapters and
-unfreezes the final transformer blocks. The actual defaults are defined in
-`src/core/config.py`; checkpoints record the model configuration so inference
-can reconstruct the same architecture.
+`build_model()` uses a Hugging Face DINOv2 backbone (Base by default). The
+default recipe freezes the early backbone blocks and fine-tunes the final
+transformer blocks and final layer norm; LoRA is disabled unless explicitly
+configured. The actual defaults are defined in `src/core/config.py`;
+checkpoints record the model configuration so inference can reconstruct the
+same architecture.
 
 For each window, the feature vector concatenates the CLS token, mean patch
 embedding, and mean embedding of the highest-magnitude patch tokens. A
@@ -32,23 +33,61 @@ per anatomical slot. An optional `CrossSlotTransformer` models interactions
 between the six slots, followed by a target-query `SlotHead` that returns one
 logit per finding.
 
-## 3. Training objective
+## 3. Training objective and optimization
 
-The default objective is Asymmetric Loss. With `p = sigmoid(logit)` and
+The default objective is Asymmetric Loss with one shared negative focusing
+exponent, rather than twelve prevalence-derived exponents estimated from the
+small Gold cohort. With `p = sigmoid(logit)` and
 `p_neg = min(1, 1 - p + clip)`, the negative log term is
-`(1 - target) * log(p_neg)`. Focusing uses `p` for positive entries and
-`p_neg` for negative entries; unlabeled entries are excluded using zero
-weights. `WeightedBCE` remains available for controlled ablations.
+`(1 - target) * log(p_neg)`. A larger negative focusing exponent suppresses
+easy negatives; it does not directly increase positive-example weight.
+Unlabeled entries are excluded. Confidence weights scale each labeled
+entry's loss, and per-target losses are averaged across labeled entries before
+the twelve target losses are averaged. This keeps pseudo-label confidence
+meaningful instead of dividing it out. Gold upweighting applies only to
+verified Gold target entries, not to other pseudo-labels from the same study.
+`WeightedBCE` uses the same confidence-weighting and masking convention for
+controlled ablations.
 
-## 4. CoAtNet attention-MIL model
+The former constant rare-target multipliers canceled out because each target
+loss was divided by its own sum of weights; they are removed rather than
+presented as an effective intervention. Partial final gradient-accumulation
+groups are averaged by their actual number of microbatches. The best raw
+checkpoint is the same checkpoint used to produce OOF predictions; no separate
+EMA checkpoint is saved because EMA was not used for selection or OOF.
 
-Select `--model_type coatnet_mil` and a timm architecture such as
+Optimization is intentionally different between the backbones: DINOv2
+fine-tunes its final eight blocks with layer-wise learning-rate decay while
+keeping earlier blocks frozen; timm currently fine-tunes its full backbone
+with a lower backbone learning rate than its MIL head. Both use AdamW,
+warmup-plus-cosine scheduling, mixed precision, and gradient clipping. These
+are starting recipes, not experimentally established optima for this dataset.
+
+## 4. timm attention-MIL models
+
+Select `--model_type timm_mil` or `--model_type coatnet_mil` and a timm architecture such as
 `coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k`. This arm uses the same six-slot cache
 and label weights as DINOv2. It resizes each valid cached window to 384 pixels,
 applies ImageNet normalization, encodes windows in bounded chunks, and pools
-the resulting window features with a separate attention distribution per
-finding. Empty slots/studies are masked. Pretrained timm weights are used by
-default; `--random_init` disables that initialization.
+the resulting window features. Pretrained timm weights are used by default;
+`--random_init` disables that initialization.
+
+New training runs default to `--timm_pooling hierarchical`: for each target,
+an attention distribution pools windows within each anatomical slot, then a
+second target-specific attention distribution fuses the six slot summaries.
+Learned slot embeddings and target-by-slot biases expose the fixed series
+identity without adding a recurrent order-sensitive head. This is a small,
+explicit architectural alternative, not a proven score improvement. Use
+`--timm_pooling flat` as the matched legacy ablation. Checkpoints record the
+pooling mode; older timm checkpoints without this metadata are reconstructed
+with their original flat pooling and state-dict layout.
+
+The two-stage pooling is permutation-invariant over windows within each fixed
+slot, so using five sampled windows in training and more windows at evaluation
+does not create the sequence-index mismatch that a recurrent ordered head
+would. It still needs empirical validation: learned attention can already
+suppress irrelevant windows in the flat model, so hierarchy is a structural
+ablation, not a guaranteed AUC gain.
 
 For a memory-conscious DGX Spark starting run:
 
@@ -59,15 +98,14 @@ python src/main.py --model_type coatnet_mil --variant coatnet_rmlp_2_rw_384.sw_i
 This is a starting configuration, not a measured throughput or score
 recommendation; tune only after observing unified-memory use on the host.
 
-The DINOv2 model retains slot identity through per-slot window pooling,
-learned slot embeddings, cross-slot attention, and target-to-slot attention.
-The timm MIL implementation currently flattens valid windows across all six
-slots before target-specific pooling, so it has no explicit slot token or
-cross-slot stage. That makes it a useful CNN-vs-transformer ablation, but not
-an architectural match to the D4 Raptor/CoAtNet family. A worthwhile follow-up
-ablation is hierarchical timm pooling (windows within slots, then slots per
-target); keep it separate from the existing model until matched-fold results
-show a benefit.
+The DINOv2 model pools windows within slots, optionally mixes the six slot
+tokens with a CrossSlotTransformer, and uses target-to-slot attention with an
+anatomical prior. The fixed prior is an unvalidated hypothesis; compare it
+with `--no_slot_prior` rather than assuming it improves localization. The timm
+hierarchical option also preserves slot identity,
+but does not use the DINOv2 cross-slot transformer. Flat pooling remains
+available for matched comparison. Neither local architecture reproduces the
+D4 Raptor readers or their full preprocessing/checkpoint contracts.
 
 ## 5. Outputs and checkpoint contract
 
@@ -123,6 +161,18 @@ predictions are rank-normalized before blending. With only 58 Gold studies,
 avoid fitting many target-specific blend weights or nonlinear stackers to the
 same validation predictions.
 
+For architecture comparisons, keep the cache, exact fold assignments,
+initialization, seeds, augmentations, optimizer budget, and checkpoint policy
+fixed; change one factor at a time (for example, flat versus hierarchical
+timm pooling, or DINO slot prior on versus off). Report per-target Gold AUC,
+macro AUC, the number of positive and negative Gold cases per target, and
+paired study-level uncertainty. Check family rank correlation and the
+equal-family OOF blend before adding an architecture to the test ensemble.
+Because each current fold's epoch is selected on that same fold's Gold labels,
+its aggregate OOF score is selection-biased; use a predeclared epoch policy or
+nested validation for stronger model-selection evidence. There is no DGX
+training run or measured leaderboard gain in this repository.
+
 For live inference, pass trained DINOv2 and CoAtNet checkpoints together:
 
 ```bash
@@ -174,9 +224,11 @@ flags only from measured throughput and memory on the DGX.
 
 The training dataset shares its epoch counter with persistent workers so that
 window sampling and augmentation remain fresh and deterministic across
-epochs. A fold's best checkpoint is selected using only Gold-labeled studies;
-after training, OOF inference covers every study in the requested held-out
-fold. Checkpoint verification checks requested folds and exact OOF study-ID
-coverage. Existing artifacts for a requested fold are not overwritten; use a
-new `--model_dir` for a new run. The default SWA pass is disabled because the
-pipeline retains EMA and SWA added an unused model copy and full-data pass.
+epochs. A fold's best raw checkpoint is selected using only Gold-labeled
+studies; after training, the same weights generate OOF predictions covering
+every study in the requested held-out fold. Checkpoint verification checks
+requested folds and exact OOF study-ID coverage. Existing artifacts for a
+requested fold are not overwritten; use a new `--model_dir` for a new run.
+EMA is not maintained: it doubled model-state storage without being used for
+checkpoint selection or OOF. The default SWA pass is disabled; enable it only
+as a measured ablation.

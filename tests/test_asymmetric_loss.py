@@ -31,3 +31,14 @@ def test_asymmetric_loss_masks_unlabeled_entries_and_has_finite_gradients():
     assert torch.isfinite(logits.grad).all()
     assert logits.grad[0, 1] == 0
     assert logits.grad[1, 0] == 0
+
+
+def test_confidence_weights_scale_loss_instead_of_normalizing_away():
+    logits = torch.tensor([[0.4, -0.2], [-0.5, 0.8]])
+    targets = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    loss_fn = AsymmetricLoss(gamma_neg=2.0)
+
+    full_confidence = loss_fn(logits, targets, torch.ones_like(targets))
+    half_confidence = loss_fn(logits, targets, torch.full_like(targets, 0.5))
+
+    torch.testing.assert_close(half_confidence, full_confidence * 0.5)

@@ -1,4 +1,4 @@
-# RSNA 2026: End-to-End Installation & Execution Guide
+# RSNA Knee Classification: Installation & Execution
 
 This guide covers the deployment of the RSNA Knee Abnormality Detection pipeline on a DGX/Linux server for mass parallelized extraction and training, followed by Kaggle deployment.
 
@@ -13,7 +13,7 @@ This guide covers the deployment of the RSNA Knee Abnormality Detection pipeline
 ## 2. Environment Setup
 
 ### Step 2.1: Clone the Repository
-Clone your completely updated and hardened repository:
+Clone the repository:
 ```bash
 git clone https://github.com/priyanshu-ogdev/Knee_RSNA.git
 cd Knee_RSNA
@@ -27,7 +27,7 @@ conda activate rsna
 ```
 
 ### Step 2.3: Install Dependencies
-Install all required dependencies. Our patches have ensured that `vllm`, `dicomsdl`, `timm`, `pydicom`, and `tenacity` are fully integrated.
+Install the base Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
@@ -35,7 +35,10 @@ pip install -r requirements.txt
 ---
 
 ## 3. Authentication (.env Configuration)
-Both the Kaggle dataset download and the HuggingFace `Nemotron-70B` model require authentication.
+Credentials are needed only for the corresponding optional downloads: Kaggle
+credentials for `kagglehub` competition downloads, and a Hugging Face token if
+you select a gated model. The default NLP engine can use the clinical-rules
+extractor and does not require vLLM or a Hugging Face model.
 
 Create a `.env` file in the root of the repository (`Knee_RSNA/.env`):
 ```bash
@@ -43,10 +46,10 @@ touch .env
 ```
 Open it and add your keys:
 ```env
-# HuggingFace Token (Required to download the Llama-3.1-Nemotron-70B model)
+# Optional: Hugging Face access for a selected gated NLP model
 HF_TOKEN=your_huggingface_token_here
 
-# Kaggle Credentials (Required to download the 570GB dataset)
+# Optional: KaggleHub competition download credentials
 KAGGLE_USERNAME=your_kaggle_username
 KAGGLE_KEY=your_kaggle_api_key
 ```
@@ -89,13 +92,23 @@ Validation for checkpoint selection runs only on Gold-labeled studies. The subse
 ## 5. Kaggle Offline Submission (Inference)
 Kaggle requires an offline (internet-disabled) environment for submission. 
 
-### Step 5.1: Create Kaggle Datasets
-1. Zip your entire `Knee_RSNA` folder (which now contains `pipeline_out/` and your trained `foldX_ema.pt` weights). Upload this as a Private Kaggle Dataset named `rsna-knee-models`.
-2. Download `.whl` files for `dicomsdl` and `timm` locally, and upload them as a second Private Kaggle Dataset named `rsna-wheels`.
+### Step 5.1: Create a checkpoint dataset
+1. Upload a zip containing the trained task-specific checkpoint files
+   (`fold*_best.pt`, preserving their model-family/fold directories) as a
+   private Kaggle dataset. Do not zip the DICOM cache or the entire work
+   directory; the cache is large and is rebuilt for test inference.
+2. Attach compatible offline wheels only for dependencies missing from the
+   Kaggle runtime. Check the runtime first; do not assume `vllm` or
+   `dicomsdl` is installed by `requirements.txt`.
 
 ### Step 5.2: Run the Notebook
 1. Open a new Kaggle Notebook attached to the competition.
-2. Attach both of your private datasets (`rsna-knee-models` and `rsna-wheels`).
+2. Attach the checkpoint dataset and any required offline dependency wheels.
 3. Import the `notebooks/kaggle_submission.ipynb` code from your repo.
 4. Ensure the paths in the notebook point to your attached datasets.
-5. Click **Submit**. The notebook is already hardcoded to dynamically deploy Batch=8 Dual-T4 DataParallel inference using your EMA checkpoints.
+5. Click **Submit**. The notebook currently loads DINOv2 and CoAtNet
+   checkpoints and `timm_mil` checkpoints, prefers `fold*_best.pt`, and falls
+   back to EMA/SWA only when a best checkpoint is absent. Its inference path
+   uses batch size 8 with multi-GPU wrapping when supported by the Kaggle
+   runtime. It is a separately embedded source snapshot; regenerate and
+   validate its embedded modules after future `src/` changes.

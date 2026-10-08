@@ -23,8 +23,8 @@ def _sha256_file(path):
 def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
     """root: competition folder. extra_csv: same schema as train.csv (targets may be soft probabilities in [0,1]),
     optionally with '<target>_weight' columns (extractor confidence). -> DataFrame (and CSV if out_csv)."""
-    if not np.isfinite(extra_weight) or extra_weight < 0:
-        raise ValueError(f"extra_weight must be finite and non-negative, got {extra_weight!r}")
+    if not np.isfinite(extra_weight) or not 0.0 <= extra_weight <= 1.0:
+        raise ValueError(f"extra_weight must be finite and in [0, 1], got {extra_weight!r}")
     tr = pd.read_csv(os.path.join(root, 'train.csv'))
     if 'StudyInstanceUID' not in tr or tr['StudyInstanceUID'].isna().any():
         raise ValueError("train.csv contains a missing StudyInstanceUID")
@@ -33,6 +33,8 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
         raise ValueError("train.csv must have non-empty, unique StudyInstanceUID values")
     gold = {t: (tr[t].astype(float) if t in tr.columns else pd.Series(np.nan, index=tr.index)) for t in config.TARGETS}
     for target, values in gold.items():
+        if np.isinf(values.to_numpy(dtype=float)).any():
+            raise ValueError(f"gold labels for {target!r} must be finite or missing")
         finite = values[np.isfinite(values)]
         if not finite.between(0.0, 1.0).all():
             raise ValueError(f"gold labels for {target!r} must be in [0, 1]")
@@ -60,6 +62,8 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
         w = np.where(np.isfinite(g), 1.0, 0.0)
         if ex is not None and t in ex.columns:
             e = ex[t].astype(float).values
+            if np.isinf(e).any():
+                raise ValueError(f"extra labels for {t!r} must be finite or missing")
             finite = e[np.isfinite(e)]
             if not np.logical_and(finite >= 0.0, finite <= 1.0).all():
                 raise ValueError(f"extra labels for {t!r} must be in [0, 1]")

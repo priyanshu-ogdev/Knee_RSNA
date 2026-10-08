@@ -9,7 +9,7 @@ import src.core.config as config
 
 
 class TimmAttentionMIL(nn.Module):
-    """Encode valid slot windows and pool them with one attention distribution per finding."""
+    """Encode valid windows with flat or slot-hierarchical target attention."""
 
     def __init__(
         self,
@@ -17,14 +17,18 @@ class TimmAttentionMIL(nn.Module):
         feature_dim: int,
         input_size: int = config.COATNET_INPUT_SIZE,
         encode_chunk_size: int = config.COATNET_ENCODE_CHUNK,
+        pooling_mode: str = "flat",
     ):
         super().__init__()
         if input_size <= 0 or encode_chunk_size <= 0:
             raise ValueError("input_size and encode_chunk_size must be positive")
+        if pooling_mode not in {"flat", "hierarchical"}:
+            raise ValueError(f"unsupported timm MIL pooling mode: {pooling_mode!r}")
         self.backbone = backbone
         self.feature_dim = int(feature_dim)
         self.input_size = int(input_size)
         self.encode_chunk_size = int(encode_chunk_size)
+        self.pooling_mode = pooling_mode
         self.model_type = "coatnet_mil"
         self.norm = nn.LayerNorm(self.feature_dim)
         self.attention = nn.Sequential(
@@ -35,6 +39,18 @@ class TimmAttentionMIL(nn.Module):
         )
         self.classifier = nn.Parameter(torch.empty(len(config.TARGETS), self.feature_dim))
         self.bias = nn.Parameter(torch.zeros(len(config.TARGETS)))
+        if self.pooling_mode == "hierarchical":
+            self.slot_embedding = nn.Parameter(
+                torch.empty(config.N_SLOTS, self.feature_dim)
+            )
+            self.slot_query = nn.Parameter(
+                torch.empty(len(config.TARGETS), self.feature_dim)
+            )
+            self.slot_bias = nn.Parameter(
+                torch.zeros(len(config.TARGETS), config.N_SLOTS)
+            )
+            nn.init.trunc_normal_(self.slot_embedding, std=0.02)
+            nn.init.trunc_normal_(self.slot_query, std=0.02)
         nn.init.trunc_normal_(self.classifier, std=0.02)
         self.register_buffer(
             "mean",
@@ -84,6 +100,18 @@ class TimmAttentionMIL(nn.Module):
         if imgs.ndim != 6:
             raise ValueError(f"expected images [B,S,W,3,H,W], received {tuple(imgs.shape)}")
         batch_size, slots, windows = imgs.shape[:3]
+        if imgs.shape[3] != 3:
+            raise ValueError(f"expected three adjacent-slice channels, received {imgs.shape[3]}")
+        if slot_mask.shape != (batch_size, slots):
+            raise ValueError(
+                f"slot_mask must have shape {(batch_size, slots)}, "
+                f"received {tuple(slot_mask.shape)}"
+            )
+        if window_mask.shape != (batch_size, slots, windows):
+            raise ValueError(
+                f"window_mask must have shape {(batch_size, slots, windows)}, "
+                f"received {tuple(window_mask.shape)}"
+            )
         valid = (slot_mask.unsqueeze(-1) > 0.5) & (window_mask > 0.5)
         flat_images = imgs.reshape(batch_size * slots * windows, *imgs.shape[3:])
         valid_indices = valid.reshape(-1).nonzero(as_tuple=False).flatten()
@@ -110,9 +138,45 @@ class TimmAttentionMIL(nn.Module):
             flat_features.view(batch_size, slots * windows, self.feature_dim)
         )
         valid_windows = valid.reshape(batch_size, slots * windows)
+        if self.pooling_mode == "hierarchical":
+            if slots != config.N_SLOTS:
+                raise ValueError(
+                    f"hierarchical pooling requires {config.N_SLOTS} anatomical slots, "
+                    f"received {slots}"
+                )
+            features = features.view(
+                batch_size, slots, windows, self.feature_dim
+            ) + self.slot_embedding.view(1, slots, 1, self.feature_dim)
+            scores = self.attention(features)
+            scores = scores.masked_fill(~valid.unsqueeze(-1), -10000.0)
+            window_attention = scores.softmax(dim=2)
+            slot_features = torch.einsum(
+                "bswc,bswd->bscd", window_attention, features
+            )
+
+            slot_valid = valid.any(dim=2)
+            slot_scores = torch.einsum(
+                "bscd,cd->bcs", slot_features, self.slot_query
+            ) / self.feature_dim**0.5
+            slot_scores = slot_scores + self.slot_bias.unsqueeze(0)
+            slot_scores = slot_scores.masked_fill(
+                ~slot_valid.unsqueeze(1), -10000.0
+            )
+            slot_attention = slot_scores.softmax(dim=2)
+            slot_attention = slot_attention.masked_fill(
+                ~slot_valid.any(dim=1, keepdim=True).unsqueeze(-1), 0.0
+            )
+            pooled = torch.einsum(
+                "bcs,bscd->bcd", slot_attention, slot_features
+            )
+            return (pooled * self.classifier.unsqueeze(0)).sum(-1) + self.bias
+
         scores = self.attention(features)
         scores = scores.masked_fill(~valid_windows.unsqueeze(-1), -10000.0)
         attention = scores.softmax(dim=1)
+        attention = attention.masked_fill(
+            ~valid_windows.any(dim=1, keepdim=True).unsqueeze(-1), 0.0
+        )
         pooled = torch.einsum("bnc,bnf->bcf", attention, features)
         return (pooled * self.classifier.unsqueeze(0)).sum(-1) + self.bias
 
@@ -122,6 +186,8 @@ def build_timm_attention_mil(
     pretrained: bool = False,
     input_size: int = config.COATNET_INPUT_SIZE,
     encode_chunk_size: int = config.COATNET_ENCODE_CHUNK,
+    pooling_mode: str = "flat",
+    model_type: str = "coatnet_mil",
 ) -> TimmAttentionMIL:
     try:
         import timm
@@ -140,9 +206,12 @@ def build_timm_attention_mil(
     feature_dim = getattr(backbone, "num_features", None)
     if not feature_dim:
         raise ValueError(f"timm model {arch!r} does not expose num_features")
-    return TimmAttentionMIL(
+    model = TimmAttentionMIL(
         backbone,
         feature_dim,
         input_size=input_size,
         encode_chunk_size=encode_chunk_size,
+        pooling_mode=pooling_mode,
     )
+    model.model_type = model_type
+    return model

@@ -46,9 +46,20 @@ def label_arrays(df, studies_index):
         if t not in df.columns:
             continue
         y = df[t].astype(float).values
-        lab = np.isfinite(y)
+        if np.isinf(y).any():
+            raise ValueError(f"labels for {t!r} must be finite or missing")
+        lab = ~np.isnan(y)
+        if not np.logical_and(y[lab] >= 0.0, y[lab] <= 1.0).all():
+            raise ValueError(f"labels for {t!r} must be in [0, 1]")
         Y[:, j] = np.where(lab, y, 0.0)
-        w = df[f'{t}_weight'].astype(float).values if f'{t}_weight' in df.columns else np.ones(len(df))
-        Wt[:, j] = np.where(lab, np.nan_to_num(w, nan=1.0), 0.0)
+        if f'{t}_weight' in df.columns:
+            w = df[f'{t}_weight'].astype(float).values
+            if not np.isfinite(w[lab]).all() or (w[lab] < 0).any() or (w[lab] > 1).any():
+                raise ValueError(
+                    f"confidence weights for {t!r} must be finite and in [0, 1]"
+                )
+        else:
+            w = np.ones(len(df), dtype=np.float32)
+        Wt[:, j] = np.where(lab, w, 0.0)
     rows = np.array([studies_index[s] for s in df['StudyInstanceUID']], dtype=np.int64)
     return rows, Y, Wt

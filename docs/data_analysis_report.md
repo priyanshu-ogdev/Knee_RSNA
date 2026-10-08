@@ -1,4 +1,10 @@
-# RSNA Knee Abnormality Detection — Comprehensive Dataset Audit & Engineering Specification
+# RSNA Knee Abnormality Detection — Historical Dataset Audit
+
+> This is a historical data audit, not the current preprocessing or training
+> specification. Its measured observations and earlier recommendations may
+> predate the current implementation. For behavior implemented in `src/`, see
+> [`architecture.md`](architecture.md) and
+> [`ml_model_design.md`](ml_model_design.md).
 
 ## Document Overview
 This document synthesizes the empirical findings from an exhaustive, definitive census of the RSNA Knee Abnormality Detection challenge dataset (`rsna_knee_eda.py` deep scan). Unlike sampled explorations, this audit inspected:
@@ -7,13 +13,15 @@ This document synthesizes the empirical findings from an exhaustive, definitive 
 - **Central slice decoded pixel matrices** for all 24,371 series (evaluating radiometric distributions, perceptual hashes, foreground geometry, and background noise)
 - **Cross-study consistency**, NLP report linguistics, and DICOM-to-label ground truth.
 
-This report establishes the foundational engineering constraints, edge cases, failure modes, and preprocessing specifications required to train robust deep neural networks and achieve SOTA AUC under Kaggle's 9-hour runtime and 20 GB disk quotas.
+This report records the audit observations and proposals made at the time.
+It does not establish current runtime quotas, guarantee a leaderboard score,
+or override the code-level contracts documented above.
 
 ---
 
 ## 1. Executive Summary & Core Engineering Directives
 
-| Area | Empirical Finding | Engineering Impact / Mandatory Directive |
+| Area | Empirical Finding | Earlier interpretation (not a current code requirement) |
 | :--- | :--- | :--- |
 | **DICOM Integrity** | 0 unreadable files, 0 corrupted headers, 0 mixed sizes/thickness per series. Transfer Syntax is 100% `1.2.840.10008.1.2.1` (Explicit VR Little Endian). | Pure uncompressed DICOM. Fast direct binary parsing or standard `pydicom` works uniformly without decompression codec overhead. |
 | **Window Center Fluctuations** | **51.89% of series** (12,646 series) exhibit `WindowCenter` varying by >10% across slices within the same series. | **DO NOT use DICOM header `WindowCenter` or `WindowWidth` tags.** Normalization must be computed directly from slice/volume pixel percentiles. |
@@ -362,7 +370,10 @@ Because radiologists systematically dictate standard negatives (e.g. *"Effusion:
 
 ---
 
-## 9. Computational & Storage Budget Specification (A11 Breakdown)
+## 9. Historical Computational & Storage Estimates
+
+The values below are estimates from the earlier proposed 192–320 px cache
+design, not measurements of the current 518 px/32-depth cache or the DGX Spark.
 
 ### In-Plane Resolution vs Spatial Fidelity
 - Median physical FOV: **160 mm**.
@@ -389,127 +400,26 @@ Total `uint8` storage requirements for the entire training set (4,400+ studies):
   - A 3-series setup at **$16 \times 256 \times 256$** fits safely (**13.9 GB**).
   - Storing all 6 slots at 256x256 exceeds 20 GB and triggers `DiskQuotaExceeded`.
 
-### Online Inference Feasibility (Kaggle 9-Hour Limit)
-- Measured DICOM decode speed: **12.0 ms per slice** on standard Kaggle CPU cores.
+### Earlier Online Inference Estimate (Not a Current Benchmark)
+- The original analysis used an assumed DICOM decode speed of **12.0 ms per slice**; this has not been validated against the current pipeline or target runtime.
 - For a test set of **1,000 hidden studies**:
   - Selecting 6 slots $\times$ 16 slices = **96 slices per study**.
   - Total slices to decode: $1,000 \times 96 = 96,000$ slices.
   - Total decode time on 4 CPU workers:
     $$\text{Time} = \frac{96,000 \times 0.012\text{ s}}{4} = \mathbf{288\text{ seconds (4.8 minutes)}}!$$
-  - GPU forward pass on 1,000 studies (batch size 8, DINOv2 / ConvNeXt): $\approx \mathbf{12\text{ minutes}}$.
-- **Conclusion:** There is zero need to cache test images to disk. Dynamic multi-threaded DICOM decoding directly during inference consumes less than **20 minutes total**, well within the 540-minute (9-hour) timeout.
+  - GPU forward-pass duration was estimated at approximately 12 minutes for 1,000 studies, but is not a measured current-pipeline result.
+- These arithmetic estimates are not a runtime guarantee or evidence that test
+  caching is unnecessary. Measure end-to-end inference, including cache build,
+  on the actual runtime and model set.
 
 ---
 
-## 10. Complete Preprocessing & Model Architecture Directives
+## 10. Current implementation pointers
 
-Based on the definitive audit, all pipeline components must adhere to the following specifications:
-
-```
-[Raw DICOM Files]
-       │
-       ▼
-1. SPATIAL ORDERING
-   Projection = IPP · (r × c)
-   Sort slices by Projection ascending
-       │
-       ▼
-2. 6-SLOT ROUTING
-   Route by Anatomical_Plane + Fluid_Sensitive
-   Arbitrate competing series (prefer 2D, high-res)
-   Mask missing slots
-       │
-       ▼
-3. UNIFORM DEPTH SAMPLING
-   Sample N slices (e.g. 16) evenly across volume
-       │
-       ▼
-4. RADIOMETRIC NORMALIZATION
-   Compute p1 and p99 on volume
-   V_norm = clip((V - p1) / (p99 - p1), 0, 1)
-   Pad non-square dimensions with edge reflection
-       │
-       ▼
-5. RESIZE & BATCHING
-   Bicubic interpolate to 256x256
-   Stack into [B, 6, 16, 256, 256]
-       │
-       ▼
-[Multi-View Vision Backbone]
-```
-
-### Preprocessing Code Specifications
-
-#### A. Spatial Slice Ordering
-```python
-import numpy as np
-
-def get_slice_order(slice_datasets):
-    """
-    Orders slices along the physical normal vector.
-    slice_datasets: list of pydicom dataset objects
-    """
-    iop = [float(x) for x in slice_datasets[0].ImageOrientationPatient]
-    normal = np.cross(iop[:3], iop[3:])
-    normal = normal / (np.linalg.norm(normal) + 1e-9)
-    
-    positions = []
-    for ds in slice_datasets:
-        ipp = np.array([float(x) for x in ds.ImagePositionPatient])
-        proj = np.dot(ipp, normal)
-        positions.append(proj)
-        
-    order = np.argsort(positions)
-    return [slice_datasets[i] for i in order]
-```
-
-#### B. Robust Radiometric Normalization & Padding
-```python
-def normalize_and_pad(volume, target_size=(256, 256)):
-    """
-    volume: 3D float32 array [D, H, W]
-    """
-    # 1. Percentile scaling (avoiding max outliers and signed negatives)
-    p1, p99 = np.percentile(volume, (1.0, 99.0))
-    denom = max(p99 - p1, 1e-6)
-    v_norm = np.clip((volume - p1) / denom, 0.0, 1.0)
-    
-    # 2. Aspect-preserving pad to square
-    D, H, W = v_norm.shape
-    if H != W:
-        max_dim = max(H, W)
-        pad_h = (max_dim - H) // 2
-        pad_w = (max_dim - W) // 2
-        # Edge padding to avoid artificial 0-contrast boundaries
-        v_norm = np.pad(
-            v_norm, 
-            ((0, 0), (pad_h, max_dim - H - pad_h), (pad_w, max_dim - W - pad_w)),
-            mode='edge'
-        )
-    return v_norm
-```
-
-#### C. Validation Leakage Prevention
-```python
-from scipy.sparse.csgraph import connected_components
-from scipy.sparse import csr_matrix
-
-def build_leakage_free_groups(study_df, duplicate_pairs):
-    """
-    study_df: DataFrame with StudyInstanceUID
-    duplicate_pairs: list of tuples (study_a, study_b) sharing central dhash
-    """
-    study_map = {uid: idx for idx, uid in enumerate(study_df['StudyInstanceUID'].unique())}
-    n = len(study_map)
-    row, col = [], []
-    for s1, s2 in duplicate_pairs:
-        if s1 in study_map and s2 in study_map:
-            row.extend([study_map[s1], study_map[s2]])
-            col.extend([study_map[s2], study_map[s1]])
-            
-    adj = csr_matrix((np.ones(len(row)), (row, col)), shape=(n, n))
-    n_components, labels = connected_components(adj, directed=False)
-    
-    group_mapping = {uid: labels[idx] for uid, idx in study_map.items()}
-    return study_df['StudyInstanceUID'].map(group_mapping)
-```
+The current pipeline uses a six-slot cache, three adjacent slices per 2.5D
+window, and the configured `v2` preprocessing shape of 518 pixels and stack
+depth 32. Its ordering, normalization, orientation, routing, duplicate grouping,
+and fold-validation behavior are implemented in `src/data/preprocess/` and
+`src/main.py`; do not copy the old 16-slice/256-pixel proposal above as current
+code. Model families, training losses, checkpoint selection, inference blends,
+and validation limitations are described in `docs/ml_model_design.md`.

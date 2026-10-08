@@ -1,5 +1,6 @@
 import inspect
 
+import pytest
 import torch
 from torch import nn
 
@@ -57,7 +58,71 @@ def test_load_checkpoint_infers_legacy_lora_rank_and_retains_preprocessing_confi
     loaded = model_module.load_checkpoint(str(checkpoint))
 
     assert received["lora_rank"] == 4
+    assert received["pretrained"] is False
     assert loaded._rsna_preprocessing_config == saved_cfg
+
+
+def test_dinov2_pretrained_load_failure_is_not_silently_ignored(monkeypatch):
+    def fail_to_load(*args, **kwargs):
+        raise OSError("weights unavailable")
+
+    monkeypatch.setattr(model_module.AutoModel, "from_pretrained", fail_to_load)
+
+    with pytest.raises(RuntimeError, match="refusing to silently train"):
+        model_module.build_model(variant="dinov2-base", pretrained=True)
+
+
+def test_dinov2_checkpoint_rebuild_uses_saved_backbone_config(tmp_path):
+    backbone_config = model_module.AutoConfig.for_model(
+        "dinov2",
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        image_size=32,
+        patch_size=16,
+        mlp_ratio=2,
+    ).to_dict()
+    model_config = {
+        "model_type": "dinov2",
+        "variant": "dinov2-base",
+        "pretrained": False,
+        "backbone_config": backbone_config,
+        "use_cross_slot": False,
+        "unfreeze_last": 1,
+        "lora_rank": 0,
+    }
+    model = model_module.build_model(**model_config)
+    checkpoint = tmp_path / "dinov2.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "model_config": model_config,
+            "targets": config.TARGETS,
+            "cfg": config.get_cfg("v2").__dict__,
+        },
+        checkpoint,
+    )
+
+    restored = model_module.load_checkpoint(str(checkpoint))
+
+    assert restored.backbone.config.hidden_size == 32
+    assert len(restored.backbone.encoder.layer) == 2
+
+
+def test_dinov2_slot_head_returns_bias_when_no_slots_are_valid():
+    from src.modeling.model import SlotHead
+
+    head = SlotHead(dim=8, n_slot=config.N_SLOTS, n_out=len(config.TARGETS))
+    head.eval()
+    features = torch.randn(2, config.N_SLOTS, 8)
+    mask = torch.zeros(2, config.N_SLOTS)
+
+    with torch.no_grad():
+        logits = head(features, mask)
+
+    torch.testing.assert_close(
+        logits, head.out.bias.unsqueeze(0).expand_as(logits)
+    )
 
 
 def test_resolve_preprocessing_config_uses_and_checks_checkpoint_metadata():

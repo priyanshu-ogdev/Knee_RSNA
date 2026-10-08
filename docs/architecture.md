@@ -1,76 +1,95 @@
 # RSNA Knee Classification Architecture
 
-## Current models
+This describes the implementation in `src/`. Training details and experiment
+limitations are documented in [`ml_model_design.md`](ml_model_design.md).
 
-The pipeline trains twelve study-level findings from six routed MRI series
-slots. Cached images are sampled as 2.5D windows of three adjacent slices.
-Training and inference share the same preprocessing/cache contract.
+## Data and labels
+
+The pipeline routes each study into six anatomical MRI slots. The `v2` cache
+uses 518-pixel images, stack depth 32, and windows built from three adjacent
+grayscale slices as the model's three input channels. Training samples up to
+five windows per slot; validation and inference use all available windows.
+Only valid windows are encoded.
+
+Structured competition labels take precedence target-by-target. Report-derived
+targets fill only missing labels and carry extractor confidence weights.
+Unlabeled targets are masked from the loss, not treated as negatives. Training
+validation and checkpoint selection use Gold-labeled targets only.
+
+## Model families
 
 ### DINOv2 MIL
 
-The default `dinov2` model uses a pretrained DINOv2 image encoder. It combines
-CLS, mean-patch, and high-magnitude patch features for each window, pools
-windows within each slot, optionally applies cross-slot attention, and routes
-slot features to target-specific outputs. It is task-trained using the
-competition labels; the generic DINOv2 encoder weights alone do not predict the
-twelve findings. LoRA is disabled by default. The anatomical slot prior is a
-heuristic that still needs a matched ablation.
+`dinov2` is the default. A pretrained DINOv2 backbone encodes each window
+using the CLS token, mean patch embedding, and high-magnitude patch features.
+Window attention pools features within each slot; an optional cross-slot
+transformer models interactions, then a target-specific slot head produces
+the twelve logits. The anatomical attention prior is configurable with
+`--no_slot_prior`. New checkpoints store the backbone configuration and
+target order; failed pretrained-weight loading is an error rather than a
+silent random-initialization fallback.
 
 ### timm attention MIL
 
-`timm_mil` uses a pretrained timm image backbone and target-specific attention
-over valid windows. It currently pools the windows from all slots together;
-unlike DINOv2, it does not explicitly encode slot identity or add a cross-slot
-stage. This is architectural diversity, but also a concrete ablation
-opportunity: compare flat pooling with hierarchical window-within-slot and
-slot-within-target pooling using the same folds, labels, and training budget.
-Do not promote the more complex head without repeatable out-of-fold benefit.
+`timm_mil` and `coatnet_mil` use timm image encoders and target-specific
+attention pooling. New runs use hierarchical pooling by default: pool windows
+within each of six fixed slots, then attend over valid slot summaries per
+target. Use `--timm_pooling flat` for the legacy all-windows-together ablation.
+Older checkpoints without pooling metadata retain flat pooling for state-dict
+compatibility. `--random_init` is supported only for these timm-based models.
 
-## Pretraining, task fitting, and calibration
+Hierarchical pooling preserves slot identity and remains permutation-invariant
+to windows within a slot. It avoids imposing a recurrent sequence length on
+the variable train/evaluation window sets, but has not been shown to improve
+AUC; compare it with flat pooling on matched folds before treating it as a
+gain. Both model families require task-specific training of the classification
+head. Generic ImageNet or DINOv2 weights alone are not knee classifiers.
 
-Pretrained weights provide an image representation, not a knee-abnormality
-classifier. For a generic encoder, fit at least a task-specific classification
-or MIL head; then compare a frozen-encoder probe with partial fine-tuning.
-An already-trained RSNA checkpoint can be loaded directly only when its output
-head, target order, preprocessing, and validation provenance match.
+## Objective, optimization, and evaluation
 
-Positive scalar temperature scaling preserves per-target prediction order and
-therefore cannot improve ROC-AUC by itself. It can improve probability
-calibration for a probability-sensitive metric. In a rank-based ensemble it
-does not affect ranks. With 58 Gold studies, fitting many target-specific blend
-weights or nonlinear stackers to the same predictions is prone to overfitting.
+The default objective is asymmetric loss with a shared negative focusing
+exponent. Confidence weights scale each labeled entry; each target loss is
+normalized by its labeled-entry count before the twelve target losses are
+averaged. Gold-only entries receive the configured training upweight;
+pseudo-label entries retain their confidence weights. Weighted BCE is
+available for controlled comparisons. DINOv2 fine-tunes its final backbone
+blocks with layer-wise learning-rate decay; timm currently fine-tunes the
+backbone at a lower rate than its MIL head. Both use AdamW, warmup/cosine
+scheduling, mixed precision, gradient accumulation, and clipping.
 
-## D4 comparison
+Each fold selects its best raw checkpoint using Gold validation AUC, then uses
+that checkpoint for held-out-fold predictions. OOF output is required to cover
+the requested studies and folds. Since each fold's best epoch is selected on
+the same validation labels later used in the aggregate OOF score, that score
+is selection-biased, especially with the small Gold cohort. It is internal
+comparison evidence, not an unbiased generalization estimate.
 
-The copied D4 notebook declares an inference ensemble made from external,
-task-trained checkpoints: 20 DINO members, five A5 folds, RadImageNet E10/E13/E11
-heads, four Raptor views, four CoAtNet readers, and optional student fleets.
-Its code pins and validates external artifacts; it does not train those models
-from generic weights during inference. This repository does not reproduce
-those model families, checkpoints, or all of their preprocessing.
+## Inference and ensemble
 
-The notebook in `tmp/d4_blend/` has no executed cells or saved outputs in this
-checkout. Its documented 0.946 leaderboard score and the contribution of its
-full current graph are therefore not independently verifiable here. The
-D4-derived target-specific DINO/CoAtNet weights are opt-in only; equal
-architecture-family rank blending is the local default because the local
-CoAtNet model is not the D4 Raptor/CoAtNet system.
+Inference reconstructs the model and preprocessing configuration from each
+checkpoint and rejects incompatible preprocessing metadata. It averages
+fold probabilities within each model family, converts family predictions to
+per-target average-tie percentile ranks, then averages families equally.
+`--d4_target_weights` opts into a D4-derived target-weight schedule; those
+weights were tuned for another model graph and are not presumed optimal for
+local models. Positive temperature scaling can affect calibration but cannot
+change per-target ROC-AUC ranking.
 
-## Recommended experiment order
+The Kaggle submission notebook embeds a snapshot of the source modules. Its
+current checkpoint discovery supports DINOv2, CoAtNet, and `timm_mil` families,
+including per-variant grouping for timm models. It does not automatically track
+future `src/` changes, so regenerate and validate the embedded source when the
+pipeline changes. The local pipeline is not a
+reproduction of the D4 inference graph: its external Raptor, A5, and
+RadImageNet task-trained checkpoints and preprocessing are not included.
+The copied D4 notebook has no saved execution outputs in this checkout, so
+its reported score and ensemble contribution cannot be reproduced here.
 
-1. Establish matched-fold OOF baselines for DINOv2 and one genuinely different
-   CNN backbone such as ConvNeXt-Small. Measure per-target AUC and rank
-   correlation, not only the aggregate.
-2. Test frozen-backbone/head-only training against the existing partial
-   fine-tuning recipe. Keep the validation studies Gold-only and prevent
-   pseudo-labels from becoming validation targets.
-3. If the CNN contributes complementary errors, test slot-aware hierarchical
-   MIL against flat pooling. Reuse the same folds, augmentation, epochs, and
-   label policy so the head is the only intended change.
-4. Compare equal family-rank blending with the D4-weighted blend on predictions
-   not used to select epochs or weights. Retain extra arms only when the
-   improvement is consistent and checkpoint/preprocessing provenance is
-   complete.
+## Hardware and measured limits
 
-No architecture, ensemble, memory, or leaderboard gain is claimed until these
-experiments are run on the actual dataset and DGX environment.
+The DGX Spark memory target and ceiling are safeguards, not a promise that the
+process will allocate a fixed amount of unified memory. Cache storage is
+separate from system memory; the default image cache is approximately 227 GB
+decimal before metadata and scratch space. No leaderboard improvement,
+throughput, or 0.965 score is claimed until measured on the target hardware and
+competition validation data.

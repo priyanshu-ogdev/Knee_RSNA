@@ -1,20 +1,7 @@
-"""Central configuration — v2 upgrade layer.
+"""Central configuration for preprocessing, training, and memory safeguards.
 
-Upgrade history
----------------
-J  Epochs 10→15, weight_decay 0.02→0.05, LR_BACKBONE 8e-6→5e-6.
-   Basis: ViT fine-tuning best-practices consensus 2025:
-     - weight_decay=0.05 is standard for ViTs (Dosovitskiy et al. 2021,
-       DeiT III Touvron et al. 2022, DINOv2 Oquab et al. 2023).
-     - More conservative backbone LR (5e-6) appropriate for larger Base model.
-     - 20 epochs on DGX Spark (no Kaggle 9-hr cap); cosine schedule fully decays.
-
-   TIME_BUDGET_HOURS set to 9999 (disabled on DGX Spark; no Kaggle cap).
-
-ASL defaults registered here so they can be overridden from a single place.
-
-Legacy constants (SEED, TARGETS, SLOTS, CANON_ORIENT …) are unchanged so
-existing code and notebooks keep working without modification.
+Training hyperparameters are starting values and require empirical comparison
+on the competition's Gold-labeled validation data.
 """
 import os
 from dataclasses import dataclass, replace
@@ -26,81 +13,47 @@ MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "88.0"))
 CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "100.0"))
 MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "20.0"))
 
-# ─────────────────────────────────────────── legacy training constants ────────
+# ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
-EPOCHS           = 10          # Optimized: peak validation AUC converges by epoch 6-8; 10 avoids label-noise overfitting
+EPOCHS           = 10          # Initial budget; convergence and early stopping require empirical validation
 BATCH_SIZE       = 24
 NUM_WORKERS      = 8
 PREFETCH_FACTOR  = 1
 EVAL_BATCH_SIZE  = 8
 PREPROCESS_WORKERS = 8
-GRAD_ACCUM       = 1           # Effective batch = 16 studies per optimizer step
-N_WINDOWS_TRAIN  = 5           # 5 stratified windows: 75% articular coverage (prevents MIL focal tear dilution)
-LR_HEAD          = 2e-3
-LR_BACKBONE      = 1e-5        # Scaled for effective batch=16
-WEIGHT_DECAY     = 0.05        # Standard ViT recipe
+GRAD_ACCUM       = 1           # Effective batch equals BATCH_SIZE when no final partial group exists
+N_WINDOWS_TRAIN  = 5           # Number of depth-stratified windows sampled per slot and epoch
+LR_HEAD          = 2e-3        # Starting value; not tuned by a DGX validation sweep
+LR_BACKBONE      = 1e-5        # Starting value; scaled per-layer by the DINOv2 optimizer
+WEIGHT_DECAY     = 0.05
 COATNET_LR_HEAD      = 1e-3
 COATNET_LR_BACKBONE  = 3e-5
 COATNET_WEIGHT_DECAY = 0.02
 COATNET_INPUT_SIZE   = 384
 COATNET_ENCODE_CHUNK = 8
 UNFREEZE_LAST    = 8           # Top 8 blocks fine-tuned with LLRD; blocks 0-3 frozen (preserves 2.5D MRI adaptation)
-LORA_RANK        = 0          # Upgrade B — rank for QV LoRA adapters
-LORA_ALPHA       = 32          # LoRA scaling: scale = LORA_ALPHA / LORA_RANK = 2
+LORA_RANK        = 0          # Zero disables LoRA adapters
+LORA_ALPHA       = 32          # Scaling used if a positive LoRA rank is selected
 TIME_BUDGET_HOURS = 9999.0     # DGX Spark: no Kaggle time cap — disabled
 EARLY_STOP_PATIENCE = 3        # Early stopping patience on validation Macro-AUC
 
-# SWA duplicates model state and performs an extra full training pass; EMA is
-# retained instead. Enable SWA only for a measured ablation.
+# SWA duplicates model state and performs an extra full training pass. Enable
+# it only for a measured ablation.
 SWA_EPOCHS      = 0
-SWA_LR          = 1e-6         # constant LR during SWA phase
 
 # Asymmetric Loss defaults (Ridnik et al., ICCV 2021)
-ASL_GAMMA_NEG   = 4.0          # paper default=4; our 98.7% unlabeled (de-facto negative) dataset needs full negative suppression
-ASL_GAMMA_POS   = 0.0          # positive focusing (keep 0 — never penalise true positives)
-ASL_CLIP        = 0.05         # probability shift — discards mislabelled easy negatives
-
-# Per-target ASL gamma_neg (FIX: replaces global scalar).
-# Grounded in gold-label prevalence from the 58-study gold set:
-#   Effusion=60.3%, Synovitis=46.6%, ACL=41.4%, Medial Meniscus=44.8% -> lower gamma
-#   MCL=15.5%, Lateral OA=19%, Bakers=20.7%, Medial OA=25.9% -> higher gamma
-# Higher gamma_neg = suppress easy negatives harder = better for rare positives.
-# Lower gamma_neg = don't suppress = preserve learning signal for common positives.
-ASL_GAMMA_NEG_PER_TARGET = [
-    2.0,   # ACL             (41.4% pos)
-    4.0,   # MCL             (15.5% pos) — rare, suppress negatives hard
-    2.0,   # Medial Meniscus (44.8% pos)
-    2.5,   # Lateral Meniscus(39.7% pos)
-    3.0,   # Medial OA       (25.9% pos)
-    3.5,   # Lateral OA      (19.0% pos) — rare
-    2.0,   # PF OA           (36.2% pos)
-    1.0,   # Effusion        (60.3% pos) — very common; DON'T suppress negatives hard
-    2.0,   # Synovitis       (46.6% pos)
-    3.0,   # Baker's         (20.7% pos)
-    2.5,   # Contusion       (32.8% pos)
-    2.5,   # Fracture        (31.0% pos)
-]
+ASL_GAMMA_NEG   = 4.0          # Shared negative focusing exponent; compare with BCE on matched folds
+ASL_GAMMA_POS   = 0.0
+ASL_CLIP        = 0.05         # Negative probability shift; a hypothesis for noisy labels, not a verified gain
 
 # Label smoothing (Szegedy et al. 2016; standard ViT recipe)
-LABEL_SMOOTHING = 0.0          # disabled: ASL clip=0.05 already handles label noise
+LABEL_SMOOTHING = 0.0          # Disabled in the default training recipe
 
 # Augmentation (unchanged from baseline)
 AUG_ROT_DEG  = 8.0
 AUG_SCALE    = 0.08
 AUG_SHIFT    = 0.05
 AUG_INTENSITY = 0.1
-
-# Mixup (Zhang et al., ICLR 2018 — applied in feature space, Upgrade I)
-# Rare target loss multipliers (FIX 4).
-# Fracture/Bakers/Synovitis/Contusion have <5% prevalence and dominate macro-AUC variance.
-RARE_TARGET_WEIGHTS = {
-    "Fracture":   2.5,
-    "Baker's":    2.0,
-    "Synovitis":  1.5,
-    "Contusion":  1.5,
-}
-
-MIXUP_ALPHA  = 0.0             # Beta(alpha, alpha) mixing coefficient; 0 = disabled
 
 # ─────────────────────────────────────────────── target / slot schema ────────
 TARGETS = [

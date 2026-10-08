@@ -144,7 +144,7 @@ OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT WITH ALL 12 KEYS):
 
 TARGETS & CLINICAL DEFINITIONS:
 1. ACL: Anterior Cruciate Ligament tear.
-2. MCL: Medial Collateral Ligament tear or sprain.
+2. MCL: Medial Collateral Ligament tear or sprain. Peri-ligamentous edema = present.
 3. Medial Meniscus: Medial meniscus tear. Post-operative states (meniscectomy, repairs) = absent. Grade 1/2 signal without articular extension = absent.
 4. Lateral Meniscus: Lateral meniscus tear. Post-operative states (meniscectomy) = absent. Grade 1/2 signal = absent.
 5. Medial OA: Medial tibiofemoral compartment osteoarthritis.
@@ -1257,26 +1257,48 @@ def auto_complete_extraction(
 
 
 def detect_language(report: str) -> str:
+    if not isinstance(report, str):
+        return "English"
     r_lower = report.lower()
-    if 'sağlam' in r_lower or 'yırtık' in r_lower or 'eklem' in r_lower:
-        return 'Turkish'
-    if 'ruptura' in r_lower and ('uredno' in r_lower or 'intaktno' in r_lower or 'lezija' in r_lower):
-        return 'Croatian/Serbian'
-    elif 'uredno' in r_lower or 'intaktno' in r_lower:
-        return 'Croatian/Serbian'
-    if 'повреда' in r_lower or 'разрыв' in r_lower or 'без' in r_lower:
-        return 'Russian'
-    if 'ρήξη' in r_lower or 'φυσιολογικός' in r_lower:
-        return 'Greek'
-    if 'rotura' in r_lower or 'derrame' in r_lower:
-        return 'Spanish'
-    if 'scheur' in r_lower or 'geen' in r_lower:
-        return 'Dutch'
-    if 'ruptur' in r_lower or 'erguss' in r_lower or 'kein' in r_lower:
-        return 'German'
-    if 'rupture' in r_lower or 'épanchement' in r_lower or 'sans' in r_lower:
-        return 'French'
-    return 'English'
+    
+    # Use word boundaries to prevent substring matches (e.g. "ruptur" inside "rupture")
+    def has_words(words):
+        return any(re.search(rf'\b{w}\b', r_lower) for w in words)
+        
+    if has_words(["sağlam", "yırtık", "eklem"]):
+        return "Turkish"
+        
+    # Croatian/Serbian
+    if has_words(["uredno", "intaktno", "lezija", "koljena", "zglob"]) or (has_words(["ruptura"]) and not has_words(["ligament", "tear"])):
+        return "Croatian/Serbian"
+        
+    # Russian
+    if has_words(["повреда", "без", "разрыв"]):
+        return "Russian"
+        
+    # Greek
+    if has_words(["ρήξη", "φυσιολογικός"]):
+        return "Greek"
+        
+    # Spanish
+    if has_words(["rotura", "derrame", "sin", "rodilla"]):
+        return "Spanish"
+        
+    # Dutch
+    if has_words(["scheur", "geen", "voorste", "kruisband"]):
+        return "Dutch"
+        
+    # German
+    if has_words(["ruptur", "erguss", "kein", "kreuzband"]):
+        return "German"
+        
+    # French
+    if has_words(["rupture", "épanchement", "sans", "fissure"]):
+        # Disambiguate from English 'rupture'
+        if has_words(["sans", "épanchement", "genou", "fissure"]):
+            return "French"
+            
+    return "English"
 
 if __name__ == '__main__':
     import argparse

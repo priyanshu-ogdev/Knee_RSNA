@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 import time
 import psutil
+import src.core.config as config
 
 # SOTA Fix: Load .env so the HuggingFace token (HF_TOKEN) is available for downloading the gated Nemotron model.
 try:

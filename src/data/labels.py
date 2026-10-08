@@ -112,7 +112,8 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
                 t: {
                     "labeled": int(out[t].notna().sum()),
                     "full_weight": int((out[f'{t}_weight'] == 1.0).sum()),
-                    "positive": int((out[t] > 0).sum()),
+                    "positive": int((out[t] >= 0.5).sum()),
+                    "labeled": int((out[f'{t}_weight'] > 0).sum()),
                 }
                 for t in config.TARGETS
             },

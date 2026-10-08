@@ -1,8 +1,8 @@
 """Window selection + augmentation (the training hot loop; numpy/OpenCV only).
 
 Throughput rules:
-  * choose the windows FIRST, then augment only the slices those windows use (training uses ~4 of 11 windows,
-    i.e. ~12 of the 24 stored slices -> ~2x less warping)
+  * choose the windows FIRST, then augment only the slices those windows use (training uses ~8 of 22 windows,
+    i.e. ~24 of the 24 stored slices -> ~2x less warping)
   * one affine matrix and one 256-entry LUT per slot, applied with cv2 (SIMD) to all of its slices
   * no flips: knees are canonicalised to 'left' at preprocessing time, so a horizontal flip would destroy the
     medial/lateral image-side consistency that the slot head relies on

@@ -6,7 +6,7 @@ limitations are documented in [`ml_model_design.md`](ml_model_design.md).
 ## Data and labels
 
 The pipeline routes each study into six anatomical MRI slots. The `v2` cache
-uses 518-pixel images, stack depth 32, and windows built from three adjacent
+uses 518-pixel images, stack depth 24, and windows built from three adjacent
 grayscale slices as the model's three input channels. Training samples up to
 five windows per slot; validation and inference use all available windows.
 Only valid windows are encoded.
@@ -89,7 +89,7 @@ its reported score and ensemble contribution cannot be reproduced here.
 
 The DGX Spark memory target and ceiling are safeguards, not a promise that the
 process will allocate a fixed amount of unified memory. Cache storage is
-separate from system memory; the default image cache is approximately 227 GB
+separate from system memory; the default image cache is approximately 170 GB
 decimal before metadata and scratch space. No leaderboard improvement,
 throughput, or 0.965 score is claimed until measured on the target hardware and
 competition validation data.

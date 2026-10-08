@@ -245,9 +245,8 @@ def run_preparation(
     labels_df = build_labels(data_root, extra_csv=pseudo_csv, extra_weight=0.5, out_csv=final_labels_csv)
     target_coverage = {
         target: {
-            "labeled": int(labels_df[target].notna().sum()),
-            "weighted": int((labels_df[f"{target}_weight"] > 0).sum()),
-            "positive": int((labels_df[target] > 0).sum()),
+            "labeled": int((labels_df[f"{target}_weight"] > 0).sum()),
+            "positive": int((labels_df[target] >= 0.5).sum()),
         }
         for target in config.TARGETS
     }

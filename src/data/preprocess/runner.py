@@ -46,7 +46,7 @@ def estimate_cache_gb(n_studies, cfg):
 
 
 def fit_cache_cfg(n_studies, free_gb, preset='v2', margin=0.92):
-    """Largest standard (img_size, stack_depth) that fits the free disk. The 'public' preset is fixed (D=12, 336 px)."""
+    """Largest standard (img_size, stack_depth) that fits the free disk. The 'public' preset is fixed (D=12, 518 px)."""
     if preset == 'public':
         return config.get_cfg('public')
     ladder = [(336, 24), (336, 20), (320, 20), (288, 24), (288, 20), (256, 20), (256, 16), (224, 16)]

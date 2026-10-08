@@ -1270,7 +1270,11 @@ if __name__ == '__main__':
         os.environ['HF_HOME'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'hf_cache'))
     
     DATA_ROOT = args.data_root
-    if not DATA_ROOT:
+    if DATA_ROOT and not os.path.exists(os.path.join(DATA_ROOT, 'train.csv')):
+        from src.core.config import resolve_data_root
+        DATA_ROOT = resolve_data_root(DATA_ROOT)
+
+    if not DATA_ROOT or not os.path.exists(os.path.join(DATA_ROOT, 'train.csv')):
         knee_env = os.environ.get('KNEE_DATA')
         local_data = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
         if knee_env and os.path.exists(os.path.join(knee_env, 'train.csv')):
@@ -1281,6 +1285,7 @@ if __name__ == '__main__':
             print(f"[SUCCESS] Dataset already present locally at: {DATA_ROOT}")
         else:
             print("Checking/Downloading RSNA dataset via Kagglehub...")
+            import kagglehub
             DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
             print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
 

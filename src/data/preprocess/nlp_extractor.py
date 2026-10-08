@@ -145,6 +145,16 @@ CLINICAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
 9. CROSS-TALK PREVENTION: PCL (Posterior Cruciate) and LCL (Lateral Collateral) are NOT targets! Never assign PCL findings to ACL, nor LCL/MPFL findings to MCL.
 10. CONSISTENCY: If exact_quote is "None", state MUST be "not_stated". Never mark "present" with "None" quote.
 
+EXAMPLES:
+Report (Turkish): "Ön çapraz bağ sağlamdır. Medial menisküs arka boynuzunda yırtık izlendi. Eklem mesafesinde minimal efüzyon."
+Output:
+{
+  "ACL": {"reasoning": "Ön çapraz bağ (ACL) is described as sağlamdır (intact/normal).", "exact_quote": "Ön çapraz bağ sağlamdır.", "state": "absent"},
+  "Medial Meniscus": {"reasoning": "Medial menisküs arka boynuzunda (medial meniscus posterior horn) has a yırtık (tear).", "exact_quote": "Medial menisküs arka boynuzunda yırtık izlendi.", "state": "present"},
+  "Effusion": {"reasoning": "Minimal efüzyon (minimal effusion) is present, which is trace/physiological.", "exact_quote": "Eklem mesafesinde minimal efüzyon.", "state": "absent"},
+  "MCL": {"reasoning": "No mention of medial collateral ligament.", "exact_quote": "None", "state": "not_stated"}
+}
+
 REPORT:
 {report}
 
@@ -369,7 +379,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 # ---------------------------------------------------------------------
                 # Shield 5: Grounding Verification Against Original Report
                 # ---------------------------------------------------------------------
-                if is_present and original_report:
+                if (is_present or is_absent) and original_report:
                     clean_q = clean_txt(exact_quote)
                     clean_rep = clean_txt(original_report)
                     if len(clean_q) > 10 and clean_q not in clean_rep:
@@ -384,9 +394,11 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                         if is_english_report and overlap < 0.3:
                             # Fabricated quote hallucination
                             is_present = False
+                            is_absent = False
                         elif not is_english_report and len(q_words) >= 3 and overlap < 0.15:
                             # Fabricated non-English quote
                             is_present = False
+                            is_absent = False
             
             # Map verified findings to labels & confidence weights
             if is_present:
@@ -398,7 +410,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
                     out[t], out[f"{t}_weight"] = 0.0, 0.0 # Strict Mask
                 else:
-                    out[t], out[f"{t}_weight"] = 0.0, 0.1 # Soft Negative
+                    out[t], out[f"{t}_weight"] = 0.0, 0.0 # Soft Negative
                     
         return out
     except Exception as e:
@@ -487,7 +499,7 @@ def _legacy_run_offline_extraction(data_root: str, out_csv: str, model_id: str =
     llm = LLM(
         model=model_id,
         enforce_eager=enforce_eager_flag,
-        max_model_len=4096,
+        max_model_len=8192,
         tensor_parallel_size=tp_size,
         gpu_memory_utilization=gpu_util,
         **llm_kwargs
@@ -785,7 +797,7 @@ def extract_by_rules(report: str, uid: str) -> dict:
             if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
                 out[t], out[f"{t}_weight"] = 0.0, 0.0
             else:
-                out[t], out[f"{t}_weight"] = 0.0, 0.1
+                out[t], out[f"{t}_weight"] = 0.0, 0.0
                 
     return out
 
@@ -1034,7 +1046,7 @@ def auto_complete_extraction(
             llm = LLM(
                 model=model_to_use,
                 enforce_eager=enforce_eager,
-                max_model_len=4096,
+                max_model_len=8192,
                 tensor_parallel_size=1,
                 gpu_memory_utilization=gpu_util,
                 **llm_kwargs

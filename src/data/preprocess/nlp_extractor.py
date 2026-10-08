@@ -125,6 +125,138 @@ def build_prompt(report: str) -> str:
     return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist. 
 Accurately extract the presence of the following 12 knee conditions from this MRI radiology report.
 
+OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT WITH ALL 12 KEYS):
+{{
+  "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}}
+}}
+
+TARGETS & CLINICAL DEFINITIONS:
+1. ACL: Anterior Cruciate Ligament tear.
+2. MCL: Medial Collateral Ligament tear or sprain.
+3. Medial Meniscus: Medial meniscus tear. Post-operative states (meniscectomy, repairs) = absent. Grade 1/2 signal without articular extension = absent.
+4. Lateral Meniscus: Lateral meniscus tear. Post-operative states (meniscectomy) = absent. Grade 1/2 signal = absent.
+5. Medial OA: Medial tibiofemoral compartment osteoarthritis.
+6. Lateral OA: Lateral tibiofemoral compartment osteoarthritis.
+7. PF OA: Patellofemoral compartment osteoarthritis.
+8. Effusion: Joint effusion.
+9. Synovitis: Synovial thickening.
+10. Baker's: Baker's cyst, popliteal cyst.
+11. Contusion: Bone bruise.
+12. Fracture: Cortical bone fracture.
+
+GENERAL RULES:
+1. Output MUST be valid JSON containing ALL 12 KEYS.
+2. "reasoning": Think step-by-step. Keep it under 25 words.
+3. "exact_quote": Copy verbatim. If absent, you MUST provide the quote proving it is absent. Absent is NEVER allowed when the structure isn't addressed; use "not_stated" instead.
+4. "state": EXACTLY ONE of ["present", "absent", "not_stated"]. Mask prior-study comparisons as "not_stated".
+5. "confidence": EXACTLY ONE of ["high", "medium", "low"].
+6. IF a general "meniscal tear" or "menisci" finding is mentioned without specifying Medial or Lateral, apply the finding to BOTH Medial and Lateral Meniscus. For example, "Menisci are unremarkable" means BOTH are "absent".
+
+MULTI-LINGUAL HINTS:
+  - Turkish: yirtik=present, saglam=absent.
+  - Croatian/Serbian: ruptura=present, uredno=absent.
+  - Russian/Bulgarian: повреда=present, без=absent.
+  - Greek: ρήξη=present, φυσιολογικός=absent.
+  - German: Kreuzband=ACL, Erguss=Effusion, keine Ruptur/intakt=absent.
+  - Spanish: LCA=ACL, derrame=effusion, sin rotura=absent.
+  - Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, geen scheur=absent.
+  - French: LCA=ACL, épanchement=effusion, sans fissure=absent.
+  
+  EXAMPLES (Always output all 12 keys):
+Report (English): "Anterior cruciate ligament is completely torn. Menisci are unremarkable. Minimal physiological joint fluid."
+Output:
+{{
+  "ACL": {{"reasoning": "Explicit complete tear stated.", "exact_quote": "Anterior cruciate ligament is completely torn.", "state": "present", "confidence": "high"}},
+  "MCL": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
+  "Medial Meniscus": {{"reasoning": "Menisci stated as unremarkable.", "exact_quote": "Menisci are unremarkable.", "state": "absent", "confidence": "high"}},
+  "Lateral Meniscus": {{"reasoning": "Menisci stated as unremarkable.", "exact_quote": "Menisci are unremarkable.", "state": "absent", "confidence": "high"}},
+  "Medial OA": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
+  "Lateral OA": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
+  "PF OA": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
+  "Effusion": {{"reasoning": "Fluid is minimal and physiological.", "exact_quote": "Minimal physiological joint fluid.", "state": "absent", "confidence": "high"}},
+  "Synovitis": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
+  "Baker's": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
+  "Contusion": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
+  "Fracture": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
+}}
+
+REPORT:
+{report}
+"""
+
+def _report_sha256(report: str) -> str:
+    return hashlib.sha256(str(report).encode("utf-8")).hexdigest()
+
+
+def _empty_extraction_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "StudyInstanceUID",
+            *TARGETS,
+            *(f"{target}_weight" for target in TARGETS),
+            "report_sha256",
+            "extractor_version",
+            "engine",
+            "model_id",
+            "prompt_sha256",
+        ]
+    )
+
+
+def _validated_extraction_rows(
+    frame: pd.DataFrame,
+    expected_uids: set[str],
+    expected_report_hashes: dict[str, str] | None = None,
+    expected_provenance: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Keep only complete, in-range extraction rows for the requested studies."""
+    required = {
+        "StudyInstanceUID",
+        *TARGETS,
+        *(f"{target}_weight" for target in TARGETS),
+    }
+    if expected_report_hashes is not None:
+        required.add("report_sha256")
+    if expected_provenance:
+        required.update(expected_provenance)
+    if not required.issubset(frame.columns):
+        return frame.iloc[0:0].copy()
+
+    clean = frame.copy()
+    clean["StudyInstanceUID"] = clean["StudyInstanceUID"].astype(str).str.strip()
+    clean = clean[clean["StudyInstanceUID"].isin(expected_uids)].copy()
+    valid = clean["StudyInstanceUID"].ne("")
+    for target in TARGETS:
+        values = pd.to_numeric(clean[target], errors="coerce")
+        valid &= values.notna() & values.between(0.0, 1.0)
+        clean[target] = values
+        weight_column = f"{target}_weight"
+        weights = pd.to_numeric(clean[weight_column], errors="coerce")
+        valid &= weights.notna() & weights.ge(0.0) & weights.le(1.0)
+        clean[weight_column] = weights
+    if expected_report_hashes is not None:
+        expected_hash = clean["StudyInstanceUID"].map(expected_report_hashes)
+        valid &= clean["report_sha256"].astype(str).eq(expected_hash.astype(str))
+    for column, expected in (expected_provenance or {}).items():
+        valid &= clean[column].astype(str).eq(str(expected))
+    return clean.loc[valid].drop_duplicates("StudyInstanceUID", keep="last")
+
+
+def build_prompt(report: str) -> str:
+    return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist. 
+Accurately extract the presence of the following 12 knee conditions from this MRI radiology report.
+
 OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT):
 {{
   "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
@@ -1268,11 +1400,13 @@ def detect_language(report: str) -> str:
     r_lower = report.lower()
     if 'sağlam' in r_lower or 'yırtık' in r_lower or 'eklem' in r_lower:
         return 'Turkish'
-    if 'ruptura' in r_lower or 'meniskus' in r_lower or 'ligament' in r_lower:
+    if 'ruptura' in r_lower and ('uredno' in r_lower or 'intaktno' in r_lower or 'lezija' in r_lower):
         return 'Croatian/Serbian'
-    if 'разрыв' in r_lower or 'повреждение' in r_lower or 'норма' in r_lower:
+    elif 'uredno' in r_lower or 'intaktno' in r_lower:
+        return 'Croatian/Serbian'
+    if 'повреда' in r_lower or 'разрыв' in r_lower or 'без' in r_lower:
         return 'Russian'
-    if 'ρήξη' in r_lower or 'φυσιολογικό' in r_lower:
+    if 'ρήξη' in r_lower or 'φυσιολογικός' in r_lower:
         return 'Greek'
     if 'rotura' in r_lower or 'derrame' in r_lower:
         return 'Spanish'
@@ -1329,77 +1463,76 @@ if __name__ == '__main__':
 
     if args.evaluate:
         train_df = pd.read_csv(os.path.join(DATA_ROOT, 'train.csv'))
+        # Evaluate on the 58 gold studies.
         gold_df = train_df[train_df['ACL'].notna()].copy()
-        print(f"Isolated {len(gold_df)} gold studies for evaluation.")
+        
+        # Keep 10 studies untouched for final checks
+        np.random.seed(42)
+        untouched_idx = np.random.choice(gold_df.index, size=min(10, len(gold_df)), replace=False)
+        eval_df = gold_df.drop(untouched_idx)
+        print(f"Isolated {len(eval_df)} gold studies for evaluation. (Held out 10 for final checks).")
         
         temp_dir = "temp_gold_eval"
         os.makedirs(temp_dir, exist_ok=True)
-        gold_df.to_csv(os.path.join(temp_dir, 'train.csv'), index=False)
+        eval_df.to_csv(os.path.join(temp_dir, 'train.csv'), index=False)
         out_csv = os.path.join(temp_dir, 'gold_extractions.csv')
         
         print(f"Running NLP Extractor (Engine: {args.engine})...")
+        import time
         start_time = time.time()
-        
         out_path, stats = auto_complete_extraction(
-            data_root=temp_dir,
-            out_csv=out_csv,
-            engine=args.engine,
-            model_id=args.model,
-            force=args.force,
-            evaluate=True
+            data_root=temp_dir, out_csv=out_csv, engine=args.engine,
+            model_id=args.model, force=args.force, evaluate=True
         )
-        
         elapsed = time.time() - start_time
         extracted_df = pd.read_csv(out_path)
         print(f"Extraction completed in {elapsed:.2f} seconds.")
-        print(f"Average time per report: {elapsed / len(gold_df):.2f} seconds.")
         
-        merged = pd.merge(gold_df, extracted_df, on="StudyInstanceUID", suffixes=("_true", "_pred"))
+        merged = pd.merge(eval_df, extracted_df, on="StudyInstanceUID", suffixes=("_true", "_pred"))
         merged['Language'] = merged['Report'].apply(detect_language)
         
-        print("\n" + "="*50)
-        print(f"OVERALL METRICS ({args.engine.upper()} ENGINE)")
-        print("="*50)
+        from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
         
-        target_aucs = []
-        for t in TARGETS:
-            # FIX: Evaluate on all gold studies where truth is known, do NOT let the model's weight mask its own mistakes!
-            mask = ~merged[f"{t}_true"].isna().values
-            y_true = merged[f"{t}_true"].values[mask]
-            y_pred = merged[f"{t}_pred"].values[mask]
-            if len(set(y_true)) > 1:
-                auc = roc_auc_score(y_true, y_pred)
-                f1 = f1_score(y_true, (y_pred >= 0.5).astype(int))
-                target_aucs.append(auc)
-                print(f"{t}: AUC = {auc:.4f}, F1 = {f1:.4f}")
+        for lang in ['ALL'] + list(merged['Language'].unique()):
+            print("\n" + "="*80)
+            if lang == 'ALL':
+                lang_df = merged
+                print(f"OVERALL METRICS (N={len(lang_df)})")
             else:
-                print(f"{t}: AUC = N/A (only 1 class in gold set)")
-                
-        if target_aucs:
-            print(f"MACRO ROC-AUC: {sum(target_aucs)/len(target_aucs):.4f}")
-        
-        print("\n" + "="*50)
-        print("METRICS BY LANGUAGE (MACRO AUC)")
-        print("="*50)
-        
-        for lang in merged['Language'].unique():
-            lang_df = merged[merged['Language'] == lang]
-            print(f"\nLanguage: {lang} (N={len(lang_df)})")
-            lang_aucs = []
+                lang_df = merged[merged['Language'] == lang]
+                print(f"METRICS FOR LANGUAGE: {lang} (N={len(lang_df)})")
+            print("="*80)
+            
+            macro_aucs = []
             for t in TARGETS:
-                mask_l = ~lang_df[f"{t}_true"].isna().values
-                y_true_l = lang_df[f"{t}_true"].values[mask_l]
-                y_pred_l = lang_df[f"{t}_pred"].values[mask_l]
-                if len(set(y_true_l)) > 1:
+                y_true = lang_df[f"{t}_true"].values
+                y_pred = lang_df[f"{t}_pred"].values
+                # -1.0 means not_stated. We drop not_stated for precision/recall of "stated entries".
+                # Also drop NaNs in true.
+                valid_mask = (~np.isnan(y_true)) & (y_pred >= 0.0)
+                y_true_valid = y_true[valid_mask]
+                y_pred_valid = y_pred[valid_mask]
+                
+                coverage = np.sum(y_pred >= 0.0) / len(y_pred) if len(y_pred) > 0 else 0
+                
+                if len(y_true_valid) > 0:
+                    preds_binary = (y_pred_valid >= 0.5).astype(int)
+                    true_binary = (y_true_valid >= 0.5).astype(int)
+                    p, r, f1, _ = precision_recall_fscore_support(true_binary, preds_binary, average='binary', zero_division=0)
+                    
                     try:
-                        auc = roc_auc_score(y_true_l, y_pred_l)
-                        lang_aucs.append(auc)
+                        auc = roc_auc_score(true_binary, y_pred_valid)
+                        macro_aucs.append(auc)
                     except ValueError:
-                        pass
-            if lang_aucs:
-                print(f"  Macro AUC: {sum(lang_aucs)/len(lang_aucs):.4f}")
-            else:
-                print("  Macro AUC: N/A (not enough class variance)")
+                        auc = float('nan')
+                        
+                    print(f"{t:18s} | Cov: {coverage*100:5.1f}% | AUC: {auc:5.3f} | P: {p:5.3f} | R: {r:5.3f} | Disagreements: {np.sum(preds_binary != true_binary)}")
+                else:
+                    print(f"{t:18s} | Cov: {coverage*100:5.1f}% | AUC:   N/A | P:   N/A | R:   N/A")
+            
+            if macro_aucs:
+                print(f"\n--> MACRO AUC for {lang}: {np.nanmean(macro_aucs):.4f}")
+                
     else:
         OUT = os.path.join(DATA_ROOT, "pseudo_labels.csv")
         auto_complete_extraction(

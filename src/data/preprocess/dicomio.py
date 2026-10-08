@@ -89,7 +89,7 @@ def decode_slice(path):
     icpt = f1(getattr(ds, 'RescaleIntercept', None))
     a = a * (slope if slope else 1.0) + (icpt if icpt else 0.0)
     if str(getattr(ds, 'PhotometricInterpretation', '')).upper() == 'MONOCHROME1':
-        a = a.max() - a
+        a = -a
     if not np.isfinite(a).all():
         a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     return a
@@ -114,12 +114,10 @@ def decode_raw(path):
         
         # Photometric Interpretation check is CRITICAL
         try:
-            # SOTA Fix: dicomsdl does not have .info(). Use direct attribute access.
             photo = getattr(ds, 'PhotometricInterpretation', '')
-            if 'MONOCHROME1' in str(photo).upper():
-                a = a.max() - a
+            is_mono1 = 'MONOCHROME1' in str(photo).upper()
         except Exception:
-            pass
+            is_mono1 = False
             
         try:
             slope = float(ds.RescaleSlope)
@@ -130,6 +128,13 @@ def decode_raw(path):
             icpt = float(ds.RescaleIntercept)
         except Exception:
             icpt = 0.0
+            
+        if is_mono1:
+            slope = -slope
+            icpt = -icpt
+            
+        if a.ndim != 2:
+            raise ValueError(f'expected a 2-D slice, got ndim={a.ndim}')
             
         return a, slope, icpt
     except Exception:
@@ -144,7 +149,7 @@ def decode_raw(path):
     if a.ndim != 2:
         raise ValueError(f'expected a 2-D slice, got ndim={a.ndim}')
     if str(getattr(ds, 'PhotometricInterpretation', '')).upper() == 'MONOCHROME1':
-        a = a.max() - a
+        a = -a
     slope = getattr(ds, 'RescaleSlope', 1.0)
     icpt = getattr(ds, 'RescaleIntercept', 0.0)
     return a, float(slope) if slope is not None else 1.0, float(icpt) if icpt is not None else 0.0

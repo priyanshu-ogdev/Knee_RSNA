@@ -161,19 +161,35 @@ def group_folds(study_meta, n_splits=5, seed=2026, min_group=10, dup_pairs=None,
         ):
             fold[va] = k
     elif scheme == 'site':
-        from sklearn.model_selection import StratifiedKFold
+        from sklearn.model_selection import StratifiedKFold, KFold
+        import pandas as pd
         rep = sm.drop_duplicates("duplicate_group").copy().reset_index(drop=True)
-        counts = rep['group'].value_counts()
-        too_small = counts[counts < n_splits].index
-        if len(too_small) > 0 and len(counts) > 0:
-            majority_grp = counts.index[0]
-            rep['group'] = rep['group'].replace({g: majority_grp for g in too_small})
-        y = rep['group'].astype('category').cat.codes.values
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        
         ufold = {}
-        for k, (_, va) in enumerate(skf.split(rep, y)):
-            for component in rep.loc[va, 'duplicate_group']:
-                ufold[component] = k
+        # Separate gold and non-gold to strictly balance gold studies across folds
+        is_gold = rep.get('gold', pd.Series(False, index=rep.index))
+        
+        for subset_mask in [is_gold, ~is_gold]:
+            if not subset_mask.any(): continue
+            sub_rep = rep[subset_mask].copy().reset_index(drop=True)
+            counts = sub_rep['group'].value_counts()
+            too_small = counts[counts < n_splits].index
+            if len(too_small) > 0 and len(counts) > 0:
+                majority_grp = counts.index[0]
+                sub_rep['group'] = sub_rep['group'].replace({g: majority_grp for g in too_small})
+            
+            y = sub_rep['group'].astype('category').cat.codes.values
+            if len(sub_rep) >= n_splits:
+                skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+                splits = skf.split(sub_rep, y)
+            else:
+                kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+                splits = kf.split(sub_rep)
+                
+            for k, (_, va) in enumerate(splits):
+                for component in sub_rep.loc[va, 'duplicate_group']:
+                    ufold[component] = k
+                    
         fold = components.map(ufold).to_numpy(dtype=int)
     else:
         raise ValueError(scheme)

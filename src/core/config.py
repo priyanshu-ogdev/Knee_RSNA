@@ -143,7 +143,7 @@ PRESETS = {
         order_mode="normal", z_mode="index", stack_depth=12, band=(0.2, 0.8),
         win_stride=1, reorient=False, slot_prefer_2d=False, slot_csv_fallback=False,
     ),
-    "v2": PreCfg(name="v2", img_size=518, stack_depth=32),
+    "v2": PreCfg(name="v2", img_size=518, stack_depth=24),
 }
 
 

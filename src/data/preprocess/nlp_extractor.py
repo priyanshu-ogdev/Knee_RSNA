@@ -12,11 +12,14 @@ import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_fscore_support
 
-import src.core.config as config
-from src.core.config import resolve_data_root
-
+import sys
 # Module-level project root resolution
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import src.core.config as config
+from src.core.config import resolve_data_root
 
 # SOTA Fix: Robustly load .env from project root so HF_TOKEN / HUGGING_FACE_HUB_TOKEN is always accessible.
 try:

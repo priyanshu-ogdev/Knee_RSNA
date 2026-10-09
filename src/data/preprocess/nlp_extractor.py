@@ -190,7 +190,17 @@ TARGETS & CLINICAL MSK DEFINITIONS:
 OUTPUT SCHEMA:
 {{
   "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  ... (ALL 12 TARGETS MUST BE INCLUDED)
+  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}}
 }}
 
 INSTRUCTIONS:

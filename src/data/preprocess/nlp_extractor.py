@@ -395,6 +395,36 @@ def run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
 
 
 
+def resolve_local_model_path(repo_id: str) -> str:
+    """If repo_id corresponds to a downloaded local HF snapshot, return the local directory path."""
+    if not repo_id or os.path.isdir(repo_id):
+        return repo_id
+    repo_folder = f"models--{repo_id.replace('/', '--')}"
+    candidate_bases = [
+        os.environ.get("HF_HOME"),
+        os.path.expanduser("~/.cache/huggingface"),
+        os.path.abspath(os.path.join(PROJECT_ROOT, "data", "hf_cache")),
+        "/home/iedc_ai_dgx1/.cache/huggingface",
+    ]
+    for base in candidate_bases:
+        if not base:
+            continue
+        hub_dir = base if base.endswith("hub") else os.path.join(base, "hub")
+        snapshots_dir = os.path.join(hub_dir, repo_folder, "snapshots")
+        if os.path.isdir(snapshots_dir):
+            snaps = [
+                os.path.join(snapshots_dir, s)
+                for s in os.listdir(snapshots_dir)
+                if os.path.isdir(os.path.join(snapshots_dir, s))
+            ]
+            if snaps:
+                valid_snaps = [s for s in snaps if os.path.exists(os.path.join(s, "config.json"))]
+                if valid_snaps:
+                    valid_snaps.sort(key=lambda s: os.path.getmtime(s), reverse=True)
+                    return valid_snaps[0]
+    return repo_id
+
+
 def auto_complete_extraction(
     data_root: str,
     out_csv: str,
@@ -587,7 +617,12 @@ def auto_complete_extraction(
     if selected_engine == "vllm":
         try:
             print(f"[INFO] Launching vLLM batch engine for {len(remaining_df)} studies...")
-            model_to_use = requested_model
+            local_resolved = resolve_local_model_path(requested_model)
+            if local_resolved != requested_model:
+                print(f"[CACHE] Resolved local snapshot for '{requested_model}' at: {local_resolved}")
+                model_to_use = local_resolved
+            else:
+                model_to_use = requested_model
             requested_gpu_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.85"))
             if not 0.0 < requested_gpu_util < 1.0:
                 raise ValueError("VLLM_GPU_MEMORY_UTILIZATION must be between 0 and 1")
@@ -991,9 +1026,13 @@ if __name__ == '__main__':
     # SOTA Fix: Force Kagglehub cache to root data folder to align with main.py
     os.environ['KAGGLEHUB_CACHE'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
     
-    # SOTA Fix: Redirect HuggingFace cache to root data folder to avoid home directory quota limit
+    # SOTA Fix: Redirect HuggingFace cache to root data folder ONLY if default hub does not already contain models
     if 'HF_HOME' not in os.environ:
-        os.environ['HF_HOME'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'hf_cache'))
+        default_hub = os.path.expanduser('~/.cache/huggingface/hub')
+        if not (os.path.exists(default_hub) and any('models--' in f for f in os.listdir(default_hub))):
+            os.environ['HF_HOME'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'hf_cache'))
+        else:
+            print(f"[CACHE] Preserving existing HuggingFace cache at: {os.path.expanduser('~/.cache/huggingface')}")
     
     DATA_ROOT = args.data_root
     if DATA_ROOT and not os.path.exists(os.path.join(DATA_ROOT, 'train.csv')):
@@ -1020,11 +1059,8 @@ if __name__ == '__main__':
         # Evaluate on the 58 gold studies.
         gold_df = train_df[train_df['ACL'].notna()].copy()
         
-        # Keep 10 studies untouched for final checks
-        np.random.seed(42)
-        untouched_idx = np.random.choice(gold_df.index, size=min(10, len(gold_df)), replace=False)
-        eval_df = gold_df.drop(untouched_idx)
-        print(f"Isolated {len(eval_df)} gold studies for evaluation. (Held out 10 for final checks).")
+        eval_df = gold_df.copy()
+        print(f"Isolated {len(eval_df)} gold studies for evaluation.")
         
         temp_dir = "temp_gold_eval"
         os.makedirs(temp_dir, exist_ok=True)

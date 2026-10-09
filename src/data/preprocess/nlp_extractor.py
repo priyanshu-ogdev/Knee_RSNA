@@ -154,246 +154,54 @@ def _validated_extraction_rows(
 
 def build_prompt(report: str) -> str:
     return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist extracting 12 knee conditions from an MRI report.
-Your goal is MAXIMUM PRECISION: only mark a finding as "present" when there is unambiguous, explicit, positive evidence in the report text.
-When in doubt, choose "not_stated" over "present". False positives are worse than false negatives in this task.
+Your goal is MAXIMUM PRECISION. Read the report carefully.
+
+CRITICAL MULTILINGUAL RULE: 
+You MUST mentally translate foreign language reports to English before extracting.
+The 'state' field in your JSON MUST BE EXACTLY one of: "present", "absent", or "not_stated" in English. Do not output foreign words in the 'state' field.
+
+TARGETS & CLINICAL MSK DEFINITIONS:
+1. ACL: Anterior Cruciate Ligament tear (partial, high-grade, complete, rupture).
+2. MCL: Medial Collateral Ligament tear.
+3. Medial Meniscus: Tear (any type). Thinning/degeneration is NOT a tear (mark absent).
+4. Lateral Meniscus: Tear (any type). Thinning/degeneration is NOT a tear (mark absent).
+5. Medial OA: Medial compartment osteoarthritis / chondral loss / cartilage loss. Mild thinning without chondrosis/OA is not_stated.
+6. Lateral OA: Lateral compartment osteoarthritis / chondral loss. Mild thinning without chondrosis/OA is not_stated.
+7. PF OA: Patellofemoral osteoarthritis / chondromalacia patellae.
+8. Effusion: Joint effusion. (Trace or physiological fluid = absent).
+9. Synovitis: Synovitis / synovial thickening.
+10. Baker's: Baker's cyst / popliteal cyst.
+11. Contusion: Bone contusion / bone bruise. (Bone marrow edema ALONE is not contusion unless trauma/bruise/impact is stated or implied).
+12. Fracture: Acute fracture of femur, tibia, fibula, or patella. (Old/healed fracture = absent).
 
 OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT WITH ALL 12 KEYS):
 {{
-  "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
+  "ACL": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "MCL": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial Meniscus": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral Meniscus": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial OA": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral OA": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "PF OA": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Effusion": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Synovitis": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Baker's": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Contusion": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Fracture": {{"exact_quote": "...", "state": "...", "confidence": "..."}}
 }}
 
-TARGETS & CLINICAL MSK DEFINITIONS:
-1. ACL: Anterior Cruciate Ligament tear (partial, high-grade, complete, rupture). Rules:
-   - Intact/normal/unremarkable ACL = absent.
-   - Intact ACL reconstruction graft = absent. Disrupted/re-torn graft = present.
-   - Mucoid degeneration WITHOUT disruption = absent.
-   - ACL described as "normal", "intact", "in normal course and signal" = absent (NEVER not_stated when explicitly described as normal).
-   - CRITICAL: If the report evaluates the ACL and finds it normal, mark absent. Do NOT mark not_stated just because the report is in another language.
+INSTRUCTIONS:
+- 'exact_quote': Copy the exact phrase from the report justifying your decision. Leave empty "" if not stated.
+- 'state': MUST BE "present", "absent", or "not_stated".
+- 'confidence': MUST BE "high" or "low". 
 
-2. MCL: Medial Collateral Ligament tear or sprain (Grade 1/2/3), ONLY if the tear/edema is EXPLICITLY attributed to the MEDIAL COLLATERAL LIGAMENT (MCL) or "inner/medial collateral ligament".
-   - Peri-ligamentous edema = present ONLY if text explicitly says "MCL", "medial collateral ligament", "inneres Seitenband", "ligamentum collaterale mediale", "unutarasnjivalo" or similar.
-   - Generic "peri-ligamentous edema" without specifying MCL = NOT MCL (mark not_stated).
-   - Peri-ACL, peri-PCL, peri-fibular, or peri-lateral collateral edema = NOT MCL.
-   - MPFL tears = NOT MCL (patellofemoral, different structure).
-   - "Collateral ligaments intact", "ligaments unremarkable", "lateral i medial kolateralni ligamenti uredni" = absent.
-
-3. Medial Meniscus: Medial meniscus tear (radial, horizontal, root, flap, bucket-handle, complex, oblique). Rules:
-   - Grade 1/2 intrameniscal signal without articular surface extension = absent.
-   - Prior partial meniscectomy with stable remnant = absent.
-   - Medial meniscus extrusion ALONE without tear = absent for tear (but note the extrusion).
-   - "Medial compartment OA" or "medial chondral wear" does NOT imply a meniscal tear.
-   - SHARED RULE: "Menisci are intact/unremarkable/normal" = BOTH menisci absent.
-   - SHARED RULE: "Bilateral meniscal tears" or "both menisci torn" = BOTH menisci present.
-
-4. Lateral Meniscus: Lateral meniscus tear. Rules:
-   - Prior meniscectomy with stable remnant = absent.
-   - Grade 1/2 signal = absent. Discoid meniscus without tear = absent.
-   - Lateral compartment OA or chondral wear does NOT imply a meniscal tear.
-   - Apply same SHARED RULE as above.
-
-5. Medial OA: SPECIFICALLY medial tibiofemoral compartment osteoarthritis — joint space narrowing, subchondral sclerosis, osteophytes, or chondral wear of medial femoral condyle or medial tibial plateau. Rules:
-   - "OA" or "arthrosis/artrosis/artrotske promjene/Arthrose" WITHOUT specifying "medial" compartment = NOT Medial OA (mark not_stated unless context makes it clear).
-   - Patellofemoral OA does NOT count as Medial OA.
-   - Lateral compartment OA does NOT count as Medial OA.
-   - Must have explicit "medial" compartment attribution OR describe findings on medial femoral condyle/tibial plateau.
-   - CAUTION: "Gonartrosis" (Spanish, general knee OA) alone = not_stated for Medial OA unless medial compartment is specifically mentioned.
-   - DO NOT assign the same OA report to ALL THREE OA targets unless each compartment is explicitly mentioned.
-
-6. Lateral OA: SPECIFICALLY lateral tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral wear of lateral femoral condyle or lateral tibial plateau. Rules:
-   - Same compartment-specificity rules as Medial OA — must explicitly state lateral compartment.
-   - "OA" without qualifier = not_stated.
-   - "Lateral compartment chondromalacia" = present.
-
-7. PF OA: SPECIFICALLY patellofemoral compartment osteoarthritis — patellar facet arthrosis, chondromalacia patellae, trochlear cartilage loss, retropatellar chondral injury, patellar chondrosis. Rules:
-   - "Chondropathy/condropatía/chondropathie rotuliana" = present (patellofemoral only).
-   - "Trochlear/patellar arthrosis" = present.
-   - "OA" without mentioning patella or patellofemoral compartment = NOT PF OA.
-   - Report of general "gonartrosis" or "Gonarthrose" without patellar reference = not_stated.
-
-8. Effusion: Pathological joint effusion. Rules:
-   - "Joint effusion", "synovial effusion", "articular effusion", "hydrops" = present.
-   - "Small effusion", "moderate effusion", "large effusion" = present.
-   - ABSENT examples (do NOT mark present): "trace fluid", "minimal physiological fluid", "physiological amount of fluid", "tiny amount of synovial fluid", "no effusion", "ohne Erguss", "bez izljeva", "bez slobodne tekucine", "efüzyon izlenmedi", "efüzyon yok", "sin derrame", "geen hydrops", "geen effusie", "pas d'epanchement", "bez výpotku", "bez artritidy".
-   - "Minimal fluid / trace fluid without clinical significance" = absent.
-   - CRITICAL: Do NOT mark effusion as present simply because effusion is mentioned as negated. Read the full sentence carefully.
-   - When effusion IS present with a clear quote, always provide the verbatim positive statement as exact_quote.
-
-9. Synovitis: Synovial thickening, synovitis, pannus, or villonodular proliferation, ONLY when EXPLICITLY mentioned. Rules:
-   - Joint effusion ALONE does NOT imply synovitis (even large effusions can be simple).
-   - "Effusion with synovial thickening" or "effusion compatible with synovitis" = present.
-   - ABSENT examples: "simple effusion", "effusion without synovitis", "bez sinovitisa", "sinovit yok", "sin signos de sinovitis", "geen synovitis", "ohne Synovitis", "no synovial thickening", "unremarkable synovium", "synovial fold not thickened".
-   - If the report mentions effusion but does NOT mention synovial thickening/synovitis, mark synovitis as not_stated (not as present).
-   - If a report says "small effusion" without any synovial mention = not_stated for Synovitis.
-
-10. Baker's: Baker's cyst, popliteal cyst, gastrocnemius-semimembranosus bursal distension. Rules:
-    - Any explicitly named Baker's/popliteal cyst of clinical size = present.
-    - "Tiny/trace/minimal popliteal bursal fluid" or "small amount of fluid in the gastrocnemius-semimembranosus bursa without discrete cyst formation" = absent.
-    - "No popliteal cyst", "no Baker's cyst", "geen Bakercyste", "Bakerzyste nicht nachweisbar", "bez Bakerove ciste", "sin quiste popliteo" = absent.
-    - Gastrocnemius-semimembranosus bursa with measurable dimensions (e.g., "popliteal cyst 21 x 17 mm") = present.
-
-11. Contusion: Traumatic bone bruise, bone contusion, or traumatic subchondral bone marrow edema. Rules:
-    - Must be EXPLICITLY TRAUMATIC or described as bone bruise/contusion/marrow edema.
-    - "Bone marrow edema", "kostani edem", "kemik ödemi", "marrow signal change", "osseous contusion" = present ONLY with traumatic context.
-    - CRITICAL DISTINCTION - these are NOT bone contusion:
-      * Soft tissue edema (edem mekih tkiva, yumuşak doku ödemi)
-      * Peri-ligamentous edema (edema around ACL, MCL, capsule)
-      * Subcutaneous edema
-      * Subchondral sclerosis or cysts (these are OA, not contusion)
-      * Subchondral bone marrow changes in the context of OA (degenerative, not traumatic)
-    - "Edem" (Croatian) alone WITHOUT "kostani/kosti" qualifier = NOT contusion.
-    - "Ödem" (Turkish) alone WITHOUT "kemik/kemiği" qualifier = NOT contusion.
-    - "Bone bruise", "Knochenkontusion/Knochenödem" (German), "contusion osseuse" (French), "contusión ósea" (Spanish), "botcontusie" (Dutch) = present.
-    - "Trabecular injury", "marrow edema pattern" following acute trauma = present.
-
-12. Fracture: Acute cortical bone disruption, avulsion fracture (Segond, tibial spine, fibular head), depressed tibial plateau fracture. Rules:
-    - Old, healed, or chronic fractures = absent.
-    - "Old fracture", "healed fracture", "prior fracture", "known fracture" with no acute component = absent.
-    - "Stress fracture" with active marrow edema = present.
-    - Osteophytes, subchondral cysts, or bone spurs = NOT fractures.
-    - "Avulsion fracture" unless specified as "old/healed" = present.
-    - "Fissure", "crack", "cortical break" = present.
-
-ANTI-HALLUCINATION & EXTRACTION RULES:
-1. Output MUST be valid JSON containing ALL 12 KEYS.
-2. "reasoning": Concise clinical justification (max 25 words). Must explain WHY you chose present/absent/not_stated.
-3. "exact_quote": Verbatim word-for-word copy from REPORT. MINIMUM 3 WORDS required for "present" or "absent" state. If genuinely not mentioned, output "None" and use "not_stated".
-4. "state": EXACTLY ONE of ["present", "absent", "not_stated"]:
-   - "present": Unambiguous, explicit, positive clinical finding. Requires a verbatim supporting quote.
-   - "absent": Explicit statement the structure is normal, intact, or negated. Requires verbatim negation quote.
-   - "not_stated": Structure was NOT evaluated or mentioned. Use this LIBERALLY when unsure.
-   - NEVER mark "absent" if not mentioned. NEVER mark "present" based on weak/ambiguous evidence.
-5. "confidence": EXACTLY ONE of ["high", "medium", "low"]. Use "low" for hedged language, "medium" for inferred findings.
-6. SHARED MENISCAL FINDINGS: "Menisci intact/normal/unremarkable" = BOTH absent. "Bilateral meniscal tears" = BOTH present.
-7. COMPARTMENT DISCIPLINE: A single OA finding in one compartment does NOT automatically apply to others. Read each compartment description separately.
-8. SPECIFICITY BIAS: When uncertain between "present" vs "not_stated", choose "not_stated". When uncertain between "absent" vs "not_stated", choose "not_stated". False positives are penalized more than false negatives.
-
-MULTILINGUAL NEGATION REFERENCE (common absent-state phrases):
-  English absent: "no [X]", "without [X]", "not seen", "intact", "unremarkable", "within normal limits", "no evidence of"
-  Croatian/Serbian absent: "uredno", "intaktno", "bez rupture", "bez izljeva", "bez sinovitisa", "bez nalaza", "bez Bakerove ciste", "uredan nalaz", "bez patologije"
-  Turkish absent: "normal", "intakt", "yok", "izlenmedi", "saptanmadi", "görülmedi", "saglamdır" — e.g., "efüzyon izlenmedi" = no effusion
-  German absent: "intakt", "regelrecht", "unauffällig", "kein Erguss", "kein Einriss", "ohne Befund", "Bakerzyste nicht nachweisbar"
-  Spanish absent: "normal", "íntegro/a", "intacto/a", "sin rotura", "sin derrame", "sin sinovitis", "no se observa", "conservado"
-  Dutch absent: "gaaf", "intact", "geen hydrops", "geen scheur", "geen Bakercyste", "niet aangetoond"
-  French absent: "intact", "normal", "sans anomalie", "pas d'épanchement", "sans synovite", "pas de kyste"
-  Greek absent: "φυσιολογικό", "ακέραιο", "χωρίς", "δεν διαπιστώθηκε"
-  Russian/Bulgarian absent: "нет разрыва", "нет выпота", "не изменён", "интактный"
-
-EXAMPLES:
-
-EXAMPLE 1 (English, ACL torn + medial meniscus + effusion with synovitis):
-Report: "Anterior cruciate ligament is completely torn. Medial meniscus shows a complex tear at the posterior horn. Lateral meniscus is unremarkable. No MCL injury. Moderate joint effusion with synovial thickening. No popliteal cyst. No bone contusion. No fracture. Cartilage intact bilaterally."
-Output:
-{{
-  "ACL": {{"reasoning": "Explicit complete tear stated.", "exact_quote": "Anterior cruciate ligament is completely torn.", "state": "present", "confidence": "high"}},
-  "MCL": {{"reasoning": "Explicitly negated - no MCL injury.", "exact_quote": "No MCL injury.", "state": "absent", "confidence": "high"}},
-  "Medial Meniscus": {{"reasoning": "Complex posterior horn tear explicitly stated.", "exact_quote": "Medial meniscus shows a complex tear at the posterior horn.", "state": "present", "confidence": "high"}},
-  "Lateral Meniscus": {{"reasoning": "Explicitly unremarkable.", "exact_quote": "Lateral meniscus is unremarkable.", "state": "absent", "confidence": "high"}},
-  "Medial OA": {{"reasoning": "Cartilage intact bilaterally; no medial compartment OA stated.", "exact_quote": "Cartilage intact bilaterally.", "state": "absent", "confidence": "high"}},
-  "Lateral OA": {{"reasoning": "Cartilage intact bilaterally; no lateral OA.", "exact_quote": "Cartilage intact bilaterally.", "state": "absent", "confidence": "high"}},
-  "PF OA": {{"reasoning": "Cartilage intact bilaterally; no PF OA.", "exact_quote": "Cartilage intact bilaterally.", "state": "absent", "confidence": "high"}},
-  "Effusion": {{"reasoning": "Moderate joint effusion explicitly stated.", "exact_quote": "Moderate joint effusion with synovial thickening.", "state": "present", "confidence": "high"}},
-  "Synovitis": {{"reasoning": "Synovial thickening explicitly co-stated with effusion.", "exact_quote": "Moderate joint effusion with synovial thickening.", "state": "present", "confidence": "high"}},
-  "Baker's": {{"reasoning": "Explicitly negated - no popliteal cyst.", "exact_quote": "No popliteal cyst.", "state": "absent", "confidence": "high"}},
-  "Contusion": {{"reasoning": "Explicitly negated - no bone contusion.", "exact_quote": "No bone contusion.", "state": "absent", "confidence": "high"}},
-  "Fracture": {{"reasoning": "Explicitly negated - no fracture.", "exact_quote": "No fracture.", "state": "absent", "confidence": "high"}}
-}}
-
-EXAMPLE 2 (Croatian, normal report with incidental physiological fluid):
-Report: "Prednji križni ligament je intaktan i normalnog toka. Stražnji križni ligament intaktan. Lateralni i medijalni kolateralni ligamenti uredni. Medijalni menisk urednoga nalaza. Lateralni menisk urednoga nalaza. Hondromalacija patele II stupnja. Minimalna fiziološka količina tekućine u zglobu. Nema Baker-ove ciste. Bez koštanih kontuzija."
-Output:
-{{
-  "ACL": {{"reasoning": "Explicitly stated intact and normal course in Croatian.", "exact_quote": "Prednji križni ligament je intaktan i normalnog toka.", "state": "absent", "confidence": "high"}},
-  "MCL": {{"reasoning": "Lateral and medial collateral ligaments explicitly normal (uredni).", "exact_quote": "Lateralni i medijalni kolateralni ligamenti uredni.", "state": "absent", "confidence": "high"}},
-  "Medial Meniscus": {{"reasoning": "Medial meniscus explicitly normal finding (urednog nalaza).", "exact_quote": "Medijalni menisk urednoga nalaza.", "state": "absent", "confidence": "high"}},
-  "Lateral Meniscus": {{"reasoning": "Lateral meniscus explicitly normal finding.", "exact_quote": "Lateralni menisk urednoga nalaza.", "state": "absent", "confidence": "high"}},
-  "Medial OA": {{"reasoning": "No medial compartment OA mentioned; only PF chondromalacia.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Lateral OA": {{"reasoning": "No lateral compartment OA mentioned.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "PF OA": {{"reasoning": "Grade II patellar chondromalacia explicitly stated.", "exact_quote": "Hondromalacija patele II stupnja.", "state": "present", "confidence": "high"}},
-  "Effusion": {{"reasoning": "Minimal physiological fluid — NOT pathological effusion.", "exact_quote": "Minimalna fiziološka količina tekućine u zglobu.", "state": "absent", "confidence": "high"}},
-  "Synovitis": {{"reasoning": "No synovial thickening mentioned; only physiological fluid.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Baker's": {{"reasoning": "Baker's cyst explicitly negated (Nema Baker-ove ciste).", "exact_quote": "Nema Baker-ove ciste.", "state": "absent", "confidence": "high"}},
-  "Contusion": {{"reasoning": "Bone contusions explicitly negated (Bez koštanih kontuzija).", "exact_quote": "Bez koštanih kontuzija.", "state": "absent", "confidence": "high"}},
-  "Fracture": {{"reasoning": "No fracture mentioned in report.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
-}}
-
-EXAMPLE 3 (Turkish, knee with MCL sprain + ACL + menisci intact):
-Report: "SOL DİZ MRG. Bulgular: Ön çapraz bağ intakt. Arka çapraz bağ intakt. İç yan bağ (MCL) grade 2 yırtık, peri-ligamentöz ödem mevcut. Medial ve lateral menisküs posterior hornda grade II dejenerasyon. Efüzyon izlenmedi. Popliteal kist izlenmedi. Kemik ödemi saptanmadı."
-Output:
-{{
-  "ACL": {{"reasoning": "Ön çapraz bağ (ACL) explicitly stated intact.", "exact_quote": "Ön çapraz bağ intakt.", "state": "absent", "confidence": "high"}},
-  "MCL": {{"reasoning": "MCL grade 2 tear with peri-ligamentous edema explicitly stated.", "exact_quote": "İç yan bağ (MCL) grade 2 yırtık, peri-ligamentöz ödem mevcut.", "state": "present", "confidence": "high"}},
-  "Medial Meniscus": {{"reasoning": "Grade II degeneration without articular extension — not a tear.", "exact_quote": "Medial ve lateral menisküs posterior hornda grade II dejenerasyon.", "state": "absent", "confidence": "high"}},
-  "Lateral Meniscus": {{"reasoning": "Grade II degeneration without articular extension — not a tear.", "exact_quote": "Medial ve lateral menisküs posterior hornda grade II dejenerasyon.", "state": "absent", "confidence": "high"}},
-  "Medial OA": {{"reasoning": "No medial compartment OA mentioned.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Lateral OA": {{"reasoning": "No lateral compartment OA mentioned.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "PF OA": {{"reasoning": "No patellofemoral OA mentioned.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Effusion": {{"reasoning": "Effusion explicitly not observed (izlenmedi).", "exact_quote": "Efüzyon izlenmedi.", "state": "absent", "confidence": "high"}},
-  "Synovitis": {{"reasoning": "No synovial thickening mentioned; effusion absent.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Baker's": {{"reasoning": "Popliteal cyst explicitly not observed.", "exact_quote": "Popliteal kist izlenmedi.", "state": "absent", "confidence": "high"}},
-  "Contusion": {{"reasoning": "Bone edema explicitly not found (kemik ödemi saptanmadı).", "exact_quote": "Kemik ödemi saptanmadı.", "state": "absent", "confidence": "high"}},
-  "Fracture": {{"reasoning": "No fracture mentioned in report.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
-}}
-
-EXAMPLE 4 (Spanish, multi-compartment OA + ACL + effusion, NO synovitis):
-Report: "Técnica: RMN de la rodilla. Hallazgos: Rotura del LCA. Menisco interno con desgarro en asta posterior. Menisco externo íntegro. Artrosis femorotibial medial con pinzamiento del espacio articular. Sin artrosis lateral ni patelofemoral. Derrame articular moderado. Sin engrosamiento sinovial. Sin quiste poplíteo. Contusiones óseas femorotibiales mediales. Sin fractura."
-Output:
-{{
-  "ACL": {{"reasoning": "Explicit ACL tear (Rotura del LCA) stated.", "exact_quote": "Rotura del LCA.", "state": "present", "confidence": "high"}},
-  "MCL": {{"reasoning": "No MCL/LCM mention in report.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Medial Meniscus": {{"reasoning": "Medial meniscus (menisco interno) posterior horn tear stated.", "exact_quote": "Menisco interno con desgarro en asta posterior.", "state": "present", "confidence": "high"}},
-  "Lateral Meniscus": {{"reasoning": "Lateral meniscus (menisco externo) explicitly intact.", "exact_quote": "Menisco externo íntegro.", "state": "absent", "confidence": "high"}},
-  "Medial OA": {{"reasoning": "Medial femorotibial arthrosis with joint space narrowing explicitly stated.", "exact_quote": "Artrosis femorotibial medial con pinzamiento del espacio articular.", "state": "present", "confidence": "high"}},
-  "Lateral OA": {{"reasoning": "Lateral arthrosis explicitly negated.", "exact_quote": "Sin artrosis lateral ni patelofemoral.", "state": "absent", "confidence": "high"}},
-  "PF OA": {{"reasoning": "Patellofemoral arthrosis explicitly negated (ni patelofemoral).", "exact_quote": "Sin artrosis lateral ni patelofemoral.", "state": "absent", "confidence": "high"}},
-  "Effusion": {{"reasoning": "Moderate articular effusion explicitly stated.", "exact_quote": "Derrame articular moderado.", "state": "present", "confidence": "high"}},
-  "Synovitis": {{"reasoning": "Synovial thickening explicitly negated (Sin engrosamiento sinovial).", "exact_quote": "Sin engrosamiento sinovial.", "state": "absent", "confidence": "high"}},
-  "Baker's": {{"reasoning": "Popliteal cyst explicitly negated (Sin quiste poplíteo).", "exact_quote": "Sin quiste poplíteo.", "state": "absent", "confidence": "high"}},
-  "Contusion": {{"reasoning": "Medial femorotibial bone contusions explicitly stated.", "exact_quote": "Contusiones óseas femorotibiales mediales.", "state": "present", "confidence": "high"}},
-  "Fracture": {{"reasoning": "Fracture explicitly negated (Sin fractura).", "exact_quote": "Sin fractura.", "state": "absent", "confidence": "high"}}
-}}
-
-EXAMPLE 5 (English minimal report, physiological fluid, specificity test):
-Report: "Anterior cruciate ligament is normal. Menisci are unremarkable. Minimal physiological joint fluid."
-Output:
-{{
-  "ACL": {{"reasoning": "ACL explicitly stated as normal.", "exact_quote": "Anterior cruciate ligament is normal.", "state": "absent", "confidence": "high"}},
-  "MCL": {{"reasoning": "Not addressed in report.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Medial Meniscus": {{"reasoning": "Menisci stated as unremarkable — applies to both.", "exact_quote": "Menisci are unremarkable.", "state": "absent", "confidence": "high"}},
-  "Lateral Meniscus": {{"reasoning": "Menisci stated as unremarkable — applies to both.", "exact_quote": "Menisci are unremarkable.", "state": "absent", "confidence": "high"}},
-  "Medial OA": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Lateral OA": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "PF OA": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Effusion": {{"reasoning": "Minimal physiological fluid — NOT pathological effusion.", "exact_quote": "Minimal physiological joint fluid.", "state": "absent", "confidence": "high"}},
-  "Synovitis": {{"reasoning": "Not addressed; only physiological fluid present.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Baker's": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Contusion": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}},
-  "Fracture": {{"reasoning": "Not addressed.", "exact_quote": "None", "state": "not_stated", "confidence": "high"}}
-}}
-
-REPORT:
+REPORT TO ANALYZE:
 {report}
 """
 
-def clean_txt(s: str) -> str:
-    # Unicode-aware stripping keeps Greek, Spanish, German, French, Dutch letters
-    return re.sub(r"[^\w]", "", str(s).lower(), flags=re.UNICODE)
-
-
 def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> dict | None:
-    """Safely extracts JSON from the LLM output with a Quadruple-Layer Clinical Hallucination Shield."""
+    """Trusts the LLM and maps the exact state and confidence to calibrated probabilities."""
     if not raw_text or not isinstance(raw_text, str):
-        print(f"[ERROR] Empty raw_text for {uid}")
         return None
         
     clean_json = None
@@ -407,7 +215,6 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
             clean_json = raw_text[start:end+1].strip()
             
     if not clean_json:
-        print(f"[ERROR] No JSON block found in output for {uid}")
         return None
         
     try:
@@ -415,11 +222,8 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         try:
             data = json.loads(clean_json_sanitized)
         except json.JSONDecodeError:
-            try:
-                ast_str = clean_json_sanitized.replace("true", "True").replace("false", "False").replace("null", "None")
-                data = ast.literal_eval(ast_str)
-            except Exception:
-                data = None
+            ast_str = clean_json_sanitized.replace("true", "True").replace("false", "False").replace("null", "None")
+            data = ast.literal_eval(ast_str)
             
         out = {"StudyInstanceUID": str(uid).strip()}
         
@@ -429,355 +233,48 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         target_map = {normalize_key(t): t for t in TARGETS}
         
         normalized_data = {}
-        if data is not None:
+        if data is not None and isinstance(data, dict):
             for k, val_item in data.items():
                 norm_k = normalize_key(k)
                 if norm_k in target_map:
                     normalized_data[target_map[norm_k]] = val_item
-        else:
-            # SOTA Fallback: Regex parsing if JSON/AST completely fails
-            for t in TARGETS:
-                escaped_t = re.escape(t)
-                pattern = r'[\x22\x27]?' + escaped_t + r'[\x22\x27]?\s*:\s*\{([^}]+)\}'
-                match = re.search(pattern, raw_text, re.IGNORECASE)
-                if match:
-                    inner = match.group(1)
-                    state_match = re.search(r'[\x22\x27]?state[\x22\x27]?\s*:\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', inner, re.IGNORECASE)
-                    quote_match = re.search(r'[\x22\x27]?exact_quote[\x22\x27]?\s*:\s*[\x22\x27]([^\x22\x27]*)[\x22\x27]', inner, re.IGNORECASE)
-                    conf_match = re.search(r'[\x22\x27]?confidence[\x22\x27]?\s*:\s*[\x22\x27]([^\x22\x27]*)[\x22\x27]', inner, re.IGNORECASE)
-                    if state_match:
-                        normalized_data[t] = {
-                            "state": state_match.group(1).strip(),
-                            "exact_quote": quote_match.group(1).strip() if quote_match else "",
-                            "confidence": conf_match.group(1).strip() if conf_match else "high",
-                        }
-            
+                    
         found_targets = sum(1 for t in TARGETS if t in normalized_data)
         if found_targets < 6:
             return None
 
         for t in TARGETS:
             val = normalized_data.get(t, {})
-            raw_state = val.get("state") if isinstance(val, dict) else None
-            exact_quote = str(val.get("exact_quote", "")).strip() if isinstance(val, dict) else ""
+            state_str = str(val.get("state", "not_stated")).lower().strip()
+            conf_str = str(val.get("confidence", "high")).lower().strip()
             
             is_present = False
             is_absent = False
             
-            if isinstance(raw_state, bool):
-                is_present = raw_state
-                is_absent = not raw_state
-            elif isinstance(raw_state, (int, float)):
-                is_present = (raw_state == 1)
-                is_absent = (raw_state == 0)
-            elif isinstance(raw_state, str):
-                s_low = raw_state.lower().strip(" .,'\"\n")
-                # Priority 1: Check for explicit not_stated / none / missing
-                if any(ns in s_low for ns in ["not_stated", "not stated", "none", "unknown", "unclear", "missing", "n/a"]):
-                    is_present = False
-                    is_absent = False
-                # Priority 2: Exact matching for single status tokens
-                elif s_low in [
-                    "absent", "normal", "intact", "unremarkable", "negative", "negativo", 
-                    "negatief", "no", "ausente", "afwezig", "unauffällig", "unauffaellig", 
-                    "regelrecht", "intakt", "conservado", "conservada", "íntegro", "integro", "χωρίς"
-                ]:
-                    is_absent = True
-                elif s_low in [
-                    "present", "torn", "tear", "fracture", "positive", "positivo", 
-                    "positief", "presente", "vorhanden", "anwesend"
-                ]:
-                    is_present = True
-                # Priority 3: Negation-safe phrase matching
-                else:
-                    absent_phrases = [
-                        "no tear", "no fracture", "no effusion", "not present", "not seen", "without tear", 
-                        "within normal limits", "sin rotura", "geen scheur", "keine ruptur", "ohne befund"
-                    ]
-                    present_phrases = [
-                        "present", "torn", "tear", "fracture", "positive", "mild", "moderate", "severe", "abnormal"
-                    ]
-                    negation_prefixes = [
-                        "no ", "not ", "without ", "free of ", "kein", "sin ", "geen ", "pas de ", "negative", "ruled out"
-                    ]
-                    # Never classify finding as positive if accompanied by negation
-                    if any(x in s_low for x in absent_phrases) or any(neg in s_low for neg in negation_prefixes):
-                        is_absent = True
-                    elif any(x in s_low for x in present_phrases):
-                        is_present = True
-            
-            # =========================================================================
-            # CLINICAL HALLUCINATION SHIELD
-            # =========================================================================
-            q_low = exact_quote.lower().strip()
-            # Shield 1: Discard ungrounded labels with empty or "None" quote
-            # For "present" state: always require a non-trivial verbatim quote
-            # For "absent" state: allow multilingual negation triggers even without explicit quote
-            NONE_EQUIVALENTS = {"none", "null", "n/a", "", "not mentioned", "not stated", 
-                                  "none.", "not applicable", "not found", "n.a.", "na"}
-            MIN_PRESENT_QUOTE_WORDS = 3  # present claims need at least 3-word quotes
-            
-            if q_low in NONE_EQUIVALENTS:
-                is_present = False  # Always nullify ungrounded present claims
-                # Only nullify absent if we have no in-report evidence
-                if is_absent:
-                    # Check if report itself contains negation for this target
-                    target_negations = {
-                        "ACL": ["acl intact", "acl normal", "intaktan", "intakt", "acl is intact", "normal course",
-                                "ön çapraz bağ intakt", "prednji križni intaktan"],
-                        "MCL": ["mcl intact", "no mcl", "collateral ligaments intact", "ligamenti uredni",
-                                "kolateralni uredni", "kolateralni ligamenti uredni"],
-                        "Effusion": ["no effusion", "without effusion", "bez izljeva", "efüzyon yok",
-                                     "efüzyon izlenmedi", "sin derrame", "geen hydrops", "kein erguss",
-                                     "pas d'epanchement", "bez výpotku", "bez artritidy",
-                                     "no joint effusion", "without joint effusion"],
-                        "Synovitis": ["no synovitis", "bez sinovitisa", "sinovit yok", "sin sinovitis",
-                                      "geen synovitis", "no synovial thickening", "ohne synovitis",
-                                      "simple effusion", "effusion without synovitis"],
-                        "Baker's": ["no baker", "no popliteal", "nema baker", "popliteal cyst izlenmedi",
-                                    "geen bakercyste", "bakerzyste nicht", "sin quiste popliteo",
-                                    "bez bakerove ciste"],
-                        "Contusion": ["no contusion", "no bone bruise", "no bone marrow", "bez kontuzije",
-                                      "kontüzyon yok", "kemik ödemi saptanmadı", "keine knochenkontusion",
-                                      "sin contusion osea"],
-                        "Fracture": ["no fracture", "bez frakture", "kırık yok", "keine fraktur",
-                                     "sin fractura", "geen fractuur", "sans fracture"],
-                        "Medial Meniscus": ["menisci intact", "menisci unremarkable", "menisci normal",
-                                             "menisk uredan", "meniscus intact", "menisci are intact"],
-                        "Lateral Meniscus": ["menisci intact", "menisci unremarkable", "menisci normal",
-                                              "menisk uredan", "meniscus intact", "menisci are intact"],
-                        "Medial OA": ["no medial oa", "no medial arthrosis", "no medial arthritis",
-                                       "no medial compartment oa", "cartilage intact"],
-                        "Lateral OA": ["no lateral oa", "no lateral arthrosis", "cartilage intact"],
-                        "PF OA": ["no patellofemoral", "no pf oa", "patellofemoral normal", "cartilage intact"],
-                    }
-                    neg_terms = target_negations.get(t, [])
-                    has_in_report_negation = any(neg in r_lower for neg in neg_terms)
-                    if not has_in_report_negation:
-                        is_absent = False  # No negation found → truly not_stated
-                    # If in-report negation found, keep is_absent = True (good absence evidence)
-            elif is_present and len(q_low.split()) < MIN_PRESENT_QUOTE_WORDS:
-                # Very short quote for a "present" claim is suspicious — downgrade weight
-                if not any(q_low.startswith(w) for w in ["tear", "torn", "ruptur", "fracture"]):
-                    is_present = False  # Reject ultra-short present quotes without clear tear terms
+            if "present" in state_str:
+                is_present = True
+            elif "absent" in state_str or "normal" in state_str or "intact" in state_str:
+                is_absent = True
                 
-            # Shield 5: Grounding Verification Against Original Report
-            # For "present" labels: strict grounding required (high FP rate otherwise)
-            # For "absent" labels: more lenient (LLM paraphrases negation phrases)
-            if (is_present or is_absent) and original_report:
-                clean_q = clean_txt(exact_quote)
-                clean_rep = clean_txt(original_report)
-                if len(clean_q) > 3 and clean_q not in clean_rep:
-                    q_words = set(re.findall(r"\b\w{4,}\b", q_low, flags=re.UNICODE))
-                    rep_words = set(re.findall(r"\b\w{4,}\b", original_report.lower(), flags=re.UNICODE))
-                    overlap = len(q_words & rep_words) / max(1, len(q_words))
-                    
-                    common_en = {"the", "and", "with", "knee", "tear", "intact", "effusion", 
-                                  "ligament", "meniscus", "fluid", "normal", "unremarkable"}
-                    is_english_report = len(common_en & rep_words) >= 2
-                    
-                    # Stricter for "present" claims; more lenient for "absent" negation claims
-                    if is_present:
-                        # English: require 30% overlap; non-English: require 20% overlap
-                        threshold = 0.30 if is_english_report else 0.20
-                    else:  # is_absent
-                        # Absent: more lenient because LLM may paraphrase negations
-                        threshold = 0.20 if is_english_report else 0.12
-                    
-                    if len(q_words) >= 3 and overlap < threshold:
-                        if is_present:
-                            is_present = False
-                        else:
-                            # For absent, check report for negation terms before nullifying
-                            common_negations = ["no", "not", "without", "intact", "normal", "unremarkable",
-                                                "absent", "bez", "yok", "izlenmedi", "kein", "sin", "geen",
-                                                "uredno", "intaktno", "intakt", "intacto", "intakt"]
-                            has_negation = any(neg in r_lower for neg in common_negations)
-                            if not has_negation:
-                                is_absent = False
-            
-            # Map verified findings to labels & confidence weights
-            conf_str = str(val.get("confidence", "")).lower() if isinstance(val, dict) else ""
             if is_present:
-                if "high" in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.95, 1.0
-                elif "low" in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.65, 0.5
-                else:
+                if "low" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.85, 0.85
+                else:
+                    out[t], out[f"{t}_weight"] = 0.95, 1.0
             elif is_absent:
-                if "high" in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.05, 1.0
-                elif "low" in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.35, 0.5
-                else:
+                if "low" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.15, 0.85
-            else:
-                # not_stated / hedged / missing
-                if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
-                    out[t], out[f"{t}_weight"] = 0.0, 0.0  # Strict Mask
                 else:
-                    out[t], out[f"{t}_weight"] = -1.0, 0.1  # Soft Negative Marker
-            
-            # =========================================================================
-            # CLINICAL CALIBRATION LAYER (v4): Post-mapping per-target corrections
-            # =========================================================================
-            q_lower = exact_quote.lower().strip()
-            r_lower = (original_report or "").lower()
-            
-            # CAL-1: Effusion trace/physiological downgrade
-            # The model may call "small effusion" present but gold labels trace fluid as absent
-            if t == "Effusion" and out.get(t, -999) >= 0.5:
-                trace_effusion_patterns = [
-                    "physiolog", "trace fluid", "trace amount", "minimal fluid",
-                    "tiny amount", "fiziološka", "fizyolojik", "fisiologica",
-                    "physiologische", "fysiologisch", "минимал", "physiol",
-                    "small amount of synovial", "small amount of joint fluid",
-                    "a small amount of fluid", "tiny physiolog",
-                ]
-                is_trace = any(pat in q_lower for pat in trace_effusion_patterns)
-                if is_trace:
-                    out[t], out[f"{t}_weight"] = 0.15, 0.85  # Downgrade to absent-equivalent
+                    out[t], out[f"{t}_weight"] = 0.05, 1.0
+            else:
+                # not_stated
+                out[t], out[f"{t}_weight"] = -1.0, 0.1
 
-            # CAL-2: Contusion soft-tissue edema false positive suppressor  
-            if t == "Contusion" and out.get(t, -999) >= 0.5:
-                # Soft tissue edema patterns that are NOT bone contusion
-                soft_tissue_patterns = [
-                    "soft tissue", "mekih tkiva", "peri-ligament", "periligament",
-                    "subcutaneous", "potkožni", "kapsula", "capsule edema",
-                    "capsular edema", "yumuşak doku", "subkutan", "surrounding soft",
-                    "periarticular soft", "peri-articular edema",
-                ]
-                bone_required_patterns = [
-                    "bone", "kost", "kemik", "marrow", "osseous", "subchondral",
-                    "trabecular", "contusion", "kontuzija", "kontüzyon",
-                    "knochenkontusion", "knochenödem", "botcontusie", "contusion",
-                    "osseus", "óseo", "kostani", "koštani",
-                ]
-                has_soft_tissue_only = any(p in q_lower for p in soft_tissue_patterns)
-                has_bone_context = any(p in q_lower for p in bone_required_patterns)
-                if has_soft_tissue_only and not has_bone_context:
-                    out[t], out[f"{t}_weight"] = 0.15, 0.85  # Downgrade: soft tissue not bone
-
-            # CAL-3: MCL peri-ligamentous edema strict attribution check
-            if t == "MCL" and out.get(t, -999) >= 0.5:
-                # Must mention MCL/medial collateral explicitly
-                mcl_specificity_terms = [
-                    "mcl", "medial collateral", "ligamentum collaterale mediale",
-                    "inneres seitenband", "innerband", "unutarnji kolateralni",
-                    "iç yan bağ", "bağ (mcl)", "lig. collaterale mediale",
-                    "collaterale med", "med. collateral", "медиальная боковая",
-                    "medijalni kolateralni", "ligamiento colateral medial",
-                    "ligament collateral interne",
-                ]
-                mcl_mentioned = any(term in q_lower for term in mcl_specificity_terms)
-                mcl_in_report = any(term in r_lower for term in mcl_specificity_terms)
-                if not mcl_mentioned and not mcl_in_report:
-                    # No MCL-specific term found — downgrade to uncertain
-                    out[t], out[f"{t}_weight"] = 0.35, 0.5  # Reduce confidence
-
-            # CAL-4: OA compartment cross-contamination guard
-            # If quoting general "OA/arthrosis" without compartment, reduce weight
-            oa_targets = {"Medial OA": ["medial", "medijal", "tibiofemoraal medial", "femorotibial med",
-                                         "compartiment med", "mediales kompartiment", "medial tibiofem",
-                                         "compartimento medial"],
-                          "Lateral OA": ["lateral", "femorotibial lat", "compartiment lat",
-                                          "laterales kompartiment", "compartimento lateral", "tibiofemoraal lat"],
-                          "PF OA": ["patell", "trochle", "pf", "patellofemoral", "retropatellar",
-                                    "chondromalacia patell", "chondropat", "condropat"]}
-            if t in oa_targets and out.get(t, -999) >= 0.5:
-                expected_terms = oa_targets[t]
-                compartment_confirmed = any(term in q_lower for term in expected_terms)
-                # Check if quote mentions a DIFFERENT OA compartment
-                other_terms = []
-                for oa_t, terms in oa_targets.items():
-                    if oa_t != t:
-                        other_terms.extend(terms)
-                only_other_compartment = (any(term in q_lower for term in other_terms) and 
-                                           not compartment_confirmed)
-                if only_other_compartment:
-                    out[t], out[f"{t}_weight"] = 0.15, 0.85  # Wrong compartment cited
-                elif not compartment_confirmed:
-                    # Generic OA mention without compartment — reduce confidence
-                    out[t], out[f"{t}_weight"] = min(0.65, out.get(t, 0.65)), 0.6
-            
-            # CAL-5: Baker's cyst size/significance threshold
-            if t == "Baker's" and out.get(t, -999) >= 0.5:
-                minimal_cyst_patterns = [
-                    "trace", "tiny", "minimal amount", "small amount of fluid in",
-                    "no discrete cyst", "without discrete cyst", "bursal fluid",
-                    "trace fluid in", "small amount of bursal",
-                ]
-                is_minimal = any(pat in q_lower for pat in minimal_cyst_patterns)
-                if is_minimal:
-                    out[t], out[f"{t}_weight"] = 0.2, 0.75
-
-            # CAL-6: Synovitis — if effusion stated but synovitis quote is vague/generic
-            if t == "Synovitis" and out.get(t, -999) >= 0.5:
-                # Must have explicit synovitis mention, not just effusion
-                explicit_synovitis = [
-                    "synovit", "sinovit", "synovial thickening", "synovijalna zadeb",
-                    "villonodular", "pannus", "synovial proliferat", "sinovijalna promjen",
-                    "engrosamiento sinovial", "sinoviale verdikking", "synoviale verdick",
-                    "synovite", "sinovite", "épaississement synovial",
-                ]
-                has_synovitis_term = any(term in q_lower for term in explicit_synovitis)
-                if not has_synovitis_term:
-                    # Probably effusion context being misread as synovitis
-                    out[t], out[f"{t}_weight"] = 0.35, 0.5  # Reduce to uncertain
-            
-            # CAL-7: Fracture — healed/old/known qualifier suppressor  
-            if t == "Fracture" and out.get(t, -999) >= 0.5:
-                old_fracture_patterns = [
-                    "old fracture", "healed fracture", "prior fracture", "chronic fracture",
-                    "known fracture", "old avulsion", "healed avulsion", "stara fraktura",
-                    "alte fraktur", "fracture ancienne", "fractura antigua", "oude fractuur",
-                ]
-                is_old = any(pat in q_lower for pat in old_fracture_patterns)
-                if is_old:
-                    out[t], out[f"{t}_weight"] = 0.05, 1.0  # Old fracture = absent
-                    
         return out
+        
     except Exception as e:
-        print(f"[ERROR] Failed to parse JSON for {uid}: {e}")
+        print(f"[PARSE ERROR] UID {uid}: {e}")
         return None
-
-
-def run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
-    """Compatibility entry point using the provenance-checked, strict vLLM path."""
-    return auto_complete_extraction(data_root, out_csv, model_id=model_id, engine="vllm")
-
-
-def resolve_local_model_path(repo_id: str) -> str:
-    """If repo_id corresponds to a downloaded local HF snapshot, return the local directory path."""
-    if not repo_id or os.path.isdir(repo_id):
-        return repo_id
-    proj_root = globals().get("PROJECT_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    repo_folder = f"models--{repo_id.replace('/', '--')}"
-    candidate_bases = [
-        os.environ.get("HF_HOME"),
-        os.path.expanduser("~/.cache/huggingface"),
-        os.path.abspath(os.path.join(proj_root, "data", "hf_cache")),
-        "/home/iedc_ai_dgx1/.cache/huggingface",
-    ]
-    for base in candidate_bases:
-        if not base:
-            continue
-        hub_dir = base if base.endswith("hub") else os.path.join(base, "hub")
-        snapshots_dir = os.path.join(hub_dir, repo_folder, "snapshots")
-        if os.path.isdir(snapshots_dir):
-            snaps = [
-                os.path.join(snapshots_dir, s)
-                for s in os.listdir(snapshots_dir)
-                if os.path.isdir(os.path.join(snapshots_dir, s))
-            ]
-            if snaps:
-                valid_snaps = [s for s in snaps if os.path.exists(os.path.join(s, "config.json"))]
-                if valid_snaps:
-                    valid_snaps.sort(key=lambda s: os.path.getmtime(s), reverse=True)
-                    return valid_snaps[0]
-    return repo_id
-
 
 def auto_complete_extraction(
     data_root: str,

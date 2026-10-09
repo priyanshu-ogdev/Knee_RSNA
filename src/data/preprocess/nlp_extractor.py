@@ -152,17 +152,17 @@ OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT WITH ALL 12 KEYS):
 
 TARGETS & CLINICAL DEFINITIONS:
 1. ACL: Anterior Cruciate Ligament tear.
-2. MCL: Medial Collateral Ligament tear or sprain. Peri-ligamentous edema = present.
+2. MCL: Medial Collateral Ligament tear or sprain. Peri-ligamentous edema = present. (MPFL tears are NOT MCL tears).
 3. Medial Meniscus: Medial meniscus tear. Post-operative states (meniscectomy, repairs) = absent. Grade 1/2 signal without articular extension = absent.
 4. Lateral Meniscus: Lateral meniscus tear. Post-operative states (meniscectomy) = absent. Grade 1/2 signal = absent.
-5. Medial OA: Medial tibiofemoral compartment osteoarthritis.
-6. Lateral OA: Lateral tibiofemoral compartment osteoarthritis.
-7. PF OA: Patellofemoral compartment osteoarthritis.
-8. Effusion: Joint effusion.
-9. Synovitis: Synovial thickening.
+5. Medial OA: Medial tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
+6. Lateral OA: Lateral tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
+7. PF OA: Patellofemoral compartment osteoarthritis, patellar facet arthrosis, chondromalacia patellae.
+8. Effusion: Joint effusion. (NOTE: 'physiological fluid' or 'trace fluid' is absent. However, ANY explicit 'effusion' including 'small effusion' is PRESENT).
+9. Synovitis: Synovial thickening, synovitis, synovial proliferation. (NOTE: If not explicitly mentioned, it is not_stated. Do not assume synovitis just because effusion is present).
 10. Baker's: Baker's cyst, popliteal cyst.
-11. Contusion: Bone bruise.
-12. Fracture: Cortical bone fracture.
+11. Contusion: Bone bruise, bone marrow edema following trauma.
+12. Fracture: Cortical bone fracture, avulsion fracture. (NOTE: Old healed fracture = absent).
 
 GENERAL RULES:
 1. Output MUST be valid JSON containing ALL 12 KEYS.
@@ -336,11 +336,10 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 is_present = False
                 is_absent = False
                 
+            # ---------------------------------------------------------------------
+            # Shield 5: Grounding Verification Against Original Report
+            # ---------------------------------------------------------------------
             if (is_present or is_absent) and original_report:
-                # ---------------------------------------------------------------------
-                  # Shield 5: Grounding Verification Against Original Report
-                # ---------------------------------------------------------------------
-                if (is_present or is_absent) and original_report:
                     clean_q = clean_txt(exact_quote)
                     clean_rep = clean_txt(original_report)
                     if len(clean_q) > 3 and clean_q not in clean_rep:
@@ -363,7 +362,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
             
             # Map verified findings to labels & confidence weights
             conf_str = str(v.get('confidence', '')).lower()
-            if (is_present or is_absent) and original_report:
+            if is_present:
                 if 'high' in conf_str:
                     out[t], out[f"{t}_weight"] = 0.95, 1.0
                 elif 'low' in conf_str:

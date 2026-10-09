@@ -20,11 +20,13 @@ def append_to_jsonl(uid, raw_output, out_csv):
 import psutil
 import src.core.config as config
 
+# Module-level project root resolution
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+
 # SOTA Fix: Robustly load .env from project root so HF_TOKEN / HUGGING_FACE_HUB_TOKEN is always accessible.
 try:
     from dotenv import load_dotenv
-    _proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-    _env_path = os.path.join(_proj_root, '.env')
+    _env_path = os.path.join(PROJECT_ROOT, '.env')
     if os.path.exists(_env_path):
         load_dotenv(_env_path)
     load_dotenv()
@@ -398,11 +400,12 @@ def resolve_local_model_path(repo_id: str) -> str:
     """If repo_id corresponds to a downloaded local HF snapshot, return the local directory path."""
     if not repo_id or os.path.isdir(repo_id):
         return repo_id
+    proj_root = globals().get("PROJECT_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     repo_folder = f"models--{repo_id.replace('/', '--')}"
     candidate_bases = [
         os.environ.get("HF_HOME"),
         os.path.expanduser("~/.cache/huggingface"),
-        os.path.abspath(os.path.join(PROJECT_ROOT, "data", "hf_cache")),
+        os.path.abspath(os.path.join(proj_root, "data", "hf_cache")),
         "/home/iedc_ai_dgx1/.cache/huggingface",
     ]
     for base in candidate_bases:

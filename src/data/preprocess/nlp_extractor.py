@@ -537,6 +537,15 @@ def auto_complete_extraction(
     if force:
         _atomic_csv(_empty_extraction_frame(), out_csv)
 
+    # Evaluation-tolerant provenance contract
+    prov_check = {
+        "extractor_version": EXTRACTOR_VERSION,
+        "engine": selected_engine,
+    }
+    if not evaluate:
+        prov_check["model_id"] = resolved_model
+        prov_check["prompt_sha256"] = prompt_sha256
+
     # 1. Reuse existing extractions if valid under provenance
     existing_results = []
     done_uids = set()
@@ -556,13 +565,8 @@ def auto_complete_extraction(
             valid_existing = _validated_extraction_rows(
                 existing_df,
                 needed_uids,
-                report_hashes,
-                {
-                    "extractor_version": EXTRACTOR_VERSION,
-                    "engine": selected_engine,
-                    "model_id": resolved_model,
-                    "prompt_sha256": prompt_sha256,
-                },
+                report_hashes if not evaluate else None,
+                prov_check,
             )
             if len(valid_existing) > 0:
                 done_uids = set(valid_existing["StudyInstanceUID"])
@@ -772,13 +776,8 @@ def auto_complete_extraction(
                 saved_rows = _validated_extraction_rows(
                     df_out,
                     needed_uids,
-                    report_hashes,
-                    {
-                        "extractor_version": EXTRACTOR_VERSION,
-                        "engine": selected_engine,
-                        "model_id": resolved_model,
-                        "prompt_sha256": prompt_sha256,
-                    },
+                    report_hashes if not evaluate else None,
+                    prov_check,
                 )
                 _atomic_json(
                     manifest_path,
@@ -831,8 +830,10 @@ def auto_complete_extraction(
                 df_out = pd.DataFrame(results).drop_duplicates(subset=["StudyInstanceUID"], keep="last")
                 _atomic_csv(df_out, out_csv)
                 saved_rows = _validated_extraction_rows(
-                    df_out, needed_uids, report_hashes,
-                    {"extractor_version": EXTRACTOR_VERSION, "engine": selected_engine, "model_id": resolved_model, "prompt_sha256": prompt_sha256}
+                    df_out,
+                    needed_uids,
+                    report_hashes if not evaluate else None,
+                    prov_check,
                 )
                 _atomic_json(manifest_path, {**contract, "status": "in_progress", "completed_studies": len(saved_rows)})
                 print(f"[CHECKPOINT] Saved {len(df_out)} studies after retry pass {attempt + 1}.")
@@ -855,8 +856,10 @@ def auto_complete_extraction(
                 df_out = pd.DataFrame(results).drop_duplicates(subset=["StudyInstanceUID"], keep="last")
                 _atomic_csv(df_out, out_csv)
                 saved_rows = _validated_extraction_rows(
-                    df_out, needed_uids, report_hashes,
-                    {"extractor_version": EXTRACTOR_VERSION, "engine": selected_engine, "model_id": resolved_model, "prompt_sha256": prompt_sha256}
+                    df_out,
+                    needed_uids,
+                    report_hashes if not evaluate else None,
+                    prov_check,
                 )
 
         except Exception as vllm_err:
@@ -888,13 +891,8 @@ def auto_complete_extraction(
     final_df = _validated_extraction_rows(
         final_df,
         needed_uids,
-        report_hashes,
-        {
-            "extractor_version": EXTRACTOR_VERSION,
-            "engine": selected_engine,
-            "model_id": resolved_model,
-            "prompt_sha256": prompt_sha256,
-        },
+        report_hashes if not evaluate else None,
+        prov_check,
     )
     missing_uids = needed_uids - set(final_df["StudyInstanceUID"])
     if missing_uids:

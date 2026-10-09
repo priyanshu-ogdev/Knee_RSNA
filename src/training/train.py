@@ -289,6 +289,12 @@ def train_epoch(
                 1.0 + (gold_weight_mult - 1.0) * verified_gold
             )
 
+        # UPGRADE 6: Curriculum label weighting
+        if epoch < 5:
+            # Up-weight positive findings
+            has_positive = (targets >= 0.5).float()
+            weights = weights * (1.0 + has_positive)
+            
         # Optional label smoothing
         if label_smoothing > 0.0:
             targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
@@ -729,6 +735,14 @@ def run_training(
     try:
         for ep in range(n_ep):
             ds_tr.set_epoch(ep)
+            
+            # UPGRADE 4: Annealed attention temperature
+            cur_temp = max(0.3, 1.0 - 0.7 * (ep / max(1, n_ep)))
+            if hasattr(model, 'module'):
+                if hasattr(model.module, 'wpool'):
+                    model.module.wpool.temperature = cur_temp
+            elif hasattr(model, 'wpool'):
+                model.wpool.temperature = cur_temp
 
             # Gold upweighting is a fixed heuristic and has not been isolated
             # in a matched validation ablation.
@@ -739,7 +753,7 @@ def run_training(
                 total_epochs=n_ep,
                 label_smoothing=label_smoothing,
                 grad_accum=grad_accum,
-                gold_weight_mult=1.5,
+                gold_weight_mult=2.0,
             )
 
             msg = f"epoch {ep + 1}/{n_ep}  loss {loss_val:.4f}"

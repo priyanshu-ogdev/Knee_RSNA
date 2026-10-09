@@ -518,6 +518,12 @@ def run_inference(
     # A single family remains on its probability scale; multi-family blends are
     # percentile-rank scores and should not be described as calibrated probabilities.
     sub = pd.DataFrame(preds, columns=config.TARGETS)
+    
+    # UPGRADE 5: Rank normalization per column
+    for col in config.TARGETS:
+        if len(sub) > 1:
+            sub[col] = sub[col].rank(pct=True)
+            
     sub.insert(0, "StudyInstanceUID", studies)
     if order is not None:
         # Mandatory Kaggle submission rule: exact 1-to-1 match with test.csv rows and order

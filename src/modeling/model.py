@@ -176,6 +176,25 @@ class SlotHead(nn.Module):
         # x: [B, S, dim]
         h = self.proj(x) + self.slot_emb                          # [B, S, hidden]
         att = torch.einsum("bsh,oh->bos", h, self.query) / self.hidden ** 0.5
+        
+        # UPGRADE 1: Per-target soft pooling mapping
+        if self.query.shape[0] == 12:
+            target_temps = torch.tensor([
+                0.5,  # ACL (top-2 avg)
+                0.5,  # MCL (top-2 avg)
+                0.1,  # Medial Meniscus (max pool)
+                0.1,  # Lateral Meniscus (max pool)
+                5.0,  # Medial OA (mean pool)
+                5.0,  # Lateral OA (mean pool)
+                5.0,  # PF OA (mean pool)
+                0.1,  # Effusion (max pool)
+                5.0,  # Synovitis (mean pool)
+                0.1,  # Baker's (max pool)
+                0.1,  # Contusion (max pool)
+                0.1,  # Fracture (max pool)
+            ], device=x.device).view(1, 12, 1)
+            att = att / target_temps
+            
         att = att + self.slot_prior.unsqueeze(0)   # anatomical plane bias
         valid_slots = mask.unsqueeze(1) >= 0.5
         att = att.masked_fill(~valid_slots, -10000.0).softmax(-1)
@@ -207,6 +226,9 @@ class WindowPool(nn.Module):
         A_V = self.attention_V(feat)
         A_U = self.attention_U(feat)
         a = self.attention_weights(A_V * A_U).squeeze(-1)  # [B, S, W]
+        # UPGRADE 4: Annealed attention temperature
+        if hasattr(self, 'temperature'):
+            a = a / self.temperature
         a = a.masked_fill(wmask < 0.5, -10000.0).softmax(-1)
         return (a.unsqueeze(-1) * feat).sum(2)             # [B, S, 3*dim]
 

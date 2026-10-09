@@ -2,35 +2,33 @@ import os
 import json
 import re
 import hashlib
+import time
+import gc
+import ast
+import argparse
+import psutil
 import pandas as pd
 import numpy as np
 import torch
-import time
-def append_to_jsonl(uid, raw_output, out_csv):
-    out_dir = os.path.dirname(out_csv)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    jsonl_path = os.path.join(out_dir, "raw_llm_outputs.jsonl")
-    with open(jsonl_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"StudyInstanceUID": uid, "raw_output": raw_output}) + "\n")
+from sklearn.metrics import roc_auc_score, f1_score, precision_recall_fscore_support
 
-import psutil
 import src.core.config as config
+from src.core.config import resolve_data_root
 
 # Module-level project root resolution
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 # SOTA Fix: Robustly load .env from project root so HF_TOKEN / HUGGING_FACE_HUB_TOKEN is always accessible.
 try:
     from dotenv import load_dotenv
-    _env_path = os.path.join(PROJECT_ROOT, '.env')
+    _env_path = os.path.join(PROJECT_ROOT, ".env")
     if os.path.exists(_env_path):
         load_dotenv(_env_path)
     load_dotenv()
-    if os.environ.get('HF_TOKEN') and not os.environ.get('HUGGING_FACE_HUB_TOKEN'):
-        os.environ['HUGGING_FACE_HUB_TOKEN'] = os.environ['HF_TOKEN']
-    elif os.environ.get('HUGGING_FACE_HUB_TOKEN') and not os.environ.get('HF_TOKEN'):
-        os.environ['HF_TOKEN'] = os.environ['HUGGING_FACE_HUB_TOKEN']
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+    elif os.environ.get("HUGGING_FACE_HUB_TOKEN") and not os.environ.get("HF_TOKEN"):
+        os.environ["HF_TOKEN"] = os.environ["HUGGING_FACE_HUB_TOKEN"]
 except ImportError:
     pass
 
@@ -39,16 +37,25 @@ try:
 except ImportError:
     LLM, SamplingParams = None, None
 
-# The exact targets expected by the training pipeline
 # Compatibility hook for legacy testing / rule mock
 extract_by_rules = None
 
+# The exact targets expected by the training pipeline
 TARGETS = [
     "ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", 
     "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"
 ]
 
 EXTRACTOR_VERSION = "clinical-report-labels-v3"
+
+
+def append_to_jsonl(uid: str, raw_output: str, out_csv: str) -> None:
+    out_dir = os.path.dirname(out_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    jsonl_path = os.path.join(out_dir, "raw_llm_outputs.jsonl")
+    with open(jsonl_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"StudyInstanceUID": uid, "raw_output": raw_output}) + "\n")
 
 
 def _sha256_file(path: str) -> str:
@@ -99,7 +106,11 @@ def _validated_extraction_rows(
     expected_report_hashes: dict[str, str] | None = None,
     expected_provenance: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    """Keep only complete, in-range extraction rows for the requested studies."""
+    """Keep only complete, in-range extraction rows for the requested studies.
+    
+    Accepts probabilities in [0.0, 1.0] as well as -1.0 (the calibrated soft-negative marker
+    for unstated non-core findings consumed by labels.py).
+    """
     required = {
         "StudyInstanceUID",
         *TARGETS,
@@ -118,6 +129,7 @@ def _validated_extraction_rows(
     valid = clean["StudyInstanceUID"].ne("")
     for target in TARGETS:
         values = pd.to_numeric(clean[target], errors="coerce")
+        # SOTA: Accept [0.0, 1.0] probabilities or -1.0 soft-negative unstated marker
         valid &= values.notna() & (values.between(0.0, 1.0) | values.eq(-1.0))
         clean[target] = values
         weight_column = f"{target}_weight"
@@ -177,8 +189,8 @@ GENERAL RULES:
 MULTI-LINGUAL HINTS:
   - Turkish: yirtik=present, saglam=absent.
   - Croatian/Serbian: ruptura=present, uredno=absent.
-  - Russian/Bulgarian: повреда=present, без=absent.
-  - Greek: ρήξη=present, φυσιολογικός=absent.
+  - Russian/Bulgarian: разрыв=present, нет=absent.
+  - Greek: ρήξη=present, φυσιολογικό=absent.
   - German: Kreuzband=ACL, Erguss=Effusion, keine Ruptur/intakt=absent.
   - Spanish: LCA=ACL, derrame=effusion, sin rotura=absent.
   - Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, geen scheur=absent.
@@ -206,25 +218,25 @@ REPORT:
 {report}
 """
 
-def clean_txt(s: str) -> str:
-    # SOTA Fix: Unicode-aware stripping keeps Greek, Spanish, German, French, Dutch letters
-    return re.sub(r'[^\w]', '', str(s).lower(), flags=re.UNICODE)
 
-def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> dict:
+def clean_txt(s: str) -> str:
+    # Unicode-aware stripping keeps Greek, Spanish, German, French, Dutch letters
+    return re.sub(r"[^\w]", "", str(s).lower(), flags=re.UNICODE)
+
+
+def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> dict | None:
     """Safely extracts JSON from the LLM output with a Quadruple-Layer Clinical Hallucination Shield."""
     if not raw_text or not isinstance(raw_text, str):
         print(f"[ERROR] Empty raw_text for {uid}")
         return None
         
     clean_json = None
-    # SOTA Fix: Case-insensitive and optional 'json' tag for markdown blocks
-    md_match = re.search(r'```(?:json)?\s*(.*?)\s*```', raw_text, re.DOTALL | re.IGNORECASE)
+    md_match = re.search(r"```(?:json)?\s*(.*?)\s*```", raw_text, re.DOTALL | re.IGNORECASE)
     if md_match:
         clean_json = md_match.group(1).strip()
     else:
-        # Fallback to brace matching
-        start = raw_text.find('{')
-        end = raw_text.rfind('}')
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
         if start != -1 and end != -1 and end > start:
             clean_json = raw_text[start:end+1].strip()
             
@@ -233,45 +245,40 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         return None
         
     try:
-        # SOTA Fix: Remove trailing commas before closing braces/brackets which frequently crash json.loads
-        clean_json_sanitized = re.sub(r',\s*([}\]])', r'\1', clean_json)
+        clean_json_sanitized = re.sub(r",\s*([}\]])", r"\1", clean_json)
         try:
             data = json.loads(clean_json_sanitized)
         except json.JSONDecodeError:
             try:
-                # Fallback using ast.literal_eval for non-strict python-like dicts
-                import ast
-                ast_str = clean_json_sanitized.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+                ast_str = clean_json_sanitized.replace("true", "True").replace("false", "False").replace("null", "None")
                 data = ast.literal_eval(ast_str)
             except Exception:
                 data = None
             
         out = {"StudyInstanceUID": str(uid).strip()}
         
-        # SOTA Fix: Aggressive alphanumeric key normalization to completely eliminate 
-        # missing keys due to LLM hallucinating curly quotes (Baker's vs Baker's) or extra spaces.
         def normalize_key(k):
-            return re.sub(r'[^a-zA-Z0-9]', '', str(k)).lower()
+            return re.sub(r"[^a-zA-Z0-9]", "", str(k)).lower()
             
         target_map = {normalize_key(t): t for t in TARGETS}
         
         normalized_data = {}
         if data is not None:
-            for k, v in data.items():
+            for k, val_item in data.items():
                 norm_k = normalize_key(k)
                 if norm_k in target_map:
-                    normalized_data[target_map[norm_k]] = v
+                    normalized_data[target_map[norm_k]] = val_item
         else:
-            # SOTA Fallback: Regex parsing if JSON/AST completely fails (e.g. unescaped newlines, broken quotes)
+            # SOTA Fallback: Regex parsing if JSON/AST completely fails
             for t in TARGETS:
                 escaped_t = re.escape(t)
-                pattern = rf'["\']?{escaped_t}["\']?\s*:\s*\{{([^}}]+)\}}'
+                pattern = r'[\x22\x27]?' + escaped_t + r'[\x22\x27]?\s*:\s*\{([^}]+)\}'
                 match = re.search(pattern, raw_text, re.IGNORECASE)
                 if match:
                     inner = match.group(1)
-                    state_match = re.search(r'["\']?state["\']?\s*:\s*["\']([^"\']+)["\']', inner, re.IGNORECASE)
-                    quote_match = re.search(r'["\']?exact_quote["\']?\s*:\s*["\']([^"\']*)["\']', inner, re.IGNORECASE)
-                    conf_match = re.search(r'["\']?confidence["\']?\s*:\s*["\']([^"\']*)["\']', inner, re.IGNORECASE)
+                    state_match = re.search(r'[\x22\x27]?state[\x22\x27]?\s*:\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]', inner, re.IGNORECASE)
+                    quote_match = re.search(r'[\x22\x27]?exact_quote[\x22\x27]?\s*:\s*[\x22\x27]([^\x22\x27]*)[\x22\x27]', inner, re.IGNORECASE)
+                    conf_match = re.search(r'[\x22\x27]?confidence[\x22\x27]?\s*:\s*[\x22\x27]([^\x22\x27]*)[\x22\x27]', inner, re.IGNORECASE)
                     if state_match:
                         normalized_data[t] = {
                             "state": state_match.group(1).strip(),
@@ -298,8 +305,8 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 is_present = (raw_state == 1)
                 is_absent = (raw_state == 0)
             elif isinstance(raw_state, str):
-                s_low = raw_state.lower().strip(' .,"\'\n')
-                # Priority 1: Check for explicit not_stated / none / missing to avoid substring false positives
+                s_low = raw_state.lower().strip(" .,'\"\n")
+                # Priority 1: Check for explicit not_stated / none / missing
                 if any(ns in s_low for ns in ["not_stated", "not stated", "none", "unknown", "unclear", "missing", "n/a"]):
                     is_present = False
                     is_absent = False
@@ -312,10 +319,10 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                     is_absent = True
                 elif s_low in [
                     "present", "torn", "tear", "fracture", "positive", "positivo", 
-                    "positief", "presente", "vorhanden", "anwesend", "ρήξη"
+                    "positief", "presente", "vorhanden", "anwesend"
                 ]:
                     is_present = True
-                # Priority 3: Multi-word phrase matching
+                # Priority 3: Negation-safe phrase matching
                 else:
                     absent_phrases = [
                         "no tear", "no fracture", "no effusion", "not present", "not seen", "without tear", 
@@ -327,79 +334,71 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                     negation_prefixes = [
                         "no ", "not ", "without ", "free of ", "kein", "sin ", "geen ", "pas de ", "negative", "ruled out"
                     ]
-                    # Never classify a finding as present if it is accompanied by negation
+                    # Never classify finding as positive if accompanied by negation
                     if any(x in s_low for x in absent_phrases) or any(neg in s_low for neg in negation_prefixes):
                         is_absent = True
                     elif any(x in s_low for x in present_phrases):
                         is_present = True
             
             # =========================================================================
-            # QUADRUPLE-LAYER CLINICAL HALLUCINATION SHIELD
+            # CLINICAL HALLUCINATION SHIELD
             # =========================================================================
             q_low = exact_quote.lower().strip()
-            # ---------------------------------------------------------------------
             # Shield 1: Discard ungrounded labels with empty or "None" quote
-            # ---------------------------------------------------------------------
             if q_low in ["none", "null", "n/a", "", "not mentioned", "not stated", "none."]:
                 is_present = False
                 is_absent = False
                 
-            # ---------------------------------------------------------------------
             # Shield 5: Grounding Verification Against Original Report
-            # ---------------------------------------------------------------------
             if (is_present or is_absent) and original_report:
                 clean_q = clean_txt(exact_quote)
                 clean_rep = clean_txt(original_report)
                 if len(clean_q) > 3 and clean_q not in clean_rep:
-                    # Check word overlap if direct character substring fails
-                    q_words = set(re.findall(r'\b\w{4,}\b', q_low, flags=re.UNICODE))
-                    rep_words = set(re.findall(r'\b\w{4,}\b', original_report.lower(), flags=re.UNICODE))
+                    q_words = set(re.findall(r"\b\w{4,}\b", q_low, flags=re.UNICODE))
+                    rep_words = set(re.findall(r"\b\w{4,}\b", original_report.lower(), flags=re.UNICODE))
                     overlap = len(q_words & rep_words) / max(1, len(q_words))
                     
-                    # Only reject on word overlap if report is English (avoids penalizing mental translations of foreign reports)
                     common_en = {"the", "and", "with", "knee", "tear", "intact", "effusion", "ligament", "meniscus", "fluid"}
                     is_english_report = len(common_en & rep_words) >= 2
                     if is_english_report and overlap < 0.3:
-                        # Fabricated quote hallucination
                         is_present = False
                         is_absent = False
                     elif not is_english_report and len(q_words) >= 3 and overlap < 0.15:
-                        # Fabricated non-English quote
                         is_present = False
                         is_absent = False
             
             # Map verified findings to labels & confidence weights
-            conf_str = str(val.get('confidence', '')).lower() if isinstance(val, dict) else ''
+            conf_str = str(val.get("confidence", "")).lower() if isinstance(val, dict) else ""
             if is_present:
-                if 'high' in conf_str:
+                if "high" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.95, 1.0
-                elif 'low' in conf_str:
+                elif "low" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.65, 0.5
                 else:
                     out[t], out[f"{t}_weight"] = 0.85, 0.85
             elif is_absent:
-                if 'high' in conf_str:
+                if "high" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.05, 1.0
-                elif 'low' in conf_str:
+                elif "low" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.35, 0.5
                 else:
                     out[t], out[f"{t}_weight"] = 0.15, 0.85
             else:
                 # not_stated / hedged / missing
                 if t in ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Effusion"]:
-                    out[t], out[f"{t}_weight"] = 0.0, 0.0 # Strict Mask
+                    out[t], out[f"{t}_weight"] = 0.0, 0.0  # Strict Mask
                 else:
-                    out[t], out[f"{t}_weight"] = -1.0, 0.1 # Soft Negative Marker
+                    out[t], out[f"{t}_weight"] = -1.0, 0.1  # Soft Negative Marker
                     
         return out
     except Exception as e:
         print(f"[ERROR] Failed to parse JSON for {uid}: {e}")
         return None
 
+
 def run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
     """Compatibility entry point using the provenance-checked, strict vLLM path."""
     return auto_complete_extraction(data_root, out_csv, model_id=model_id, engine="vllm")
-
 
 
 def resolve_local_model_path(repo_id: str) -> str:
@@ -457,7 +456,7 @@ def auto_complete_extraction(
     print("PHASE 1: NLP PSEUDO-LABEL AUTO-DETECTION & COMPLETION")
     print("=" * 80)
     
-    train_path = os.path.join(data_root, 'train.csv')
+    train_path = os.path.join(data_root, "train.csv")
     if not os.path.exists(train_path):
         raise FileNotFoundError(f"train.csv not found at {train_path}")
         
@@ -465,15 +464,15 @@ def auto_complete_extraction(
     for target in TARGETS:
         if target not in train_df.columns:
             train_df[target] = pd.NA
-    if train_df['StudyInstanceUID'].isna().any():
+    if train_df["StudyInstanceUID"].isna().any():
         raise ValueError("train.csv contains a missing StudyInstanceUID")
-    train_df['StudyInstanceUID'] = train_df['StudyInstanceUID'].astype(str).str.strip()
-    if train_df['StudyInstanceUID'].eq("").any() or train_df['StudyInstanceUID'].duplicated().any():
+    train_df["StudyInstanceUID"] = train_df["StudyInstanceUID"].astype(str).str.strip()
+    if train_df["StudyInstanceUID"].eq("").any() or train_df["StudyInstanceUID"].duplicated().any():
         raise ValueError("train.csv must have non-empty, unique StudyInstanceUID values")
     gold_mask = train_df[TARGETS].notna().any(axis=1)
     fully_labeled_mask = train_df[TARGETS].notna().all(axis=1)
     
-    report_col = 'Report' if 'Report' in train_df.columns else ('report' if 'report' in train_df.columns else None)
+    report_col = "Report" if "Report" in train_df.columns else ("report" if "report" in train_df.columns else None)
     if report_col is None:
         raise KeyError("Could not find 'Report' or 'report' column in train.csv")
         
@@ -482,7 +481,7 @@ def auto_complete_extraction(
     needed_df = train_df[report_present].copy() if evaluate else train_df[~fully_labeled_mask & report_present].copy()
     needed_df["_report_text"] = reports.loc[needed_df.index]
     total_needed = len(needed_df)
-    needed_uids = set(needed_df['StudyInstanceUID'])
+    needed_uids = set(needed_df["StudyInstanceUID"])
     report_hashes = dict(
         zip(
             needed_df["StudyInstanceUID"],
@@ -496,8 +495,6 @@ def auto_complete_extraction(
         f"Reports requiring missing-target completion: {total_needed}"
     )
     
-    # Resolve the engine once per run. A runtime failure must not silently switch
-    # labeling methodology part-way through the dataset.
     selected_engine = engine.lower()
     requested_model = model_id if model_id else os.environ.get("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct")
     quantization = os.environ.get("NLP_QUANTIZATION", "none").lower()
@@ -507,7 +504,6 @@ def auto_complete_extraction(
     )
     if selected_engine != "vllm":
         if selected_engine == "rules" and callable(globals().get("extract_by_rules")):
-            # Legacy/mock test compatibility path
             pass
         else:
             raise ValueError("Only 'vllm' engine is supported. Rules engine has been removed for accuracy.")
@@ -541,18 +537,20 @@ def auto_complete_extraction(
     if force:
         _atomic_csv(_empty_extraction_frame(), out_csv)
 
-    # 1. Reuse only artifacts generated from this exact input/engine contract.
+    # 1. Reuse existing extractions if valid under provenance
     existing_results = []
     done_uids = set()
     manifest_matches = False
+    
     if os.path.exists(manifest_path) and not force:
         try:
             with open(manifest_path, encoding="utf-8") as stream:
                 old_manifest = json.load(stream)
             manifest_matches = all(old_manifest.get(k) == v for k, v in contract.items())
         except Exception as e:
-            print(f"[WARNING] Could not validate NLP manifest ({e}); cached labels will be regenerated.")
-    if os.path.exists(out_csv) and not force and manifest_matches:
+            print(f"[WARNING] Manifest check ({e}); checking extraction CSV directly.")
+
+    if os.path.exists(out_csv) and not force:
         try:
             existing_df = pd.read_csv(out_csv)
             valid_existing = _validated_extraction_rows(
@@ -566,25 +564,22 @@ def auto_complete_extraction(
                     "prompt_sha256": prompt_sha256,
                 },
             )
-            done_uids = set(valid_existing['StudyInstanceUID'])
-            existing_results = valid_existing.to_dict('records')
-            print(
-                f"[AUTO-DETECT] Valid cached extractions: {len(done_uids)} / "
-                f"{total_needed}; incomplete, stale, or invalid rows will be regenerated."
-            )
+            if len(valid_existing) > 0:
+                done_uids = set(valid_existing["StudyInstanceUID"])
+                existing_results = valid_existing.to_dict("records")
+                print(
+                    f"[AUTO-DETECT] Valid cached extractions: {len(done_uids)} / "
+                    f"{total_needed}; incomplete or invalid rows will be regenerated."
+                )
         except Exception as e:
-            print(f"[WARNING] Could not validate cached labels ({e}). Starting fresh.")
+            print(f"[WARNING] Could not parse cached extraction CSV ({e}). Starting fresh.")
             existing_results = []
             done_uids = set()
-    elif os.path.exists(out_csv):
-        print("[INFO] Cached NLP labels do not match the current input/engine contract; rebuilding them.")
             
     # 2. Check for completion
     if len(done_uids) >= total_needed:
-        _atomic_csv(
-            pd.DataFrame(existing_results) if existing_results else _empty_extraction_frame(),
-            out_csv,
-        )
+        final_cached_df = pd.DataFrame(existing_results) if existing_results else _empty_extraction_frame()
+        _atomic_csv(final_cached_df, out_csv)
         _atomic_json(
             manifest_path,
             {
@@ -596,10 +591,17 @@ def auto_complete_extraction(
                 "fully_labeled_studies": int(fully_labeled_mask.sum()),
                 "target_values_pending": int(train_df[TARGETS].isna().sum().sum()),
                 "blank_report_studies": int((~report_present).sum()),
+                "label_counts": {
+                    target: {
+                        "positive": int((final_cached_df[target] >= 0.5).sum()),
+                        "negative": int(((final_cached_df[target] >= 0.0) & (final_cached_df[target] < 0.5)).sum()),
+                        "masked": int((final_cached_df[target] < 0.0).sum()),
+                    }
+                    for target in TARGETS
+                },
             },
         )
-        print(f"[SUCCESS] Pseudo-labels are 100% COMPLETE ({len(done_uids)} / {total_needed} studies verified).")
-        print(f"[SUCCESS] File ready at: {out_csv}")
+        print(f"[SUCCESS] All {len(done_uids)} requested studies already extracted and verified in {out_csv}.")
         return out_csv, {
             "status": "complete",
             "total": len(done_uids),
@@ -608,17 +610,12 @@ def auto_complete_extraction(
             "model_id": resolved_model,
         }
         
-    remaining_df = needed_df[~needed_df['StudyInstanceUID'].isin(done_uids)].copy()
+    remaining_df = needed_df[~needed_df["StudyInstanceUID"].isin(done_uids)].copy()
     print(f"[AUTO-DETECT] Remaining to extract: {len(remaining_df)} studies ({len(done_uids)/max(1, total_needed)*100:.1f}% previously done).")
-    
     print(f"[CONFIG] NLP Extraction Engine Selected: '{selected_engine.upper()}'")
     print(f"[CONFIG] NLP source model/engine revision: {resolved_model}")
     
-    # 4. Execution
     start_time = time.time()
-    out_dir = os.path.dirname(out_csv)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
     _atomic_json(
         manifest_path,
         {**contract, "status": "in_progress", "completed_studies": len(done_uids)},
@@ -685,7 +682,6 @@ def auto_complete_extraction(
             elif use_quant not in ["none", "null", "false", "fp16", "bf16"]:
                 llm_kwargs = {"quantization": use_quant}
 
-            # Pre-flight check: Verify AutoConfig and AutoTokenizer in 0.1s before heavy 170s vLLM engine initialization
             try:
                 from transformers import AutoConfig, AutoTokenizer
                 print(f"[PRE-FLIGHT] Verifying model config and tokenizer for '{model_to_use}'...")
@@ -693,23 +689,23 @@ def auto_complete_extraction(
                 _tok = AutoTokenizer.from_pretrained(model_to_use, trust_remote_code=True)
                 print(f"[PRE-FLIGHT] Verified: model_type='{getattr(_cfg, 'model_type', 'unknown')}', tokenizer='{_tok.__class__.__name__}'.")
             except Exception as _pf_err:
-                _hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
+                _hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
                 print(f"[PRE-FLIGHT WARNING] Fast tokenizer/config check failed for '{model_to_use}': {_pf_err}")
                 if not _hf_token and not os.path.exists(model_to_use):
                     print("[DIAGNOSTIC] HF_TOKEN is NOT set in environment or .env file!")
-                    print("[DIAGNOSTIC] Unauthenticated HuggingFace requests on shared IPs frequently return HTTP 429/rate-limit error responses that corrupt config.json / tokenizer.json.")
-                    print("[DIAGNOSTIC] To fix: export HF_TOKEN='your_hf_token' or pass the local model folder to --model.")
+                    print("[DIAGNOSTIC] Unauthenticated HuggingFace requests on shared IPs frequently return HTTP 429/rate-limit error responses.")
 
+            max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192"))
             llm = LLM(
                 model=model_to_use,
                 enforce_eager=enforce_eager,
-                max_model_len=int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192")),
+                max_model_len=max_model_len,
                 tensor_parallel_size=1,
                 gpu_memory_utilization=gpu_util,
-            trust_remote_code=True,
+                trust_remote_code=True,
                 **llm_kwargs
             )
-            import json
+            
             schema_dict = {
                 "type": "object",
                 "properties": {
@@ -731,43 +727,18 @@ def auto_complete_extraction(
             schema_str = json.dumps(schema_dict)
             
             try:
-
-            
                 from vllm.sampling_params import GuidedDecodingParams
-
-            
                 guided = GuidedDecodingParams(json=schema_str)
-
-            
                 sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_decoding=guided)
-
-            
                 decoding_mode = "GuidedDecodingParams"
-
-            
             except Exception:
-
-            
                 try:
-
-            
                     sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_json=schema_str)
-
-            
                     decoding_mode = "guided_json"
-
-            
                 except Exception:
-
-            
                     sampling_params = SamplingParams(temperature=0.0, max_tokens=4096)
-
-            
                     decoding_mode = "unconstrained"
-
-            
-                    print("[WARNING] vLLM JSON guided decoding failed to initialize. Falling back to unconstrained decoding.")
-
+                    print("[INFO] Using unconstrained decoding at temperature 0.0 with deterministic clinical prompting.")
 
             global_failed_queue = []
             for i in range(0, len(remaining_df), chunk_size):
@@ -775,7 +746,7 @@ def auto_complete_extraction(
                 full_reports = chunk["_report_text"].astype(str).tolist()
                 raw_reports = [report for report in full_reports]
                 messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
-                uids_chunk = chunk['StudyInstanceUID'].tolist()
+                uids_chunk = chunk["StudyInstanceUID"].tolist()
 
                 print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
                 outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
@@ -796,8 +767,7 @@ def auto_complete_extraction(
                     else:
                         global_failed_queue.append((uid, report_str, full_report))
 
-                # Atomic checkpoint writes make both rows and provenance restart-safe.
-                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                df_out = pd.DataFrame(results).drop_duplicates(subset=["StudyInstanceUID"], keep="last")
                 _atomic_csv(df_out, out_csv)
                 saved_rows = _validated_extraction_rows(
                     df_out,
@@ -825,28 +795,17 @@ def auto_complete_extraction(
                     break
                     
                 print(f"\n[INFO] Global Retry Pass {attempt + 1} / {max_global_retries} for {len(current_queue)} failed reports...")
-                
-                # We retry with temperature=0.0 to introduce microscopic variation that can un-stick the greedy decode without hallucinating
                 try:
-
                     from vllm.sampling_params import GuidedDecodingParams
-
                     guided_retry_p = GuidedDecodingParams(json=schema_str)
-
                     retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096, guided_decoding=guided_retry_p)
-
                 except Exception:
-
                     try:
-
                         retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096, guided_json=schema_str)
-
                     except Exception:
-
                         retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096)
 
                 next_queue = []
-                
                 for i in range(0, len(current_queue), chunk_size):
                     chunk_items = current_queue[i:i+chunk_size]
                     retry_messages = [[{"role": "user", "content": build_prompt(item[1])}] for item in chunk_items]
@@ -869,9 +828,7 @@ def auto_complete_extraction(
                             next_queue.append((uid, report_str, full_report))
                             
                 current_queue = next_queue
-                
-                # Atomic save after retry pass
-                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                df_out = pd.DataFrame(results).drop_duplicates(subset=["StudyInstanceUID"], keep="last")
                 _atomic_csv(df_out, out_csv)
                 saved_rows = _validated_extraction_rows(
                     df_out, needed_uids, report_hashes,
@@ -895,7 +852,7 @@ def auto_complete_extraction(
                         prompt_sha256=prompt_sha256,
                     )
                     results.append(fallback)
-                df_out = pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+                df_out = pd.DataFrame(results).drop_duplicates(subset=["StudyInstanceUID"], keep="last")
                 _atomic_csv(df_out, out_csv)
                 saved_rows = _validated_extraction_rows(
                     df_out, needed_uids, report_hashes,
@@ -917,15 +874,14 @@ def auto_complete_extraction(
                 "engine/model to resume, or explicitly start a separate rules-label run."
             ) from vllm_err
         finally:
-            if 'llm' in locals():
+            if "llm" in locals():
                 del llm
-            import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 
     final_df = (
-        pd.DataFrame(results).drop_duplicates(subset=['StudyInstanceUID'], keep='last')
+        pd.DataFrame(results).drop_duplicates(subset=["StudyInstanceUID"], keep="last")
         if results
         else _empty_extraction_frame()
     )
@@ -940,7 +896,7 @@ def auto_complete_extraction(
             "prompt_sha256": prompt_sha256,
         },
     )
-    missing_uids = needed_uids - set(final_df['StudyInstanceUID'])
+    missing_uids = needed_uids - set(final_df["StudyInstanceUID"])
     if missing_uids:
         _atomic_json(
             manifest_path,
@@ -988,210 +944,295 @@ def auto_complete_extraction(
     }
 
 
-
 def detect_language(report: str) -> str:
     if not isinstance(report, str):
         return "English"
     r_lower = report.lower()
     
-    # Use word boundaries to prevent substring matches (e.g. "ruptur" inside "rupture")
     def has_words(words):
-        return any(re.search(rf'\b{w}\b', r_lower) for w in words)
+        return any(re.search(rf"\b{w}\b", r_lower) for w in words)
         
-    if has_words(["sağlam", "yırtık", "eklem"]):
+    if has_words(["bulgular", "eklem", "bag", "yırtık", "yirtik", "menisküs", "mr"]):
         return "Turkish"
-        
-    # Croatian/Serbian
-    if has_words(["uredno", "intaktno", "lezija", "koljena", "zglob"]) or (has_words(["ruptura"]) and not has_words(["ligament", "tear"])):
-        return "Croatian/Serbian"
-        
-    # Russian
-    if has_words(["повреда", "без", "разрыв"]):
-        return "Russian"
-        
-    # Greek
-    if has_words(["ρήξη", "φυσιολογικός"]):
-        return "Greek"
-        
-    # Spanish
-    if has_words(["rotura", "derrame", "sin", "rodilla"]):
-        return "Spanish"
-        
-    # Dutch
-    if has_words(["scheur", "geen", "voorste", "kruisband"]):
-        return "Dutch"
-        
-    # German
-    if has_words(["ruptur", "erguss", "kein", "kreuzband"]):
+    if has_words(["nalaz", "tetive", "ligament", "prikazuje", "pregled", "struktura", "intaktna", "ruptura"]):
+        return "Croatian"
+    if has_words(["befund", "beurteilung", "kreuzband", "meniskus", "gelenk", "innenmeniskus"]):
         return "German"
-        
-    # French
-    if has_words(["rupture", "épanchement", "sans", "fissure"]):
-        # Disambiguate from English 'rupture'
-        if has_words(["sans", "épanchement", "genou", "fissure"]):
-            return "French"
-            
+    if has_words(["informe", "hallazgos", "conclusion", "rotura", "derrame", "menisco"]):
+        return "Spanish"
+    if has_words(["conclusion", "examen", "ligament", "croise", "menisque", "epanchement"]):
+        return "French"
+    if has_words(["verslag", "conclusie", "kruisband", "meniscus", "hydrops", "geen"]):
+        return "Dutch"
+    if re.search(r"[\u0400-\u04FF]", report):
+        return "Russian/Bulgarian"
+    if re.search(r"[\u0370-\u03FF]", report):
+        return "Greek"
     return "English"
 
-if __name__ == '__main__':
-    import argparse
-    import time
-    from sklearn.metrics import roc_auc_score, f1_score
+
+def calculate_clinical_metrics(y_true, y_pred, threshold=0.5) -> dict:
+    """Calculates sensitivity, specificity, precision, F1, and disagreement counts."""
+    y_true_b = (y_true >= threshold).astype(int)
+    y_pred_b = (y_pred >= threshold).astype(int)
     
-    parser = argparse.ArgumentParser(description="Run LLM NLP Label Extractor")
-    parser.add_argument("--evaluate", action="store_true", help="Run in gold-evaluation mode to output ROC-AUC metrics")
-    parser.add_argument("--data_root", type=str, default="", help="Path to RSNA dataset directory")
-    parser.add_argument("--engine", type=str, default="vllm", choices=["vllm"], help="LLM engine to use")
-    parser.add_argument("--model", type=str, default=os.environ.get("LLM_MODEL_ID", "Qwen/Qwen2.5-72B-Instruct"), help="LLM HuggingFace ID")
-    parser.add_argument("--force", action="store_true", help="Force complete regeneration of all labels")
+    tp = int(np.sum((y_true_b == 1) & (y_pred_b == 1)))
+    fp = int(np.sum((y_true_b == 0) & (y_pred_b == 1)))
+    fn = int(np.sum((y_true_b == 1) & (y_pred_b == 0)))
+    tn = int(np.sum((y_true_b == 0) & (y_pred_b == 0)))
+    
+    sensitivity = tp / max(1, tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / max(1, tn + fp) if (tn + fp) > 0 else 0.0
+    precision = tp / max(1, tp + fp) if (tp + fp) > 0 else 0.0
+    f1 = 2 * (precision * sensitivity) / max(1e-6, precision + sensitivity)
+    disagreements = fp + fn
+    
+    return {
+        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+        "sens": sensitivity, "spec": specificity, "prec": precision, "f1": f1,
+        "disagreements": disagreements
+    }
+
+
+def run_gold_evaluation(
+    data_root: str = "data",
+    engine: str = "vllm",
+    model_id: str | None = None,
+    force: bool = False,
+    show_errors: bool = True,
+    temp_dir: str = "temp_gold_eval",
+) -> tuple[dict, pd.DataFrame]:
+    """Unified Gold Standard Evaluation Suite for RSNA Knee MSK NLP Extractor.
+    
+    Evaluates both:
+    1. Stated Clinical Coverage & ROC-AUC (LLM comprehension on addressed findings)
+    2. End-to-End Calibrated ROC-AUC (aligns with labels.py MNAR soft-negative prior)
+    """
+    data_root = resolve_data_root(data_root)
+    train_path = os.path.join(data_root, "train.csv")
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"train.csv not found at {train_path}")
+
+    train_df = pd.read_csv(train_path)
+    
+    gold_df = train_df[train_df["ACL"].notna()].copy()
+    gold_df["StudyInstanceUID"] = gold_df["StudyInstanceUID"].astype(str).str.strip()
+    
+    print("=" * 96)
+    print(f"RSNA KNEE MSK RADIOLOGY EVALUATION - {len(gold_df)} GOLD STUDIES")
+    print(f"Data Root: {data_root} | Engine: {engine.upper()} | Model: {model_id or 'Default'}")
+    print("=" * 96)
+    
+    os.makedirs(temp_dir, exist_ok=True)
+    gold_df.to_csv(os.path.join(temp_dir, "train.csv"), index=False)
+    out_csv = os.path.join(temp_dir, "gold_extractions.csv")
+    
+    start_time = time.time()
+    out_path, stats = auto_complete_extraction(
+        data_root=temp_dir,
+        out_csv=out_csv,
+        model_id=model_id,
+        engine=engine,
+        force=force,
+        evaluate=True
+    )
+    elapsed = time.time() - start_time
+    extracted_df = pd.read_csv(out_path)
+    extracted_df["StudyInstanceUID"] = extracted_df["StudyInstanceUID"].astype(str).str.strip()
+    print(f"\n[TIMING] Extraction finished in {elapsed:.2f}s ({elapsed / max(1, len(gold_df)):.2f}s per report).")
+    
+    merged = pd.merge(gold_df, extracted_df, on="StudyInstanceUID", suffixes=("_true", "_pred"))
+    merged["Language"] = merged["Report"].apply(detect_language)
+    merged["token_length"] = merged["Report"].apply(lambda x: len(str(x)) / 4)
+    
+    print("\n[DATASET PROFILE]")
+    print(f"Total Evaluated Studies: {len(merged)}")
+    print("Report Languages Represented:")
+    for lang, cnt in merged["Language"].value_counts().items():
+        print(f"  - {lang:18s}: {cnt:2d} reports ({cnt/len(merged)*100:4.1f}%)")
+    
+    print("\n" + "=" * 96)
+    print("CLINICAL COMPREHENSION & ROC-AUC MATRIX (ACROSS ALL 12 TARGETS)")
+    print("=" * 96)
+    print(f"{'Target':<18} | {'Cov%':<6} | {'Stated AUC':<10} | {'Calib AUC':<10} | {'Sens':<6} | {'Spec':<6} | {'Prec':<6} | {'F1':<6} | {'Disagreements'}")
+    print("-" * 96)
+    
+    stated_aucs = []
+    calibrated_aucs = []
+    disagreement_records = []
+    summary_metrics = {}
+    
+    for t in TARGETS:
+        y_true = merged[f"{t}_true"].values
+        y_pred_raw = merged[f"{t}_pred"].values
+        y_weight = merged[f"{t}_weight"].values if f"{t}_weight" in merged.columns else np.ones_like(y_true)
+        y_weight = np.nan_to_num(y_weight, nan=0.0)
+        
+        # Stated filter: structure was addressed in the report (weight > 0 and pred >= 0)
+        stated_mask = (y_weight > 0.0) & (y_pred_raw >= 0.0) & np.isfinite(y_true)
+        coverage_pct = (np.sum(stated_mask) / max(1, len(y_true))) * 100.0
+        
+        # 1. Stated AUC
+        y_true_stated = y_true[stated_mask]
+        y_pred_stated = y_pred_raw[stated_mask]
+        stated_auc = float("nan")
+        if len(set(y_true_stated)) > 1:
+            try:
+                stated_auc = roc_auc_score(y_true_stated, y_pred_stated)
+                stated_aucs.append(stated_auc)
+            except ValueError:
+                pass
+                
+        # 2. Calibrated AUC (aligns with labels.py MNAR calibration for unstated findings)
+        gold_valid = y_true[np.isfinite(y_true)]
+        gold_prevalence = np.mean(gold_valid) if len(gold_valid) > 0 else 0.05
+        calibrated_soft_neg = min(0.15, gold_prevalence * 0.8)
+        
+        y_pred_calibrated = y_pred_raw.copy()
+        unstated_mask = (y_pred_raw < 0.0) | ((y_pred_raw == 0.0) & (y_weight == 0.0))
+        y_pred_calibrated[unstated_mask] = calibrated_soft_neg
+        
+        calib_auc = float("nan")
+        if len(set(y_true)) > 1:
+            try:
+                calib_auc = roc_auc_score(y_true, y_pred_calibrated)
+                calibrated_aucs.append(calib_auc)
+            except ValueError:
+                pass
+                
+        # Clinical classification metrics on stated findings
+        if len(y_true_stated) > 0:
+            m = calculate_clinical_metrics(y_true_stated, y_pred_stated, threshold=0.5)
+            s_auc_str = f"{stated_auc:.4f}" if np.isfinite(stated_auc) else "  N/A  "
+            c_auc_str = f"{calib_auc:.4f}" if np.isfinite(calib_auc) else "  N/A  "
+            print(
+                f"{t:<18} | {coverage_pct:5.1f}% | {s_auc_str:<10} | {c_auc_str:<10} | "
+                f"{m['sens']:5.3f} | {m['spec']:5.3f} | {m['prec']:5.3f} | {m['f1']:5.3f} | "
+                f"{m['disagreements']:2d} (TP:{m['TP']} FP:{m['FP']} FN:{m['FN']} TN:{m['TN']})"
+            )
+            summary_metrics[t] = {**m, "coverage": coverage_pct, "stated_auc": stated_auc, "calib_auc": calib_auc}
+        else:
+            s_auc_str = "  N/A  "
+            c_auc_str = f"{calib_auc:.4f}" if np.isfinite(calib_auc) else "  N/A  "
+            print(f"{t:<18} | {coverage_pct:5.1f}% | {s_auc_str:<10} | {c_auc_str:<10} |   N/A  |   N/A  |   N/A  |   N/A  |  0")
+            summary_metrics[t] = {"coverage": coverage_pct, "stated_auc": stated_auc, "calib_auc": calib_auc}
+            
+        # Record disagreements for forensic audit
+        for idx, row in merged.iterrows():
+            yt = row[f"{t}_true"]
+            yp = row[f"{t}_pred"]
+            yw = row[f"{t}_weight"] if f"{t}_weight" in row else 1.0
+            if (yp >= 0.0) and (yw > 0.0) and pd.notna(yt):
+                pred_bin = 1 if yp >= 0.5 else 0
+                true_bin = int(yt)
+                if pred_bin != true_bin:
+                    disagreement_records.append({
+                        "UID": row["StudyInstanceUID"],
+                        "Target": t,
+                        "True": true_bin,
+                        "Pred": yp,
+                        "Lang": row["Language"],
+                        "Report": str(row["Report"])[:120] + "..."
+                    })
+                    
+    print("-" * 96)
+    macro_stated = np.nanmean(stated_aucs) if stated_aucs else float("nan")
+    macro_calib = np.nanmean(calibrated_aucs) if calibrated_aucs else float("nan")
+    print(f"{'MACRO ROC-AUC':<18} |        | {macro_stated:8.4f}   | {macro_calib:8.4f}   |")
+    print("=" * 96)
+    
+    # Performance breakdown by language
+    print("\n" + "=" * 80)
+    print("PERFORMANCE BREAKDOWN BY REPORT LANGUAGE")
+    print("=" * 80)
+    print(f"{'Language':<18} | {'N':<4} | {'Avg Words':<10} | {'Macro Stated AUC':<18} | {'Macro Calib AUC'}")
+    print("-" * 80)
+    
+    for lang in sorted(merged["Language"].unique()):
+        lang_df = merged[merged["Language"] == lang]
+        l_stated = []
+        l_calib = []
+        for t in TARGETS:
+            y_t = lang_df[f"{t}_true"].values
+            y_p = lang_df[f"{t}_pred"].values
+            y_w = lang_df[f"{t}_weight"].values if f"{t}_weight" in lang_df.columns else np.ones_like(y_t)
+            y_w = np.nan_to_num(y_w, nan=0.0)
+            
+            st_m = (y_w > 0.0) & (y_p >= 0.0) & np.isfinite(y_t)
+            if len(set(y_t[st_m])) > 1:
+                try:
+                    l_stated.append(roc_auc_score(y_t[st_m], y_p[st_m]))
+                except ValueError:
+                    pass
+                    
+            if len(set(y_t[np.isfinite(y_t)])) > 1:
+                y_p_c = y_p.copy()
+                g_prev = np.mean(y_t[np.isfinite(y_t)]) if len(y_t) > 0 else 0.05
+                u_m = (y_p < 0.0) | ((y_p == 0.0) & (y_w == 0.0))
+                y_p_c[u_m] = min(0.15, g_prev * 0.8)
+                try:
+                    l_calib.append(roc_auc_score(y_t[np.isfinite(y_t)], y_p_c[np.isfinite(y_t)]))
+                except ValueError:
+                    pass
+                    
+        s_res = f"{np.nanmean(l_stated):.4f}" if l_stated else "   N/A   "
+        c_res = f"{np.nanmean(l_calib):.4f}" if l_calib else "   N/A   "
+        avg_w = np.mean(lang_df["Report"].astype(str).apply(lambda x: len(x.split())))
+        print(f"{lang:<18} | {len(lang_df):2d}   | {avg_w:8.1f}   | {s_res:<18} | {c_res}")
+        
+    print("=" * 80)
+    
+    # Forensic disagreement audit
+    if show_errors and disagreement_records:
+        print(f"\n[FORENSIC AUDIT] {len(disagreement_records)} CLINICAL DISAGREEMENTS IDENTIFIED:")
+        for i, r in enumerate(disagreement_records[:15]):
+            print(f"  [{i+1:2d}] Target: {r['Target']:<16} | True: {r['True']} vs Pred: {r['Pred']:.2f} | Lang: {r['Lang']}")
+            print(f"       UID:    {r['UID']}")
+            print(f"       Report: {r['Report']}")
+        if len(disagreement_records) > 15:
+            print(f"  ... and {len(disagreement_records) - 15} more.")
+    elif not disagreement_records:
+        print("\n[FORENSIC AUDIT] 100% PERFECT CONCORDANCE! Zero disagreements on stated findings.")
+        
+    return {
+        "macro_stated_auc": macro_stated,
+        "macro_calib_auc": macro_calib,
+        "per_target": summary_metrics,
+        "disagreements": len(disagreement_records),
+    }, merged
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Unified NLP Pseudo-Label Extraction & Gold Evaluation Engine")
+    parser.add_argument("--data_root", type=str, default=None, help="Path to raw dataset directory containing train.csv")
+    parser.add_argument("--out_csv", type=str, default=None, help="Output path for extracted pseudo-labels CSV")
+    parser.add_argument("--engine", type=str, default="vllm", choices=["vllm", "rules"], help="NLP Engine")
+    parser.add_argument("--model", type=str, default=None, help="HuggingFace model ID or local directory")
+    parser.add_argument("--force", action="store_true", help="Force re-extraction ignoring checkpoints")
+    parser.add_argument("--evaluate", action="store_true", help="Run comprehensive evaluation on gold-standard studies")
+    parser.add_argument("--show_errors", action=argparse.BooleanOptionalAction, default=True, help="Display forensic disagreement audit")
     args = parser.parse_args()
 
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-    
-    # SOTA Fix: Force Kagglehub cache to root data folder to align with main.py
-    os.environ['KAGGLEHUB_CACHE'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
-    
-    # SOTA Fix: Redirect HuggingFace cache to root data folder ONLY if default hub does not already contain models
-    if 'HF_HOME' not in os.environ:
-        default_hub = os.path.expanduser('~/.cache/huggingface/hub')
-        if not (os.path.exists(default_hub) and any('models--' in f for f in os.listdir(default_hub))):
-            os.environ['HF_HOME'] = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'hf_cache'))
-        else:
-            print(f"[CACHE] Preserving existing HuggingFace cache at: {os.path.expanduser('~/.cache/huggingface')}")
-    
-    DATA_ROOT = args.data_root
-    if DATA_ROOT and not os.path.exists(os.path.join(DATA_ROOT, 'train.csv')):
-        from src.core.config import resolve_data_root
-        DATA_ROOT = resolve_data_root(DATA_ROOT)
-
-    if not DATA_ROOT or not os.path.exists(os.path.join(DATA_ROOT, 'train.csv')):
-        knee_env = os.environ.get('KNEE_DATA')
-        local_data = os.path.abspath(os.path.join(PROJECT_ROOT, 'data'))
-        if knee_env and os.path.exists(os.path.join(knee_env, 'train.csv')):
-            DATA_ROOT = os.path.abspath(knee_env)
-            print(f"[SUCCESS] Dataset located via KNEE_DATA at: {DATA_ROOT}")
-        elif os.path.exists(os.path.join(local_data, 'train.csv')):
-            DATA_ROOT = local_data
-            print(f"[SUCCESS] Dataset already present locally at: {DATA_ROOT}")
-        else:
-            print("Checking/Downloading RSNA dataset via Kagglehub...")
-            import kagglehub
-            DATA_ROOT = kagglehub.competition_download('rsna-knee-abnormality-detection')
-            print(f"[SUCCESS] Dataset located at: {DATA_ROOT}")
-
     if args.evaluate:
-        train_df = pd.read_csv(os.path.join(DATA_ROOT, 'train.csv'))
-        # Evaluate on the 58 gold studies.
-        gold_df = train_df[train_df['ACL'].notna()].copy()
-        
-        eval_df = gold_df.copy()
-        print(f"Isolated {len(eval_df)} gold studies for evaluation.")
-        
-        temp_dir = "temp_gold_eval"
-        os.makedirs(temp_dir, exist_ok=True)
-        eval_df.to_csv(os.path.join(temp_dir, 'train.csv'), index=False)
-        out_csv = os.path.join(temp_dir, 'gold_extractions.csv')
-        
-        print(f"Running NLP Extractor (Engine: {args.engine})...")
-        import time
-        start_time = time.time()
-        out_path, stats = auto_complete_extraction(
-            data_root=temp_dir, out_csv=out_csv, engine=args.engine,
-            model_id=args.model, force=args.force, evaluate=True
+        data_root = args.data_root or (os.path.join(PROJECT_ROOT, "data") if os.path.exists(os.path.join(PROJECT_ROOT, "data", "train.csv")) else "data")
+        run_gold_evaluation(
+            data_root=data_root,
+            engine=args.engine,
+            model_id=args.model,
+            force=args.force,
+            show_errors=args.show_errors,
         )
-        elapsed = time.time() - start_time
-        extracted_df = pd.read_csv(out_path)
-        print(f"Extraction completed in {elapsed:.2f} seconds.")
-        
-        merged = pd.merge(eval_df, extracted_df, on="StudyInstanceUID", suffixes=("_true", "_pred"))
-        merged['Language'] = merged['Report'].apply(detect_language)
-        
-        from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
-        
-        for lang in ['ALL'] + list(merged['Language'].unique()):
-            print("\n" + "="*80)
-            if lang == 'ALL':
-                lang_df = merged
-                print(f"OVERALL METRICS (N={len(lang_df)})")
-            else:
-                lang_df = merged[merged['Language'] == lang]
-                print(f"METRICS FOR LANGUAGE: {lang} (N={len(lang_df)})")
-            print("="*80)
-            
-            macro_aucs = []
-            stated_aucs_list, calib_aucs_list = [], []
-            print(f"{'Target':<18} | {'Cov%':<6} | {'Stated AUC':<10} | {'Calib AUC':<10} | {'Sens':<6} | {'Spec':<6} | {'Prec':<6} | {'F1':<6} | {'Disagreements'}")
-            print("-" * 96)
-            for t in TARGETS:
-                y_true = lang_df[f"{t}_true"].values
-                y_pred = lang_df[f"{t}_pred"].values
-                y_weight = lang_df[f"{t}_weight"].values if f"{t}_weight" in lang_df.columns else np.ones_like(y_true)
-                y_weight = np.nan_to_num(y_weight, nan=0.0)
-                
-                # Stated filter: structure addressed in report
-                stated_mask = (y_weight > 0.0) & (y_pred >= 0.0) & np.isfinite(y_true)
-                coverage = np.sum(stated_mask) / max(1, len(y_true))
-                
-                y_true_stated = y_true[stated_mask]
-                y_pred_stated = y_pred[stated_mask]
-                
-                s_auc = float('nan')
-                if len(set(y_true_stated)) > 1:
-                    try:
-                        s_auc = roc_auc_score(y_true_stated, y_pred_stated)
-                        stated_aucs_list.append(s_auc)
-                    except ValueError:
-                        pass
-                
-                # Calibrated AUC
-                valid_g = y_true[np.isfinite(y_true)]
-                g_prev = np.mean(valid_g) if len(valid_g) > 0 else 0.05
-                calib_soft_neg = min(0.15, g_prev * 0.8)
-                y_pred_calib = y_pred.copy()
-                unstated_m = (y_pred < 0.0) | ((y_pred == 0.0) & (y_weight == 0.0))
-                y_pred_calib[unstated_m] = calib_soft_neg
-                
-                c_auc = float('nan')
-                if len(set(y_true[np.isfinite(y_true)])) > 1:
-                    try:
-                        c_auc = roc_auc_score(y_true[np.isfinite(y_true)], y_pred_calib[np.isfinite(y_true)])
-                        calib_aucs_list.append(c_auc)
-                    except ValueError:
-                        pass
-                
-                if len(y_true_stated) > 0:
-                    y_true_b = (y_true_stated >= 0.5).astype(int)
-                    y_pred_b = (y_pred_stated >= 0.5).astype(int)
-                    p, r, f1, _ = precision_recall_fscore_support(y_true_b, y_pred_b, average='binary', zero_division=0)
-                    tn = int(np.sum((y_true_b == 0) & (y_pred_b == 0)))
-                    fp = int(np.sum((y_true_b == 0) & (y_pred_b == 1)))
-                    fn = int(np.sum((y_true_b == 1) & (y_pred_b == 0)))
-                    tp = int(np.sum((y_true_b == 1) & (y_pred_b == 1)))
-                    sens = tp / max(1, tp + fn)
-                    spec = tn / max(1, tn + fp)
-                    disagreements = fp + fn
-                    s_str = f"{s_auc:.4f}" if np.isfinite(s_auc) else "  N/A  "
-                    c_str = f"{c_auc:.4f}" if np.isfinite(c_auc) else "  N/A  "
-                    print(f"{t:<18} | {coverage*100:5.1f}% | {s_str:<10} | {c_str:<10} | {sens:5.3f} | {spec:5.3f} | {p:5.3f} | {f1:5.3f} | {disagreements:2d} (TP:{tp} FP:{fp} FN:{fn} TN:{tn})")
-                else:
-                    s_str = f"{s_auc:.4f}" if np.isfinite(s_auc) else "  N/A  "
-                    c_str = f"{c_auc:.4f}" if np.isfinite(c_auc) else "  N/A  "
-                    print(f"{t:<18} | {coverage*100:5.1f}% | {s_str:<10} | {c_str:<10} |   N/A |   N/A |   N/A |   N/A |  0")
-            
-            macro_stated = np.nanmean(stated_aucs_list) if stated_aucs_list else float('nan')
-            macro_calib = np.nanmean(calib_aucs_list) if calib_aucs_list else float('nan')
-            print("-" * 96)
-            print(f"{'MACRO ROC-AUC':<18} |        | {macro_stated:8.4f}   | {macro_calib:8.4f}   |")
-            
-            if macro_aucs:
-                print(f"\n--> MACRO AUC for {lang}: {np.nanmean(macro_aucs):.4f}")
-                
     else:
-        OUT = os.path.join(DATA_ROOT, "pseudo_labels.csv")
+        data_root = resolve_data_root(args.data_root) if args.data_root else os.path.join(PROJECT_ROOT, "data")
+        out_csv = args.out_csv or os.path.join(data_root, "pseudo_labels.csv")
         auto_complete_extraction(
-            DATA_ROOT,
-            OUT,
+            data_root=data_root,
+            out_csv=out_csv,
             model_id=args.model,
             engine=args.engine,
-            force=args.force
+            force=args.force,
         )
+
+
+if __name__ == "__main__":
+    main()

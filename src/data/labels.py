@@ -64,10 +64,10 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
         y = g.copy()
         w = np.where(np.isfinite(g), 1.0, 0.0)
         if ex is not None and t in ex.columns:
-            e = ex[t].astype(float).values
+            e = ex[t].astype(float).to_numpy(copy=True)
             
             # SOTA Calibration: Estimate P(positive | not_stated) using Gold Studies
-            is_soft_neg = (e == -1.0)
+            is_soft_neg = np.isclose(e, -1.0, atol=1e-5)
             if is_soft_neg.any():
                 gold_valid = g[np.isfinite(g)]
                 if len(gold_valid) > 0:
@@ -113,7 +113,7 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
                     "labeled": int(out[t].notna().sum()),
                     "full_weight": int((out[f'{t}_weight'] == 1.0).sum()),
                     "positive": int((out[t] >= 0.5).sum()),
-                    "labeled": int((out[f'{t}_weight'] > 0).sum()),
+                    "active_weight": int((out[f'{t}_weight'] > 0).sum()),
                 }
                 for t in config.TARGETS
             },

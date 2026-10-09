@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--engine", type=str, default="vllm", choices=["vllm"], help="Inference engine (vllm)")
     parser.add_argument("--model", type=str, default=None, help="HuggingFace model ID or local snapshot directory path")
     parser.add_argument("--force", action="store_true", help="Force re-extraction of gold reports via LLM")
-    parser.add_argument("--show_errors", action="store_true", default=True, help="Print detailed diagnostic audit of any gold label disagreements")
+    parser.add_argument("--show_errors", action=argparse.BooleanOptionalAction, default=True, help="Print detailed diagnostic audit of any gold label disagreements")
     args = parser.parse_args()
 
     args.data_root = resolve_data_root(args.data_root)
@@ -82,6 +82,8 @@ def main():
     extracted_df = pd.read_csv(out_path)
     print(f"\n[TIMING] Extraction finished in {elapsed:.2f}s ({elapsed / max(1, len(gold_df)):.2f}s per report).")
     
+    gold_df["StudyInstanceUID"] = gold_df["StudyInstanceUID"].astype(str).str.strip()
+    extracted_df["StudyInstanceUID"] = extracted_df["StudyInstanceUID"].astype(str).str.strip()
     merged = pd.merge(gold_df, extracted_df, on="StudyInstanceUID", suffixes=("_true", "_pred"))
     merged['Language'] = merged['Report'].apply(detect_language)
     merged['token_length'] = merged['Report'].apply(lambda x: len(str(x)) / 4)
@@ -170,8 +172,9 @@ def main():
             yp = row[f"{t}_pred"]
             yw = row[f"{t}_weight"] if f"{t}_weight" in row else 1.0
             if (yp >= 0.0) and (yw > 0.0):
-                pred_bin = 1 if yp >= 0.5 else 0
-                true_bin = int(yt)
+                if pd.notna(yt):
+                    pred_bin = 1 if yp >= 0.5 else 0
+                    true_bin = int(yt)
                 if pred_bin != true_bin:
                     disagreement_records.append({
                         "UID": row["StudyInstanceUID"],

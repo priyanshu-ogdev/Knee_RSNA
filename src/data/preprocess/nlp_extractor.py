@@ -153,6 +153,11 @@ def _validated_extraction_rows(
 
 
 def build_prompt(report: str) -> str:
+    # Truncate extremely long anomalies to prevent vLLM max context crashes (8192 token limit)
+    # A standard knee MRI report is < 3000 chars. 10000+ chars indicates corrupted metadata.
+    if len(report) > 10000:
+        report = report[:10000] + "\n...[TRUNCATED TO PREVENT VLLM CONTEXT CRASH]"
+        
     return f"""You are an expert subspecialty musculoskeletal (MSK) radiologist extracting 12 knee conditions from an MRI report.
 Your goal is MAXIMUM PRECISION: only mark a finding as "present" when there is unambiguous, explicit, positive evidence in the report text.
 When in doubt, choose "not_stated" over "present". False positives are worse than false negatives in this task.

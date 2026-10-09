@@ -49,9 +49,9 @@ TARGETS = [
 EXTRACTOR_VERSION = "clinical-report-labels-v3"
 
 # High-throughput batching & context defaults
-DEFAULT_CHUNK_SIZE = int(os.environ.get("NLP_CHUNK_SIZE", "200"))
-DEFAULT_MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "4096"))
-DEFAULT_MAX_TOKENS = int(os.environ.get("NLP_MAX_TOKENS", "1536"))
+DEFAULT_CHUNK_SIZE = int(os.environ.get("NLP_CHUNK_SIZE", "150"))
+DEFAULT_MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("NLP_MAX_TOKENS", "2048"))
 
 
 def append_to_jsonl(uid: str, raw_output: str, out_csv: str) -> None:

@@ -852,7 +852,7 @@ def main():
         help="Rebuild DICOM index chunks and cache from scratch; existing generated cache files are overwritten",
     )
     parser.add_argument("--skip_nlp", action="store_true", help="Skip NLP extraction entirely and train with Gold labels only")
-    parser.add_argument("--nlp_batch_size", "--nlp_chunk_size", type=int, default=int(os.environ.get("NLP_CHUNK_SIZE", "200")), help="Batch size of concurrent reports for parallel vLLM NLP extraction")
+    parser.add_argument("--nlp_batch_size", "--nlp_chunk_size", type=int, default=int(os.environ.get("NLP_CHUNK_SIZE", "150")), help="Batch size of concurrent reports for parallel vLLM NLP extraction")
 
     # Training Options
     parser.add_argument("--epochs", type=int, default=config.EPOCHS, help="Number of training epochs")

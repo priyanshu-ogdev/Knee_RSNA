@@ -276,6 +276,44 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         print(f"[PARSE ERROR] UID {uid}: {e}")
         return None
 
+
+def run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
+    """Compatibility entry point using the provenance-checked, strict vLLM path."""
+    return auto_complete_extraction(data_root, out_csv, model_id=model_id, engine="vllm")
+
+
+def resolve_local_model_path(repo_id: str) -> str:
+    """If repo_id corresponds to a downloaded local HF snapshot, return the local directory path."""
+    import os
+    if not repo_id or os.path.isdir(repo_id):
+        return repo_id
+    proj_root = globals().get("PROJECT_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    repo_folder = f"models--{repo_id.replace('/', '--')}"
+    candidate_bases = [
+        os.environ.get("HF_HOME"),
+        os.path.expanduser("~/.cache/huggingface"),
+        os.path.abspath(os.path.join(proj_root, "data", "hf_cache")),
+        "/home/iedc_ai_dgx1/.cache/huggingface",
+    ]
+    for base in candidate_bases:
+        if not base:
+            continue
+        hub_dir = base if base.endswith("hub") else os.path.join(base, "hub")
+        snapshots_dir = os.path.join(hub_dir, repo_folder, "snapshots")
+        if os.path.isdir(snapshots_dir):
+            snaps = [
+                os.path.join(snapshots_dir, s)
+                for s in os.listdir(snapshots_dir)
+                if os.path.isdir(os.path.join(snapshots_dir, s))
+            ]
+            if snaps:
+                valid_snaps = [s for s in snaps if os.path.exists(os.path.join(s, "config.json"))]
+                if valid_snaps:
+                    valid_snaps.sort(key=lambda s: os.path.getmtime(s), reverse=True)
+                    return valid_snaps[0]
+    return repo_id
+
+
 def auto_complete_extraction(
     data_root: str,
     out_csv: str,

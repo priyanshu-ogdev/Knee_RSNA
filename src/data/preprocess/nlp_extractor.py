@@ -48,6 +48,11 @@ TARGETS = [
 
 EXTRACTOR_VERSION = "clinical-report-labels-v3"
 
+# High-throughput batching & context defaults
+DEFAULT_CHUNK_SIZE = int(os.environ.get("NLP_CHUNK_SIZE", "200"))
+DEFAULT_MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "4096"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("NLP_MAX_TOKENS", "1536"))
+
 
 def append_to_jsonl(uid: str, raw_output: str, out_csv: str) -> None:
     out_dir = os.path.dirname(out_csv)
@@ -164,39 +169,42 @@ OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT WITH ALL 12 KEYS):
   "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}}
 }}
 
-TARGETS & CLINICAL DEFINITIONS:
-1. ACL: Anterior Cruciate Ligament tear.
-2. MCL: Medial Collateral Ligament tear or sprain. Peri-ligamentous edema = present. (MPFL tears are NOT MCL tears).
-3. Medial Meniscus: Medial meniscus tear. Post-operative states (meniscectomy, repairs) = absent. Grade 1/2 signal without articular extension = absent.
-4. Lateral Meniscus: Lateral meniscus tear. Post-operative states (meniscectomy) = absent. Grade 1/2 signal = absent.
-5. Medial OA: Medial tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
-6. Lateral OA: Lateral tibiofemoral compartment osteoarthritis, joint space narrowing, or chondral loss. (DO NOT include patellofemoral).
-7. PF OA: Patellofemoral compartment osteoarthritis, patellar facet arthrosis, chondromalacia patellae.
-8. Effusion: Joint effusion. (NOTE: 'physiological fluid' or 'trace fluid' is absent. However, ANY explicit 'effusion' including 'small effusion' is PRESENT).
-9. Synovitis: Synovial thickening, synovitis, synovial proliferation. (NOTE: If not explicitly mentioned, it is not_stated. Do not assume synovitis just because effusion is present).
-10. Baker's: Baker's cyst, popliteal cyst.
-11. Contusion: Bone bruise, bone marrow edema following trauma.
-12. Fracture: Cortical bone fracture, avulsion fracture. (NOTE: Old healed fracture = absent).
+TARGETS & CLINICAL MSK DEFINITIONS:
+1. ACL: Anterior Cruciate Ligament tear (partial, high-grade, complete). Intact ACL reconstruction graft = absent. Disrupted graft = present. Mucoid degeneration without disruption = absent.
+2. MCL: Medial Collateral Ligament tear or sprain (Grade 1/2/3). Peri-ligamentous edema = present. (NOTE: MPFL tears are medial patellofemoral ligament, NOT MCL).
+3. Medial Meniscus: Medial meniscus tear (radial, horizontal, root, flap, bucket-handle). Prior partial meniscectomy with stable remnant = absent. Grade 1/2 signal without articular extension = absent.
+4. Lateral Meniscus: Lateral meniscus tear. Prior meniscectomy = absent. Grade 1/2 signal = absent. Discoid meniscus without tear = absent.
+5. Medial OA: Medial tibiofemoral compartment osteoarthritis, joint space narrowing, subchondral sclerosis, osteophytes, or chondral wear of medial femoral condyle/tibial plateau. (DO NOT include patellofemoral).
+6. Lateral OA: Lateral tibiofemoral compartment osteoarthritis, joint space narrowing, or lateral femoral/tibial chondromalacia. (DO NOT include patellofemoral).
+7. PF OA: Patellofemoral compartment osteoarthritis, patellar facet arthrosis, chondromalacia patellae, trochlear spurring.
+8. Effusion: Joint effusion. (NOTE: 'physiological fluid', 'trace fluid', or isolated prepatellar bursitis is absent. However, ANY explicit 'effusion' including 'small effusion' is PRESENT).
+9. Synovitis: Synovial thickening, synovitis, pannus, or villonodular proliferation. (NOTE: Joint effusion alone does NOT imply synovitis; must be explicitly mentioned, otherwise not_stated).
+10. Baker's: Baker's cyst, popliteal cyst, gastrocnemius-semimembranosus bursal distension.
+11. Contusion: Bone bruise, bone contusion, traumatic subchondral trabecular marrow edema.
+12. Fracture: Cortical bone disruption, avulsion fracture (Segond, tibial spine, fibular head), depressed plateau fracture. (NOTE: Old healed fracture = absent).
 
-GENERAL RULES:
+ANTI-HALLUCINATION & EXTRACTION RULES:
 1. Output MUST be valid JSON containing ALL 12 KEYS.
-2. "reasoning": Think step-by-step. Keep it under 25 words.
-3. "exact_quote": Copy verbatim. If absent, you MUST provide the quote proving it is absent. Absent is NEVER allowed when the structure isn't addressed; use "not_stated" instead.
-4. "state": EXACTLY ONE of ["present", "absent", "not_stated"]. Mask prior-study comparisons as "not_stated".
-5. "confidence": EXACTLY ONE of ["high", "medium", "low"].
-6. IF a general "meniscal tear" or "menisci" finding is mentioned without specifying Medial or Lateral, apply the finding to BOTH Medial and Lateral Meniscus. For example, "Menisci are unremarkable" means BOTH are "absent".
+2. "reasoning": Concise step-by-step clinical justification. Keep it under 20 words.
+3. "exact_quote": Verbatim word-for-word copy from the REPORT. If the structure is not addressed, output "None". Never fabricate, paraphrase, or summarize in exact_quote.
+4. "state": EXACTLY ONE of ["present", "absent", "not_stated"].
+   - "present": Explicit finding of condition.
+   - "absent": Explicit statement that the structure is intact, normal, unremarkable, without tear, or resolved.
+   - "not_stated": Structure was NOT evaluated or mentioned in the report. (NEVER mark absent if unstated).
+5. "confidence": EXACTLY ONE of ["high", "medium", "low"]. Use "medium" or "low" for ambiguous hedging (e.g. "cannot exclude", "suspected").
+6. SHARED MENISCAL FINDINGS: If a general finding applies to menisci (e.g. "Menisci are intact" or "Bilateral meniscal tears"), apply to BOTH Medial and Lateral Meniscus.
 
-MULTI-LINGUAL HINTS:
-  - Turkish: yirtik=present, saglam=absent.
-  - Croatian/Serbian: ruptura=present, uredno=absent.
-  - Russian/Bulgarian: разрыв=present, нет=absent.
-  - Greek: ρήξη=present, φυσιολογικό=absent.
-  - German: Kreuzband=ACL, Erguss=Effusion, keine Ruptur/intakt=absent.
-  - Spanish: LCA=ACL, derrame=effusion, sin rotura=absent.
-  - Dutch: VKB/voorste kruisband=ACL, hydrops=effusion, geen scheur=absent.
-  - French: LCA=ACL, épanchement=effusion, sans fissure=absent.
-  
-  EXAMPLES (Always output all 12 keys):
+MULTI-LINGUAL CLINICAL DICTIONARY:
+  - Turkish: yirtik/yırtık=tear, saglam/sağlam=intact, efüzyon=effusion, kist=cyst, kontüzyon/ödem=contusion, kirik/kırık=fracture, artroz=OA.
+  - Croatian/Serbian: ruptura=tear, uredno/intaktno=intact, izljev=effusion, cista=cyst, edem=contusion, fraktura=fracture.
+  - German: Kreuzband=ACL, Ruptur/Einriss=tear, intakt/regelrecht/unauffällig=intact, Erguss=effusion, Bakerzyste=cyst, Knochenkontusion=contusion, Fraktur=fracture, Arthrose/Knorpelschaden=OA.
+  - Spanish: LCA=ACL, rotura/desgarro=tear, íntegro/intacto=intact, derrame=effusion, quiste=cyst, contusión=contusion, fractura=fracture, artrosis/condropatía=OA.
+  - French: LCA=ACL, rupture/fissure=tear, intact/sans anomalie=intact, épanchement=effusion, kyste poplité=cyst, contusion=contusion, fracture=fracture, arthrose=OA.
+  - Dutch: VKB=ACL, scheur/ruptuur=tear, gaaf/intact=intact, hydrops=effusion, Bakerse cyste=cyst, botcontusie=contusion, fractuur=fracture, artrose=OA.
+  - Russian/Bulgarian: ПКС/разрыв=ACL/tear, интактен/без патологии=intact, выпот=effusion, киста Бейкера=cyst, ушиб/отек=contusion, перелом=fracture, артроз=OA.
+  - Greek: πρόσθιος χιαστός/ρήξη=ACL/tear, ακέραιος/φυσιολογικός=intact, συλλογή=effusion, κύστη Baker=cyst, οστική θλάση=contusion, κάταγμα=fracture.
+
+EXAMPLES (Always output all 12 keys):
 Report (English): "Anterior cruciate ligament is completely torn. Menisci are unremarkable. Minimal physiological joint fluid."
 Output:
 {{
@@ -438,7 +446,8 @@ def auto_complete_extraction(
     model_id: str | None = None,
     engine: str = "vllm",
     force: bool = False,
-    chunk_size: int = 100,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     evaluate: bool = False,
 ) -> tuple[str, dict]:
     """Unified Auto-Detection & Completion Engine for NLP Pseudo-Labels.
@@ -699,7 +708,7 @@ def auto_complete_extraction(
                     print("[DIAGNOSTIC] HF_TOKEN is NOT set in environment or .env file!")
                     print("[DIAGNOSTIC] Unauthenticated HuggingFace requests on shared IPs frequently return HTTP 429/rate-limit error responses.")
 
-            max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "8192"))
+            max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", str(DEFAULT_MAX_MODEL_LEN)))
             llm = LLM(
                 model=model_to_use,
                 enforce_eager=enforce_eager,
@@ -733,28 +742,32 @@ def auto_complete_extraction(
             try:
                 from vllm.sampling_params import GuidedDecodingParams
                 guided = GuidedDecodingParams(json=schema_str)
-                sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_decoding=guided)
+                sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens, guided_decoding=guided)
                 decoding_mode = "GuidedDecodingParams"
             except Exception:
                 try:
-                    sampling_params = SamplingParams(temperature=0.0, max_tokens=4096, guided_json=schema_str)
+                    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens, guided_json=schema_str)
                     decoding_mode = "guided_json"
                 except Exception:
-                    sampling_params = SamplingParams(temperature=0.0, max_tokens=4096)
+                    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
                     decoding_mode = "unconstrained"
                     print("[INFO] Using unconstrained decoding at temperature 0.0 with deterministic clinical prompting.")
 
             global_failed_queue = []
-            for i in range(0, len(remaining_df), chunk_size):
+            total_batches = ((len(remaining_df) - 1) // chunk_size) + 1
+            for batch_idx, i in enumerate(range(0, len(remaining_df), chunk_size)):
+                chunk_start = time.time()
                 chunk = remaining_df.iloc[i:i+chunk_size]
                 full_reports = chunk["_report_text"].astype(str).tolist()
                 raw_reports = [report for report in full_reports]
                 messages_chunk = [[{"role": "user", "content": build_prompt(r)}] for r in raw_reports]
                 uids_chunk = chunk["StudyInstanceUID"].tolist()
 
-                print(f"[INFO] vLLM processing chunk {i//chunk_size + 1} / {((len(remaining_df)-1)//chunk_size) + 1} ({len(chunk)} reports)...")
+                print(f"\n[BATCH {batch_idx + 1} / {total_batches}] Dispatching {len(chunk)} concurrent studies to vLLM engine...")
                 outputs = llm.chat(messages_chunk, sampling_params, use_tqdm=True)
-
+                chunk_elapsed = max(0.001, time.time() - chunk_start)
+                
+                new_success = 0
                 for output, uid, report_str, full_report in zip(outputs, uids_chunk, raw_reports, full_reports):
                     text = output.outputs[0].text if (output.outputs and len(output.outputs) > 0) else ""
                     append_to_jsonl(uid, text, out_csv)
@@ -768,6 +781,7 @@ def auto_complete_extraction(
                             prompt_sha256=prompt_sha256,
                         )
                         results.append(res)
+                        new_success += 1
                     else:
                         global_failed_queue.append((uid, report_str, full_report))
 
@@ -783,7 +797,14 @@ def auto_complete_extraction(
                     manifest_path,
                     {**contract, "status": "in_progress", "completed_studies": len(saved_rows)},
                 )
-                print(f"[CHECKPOINT] Saved {len(df_out)} studies to {out_csv}")
+                rps = len(chunk) / chunk_elapsed
+                rem_studies = len(remaining_df) - (i + len(chunk))
+                eta_s = rem_studies / rps if rps > 0 else 0
+                print(
+                    f"[THROUGHPUT] Batch {batch_idx + 1}: {len(chunk)} studies in {chunk_elapsed:.1f}s "
+                    f"({rps:.1f} studies/sec) | Success: {new_success}/{len(chunk)} | "
+                    f"Total Checkpointed: {len(df_out)} | ETA: {int(eta_s//60)}m {int(eta_s%60):02d}s"
+                )
                 
             # Global Retry Pass for Failed Reports
             max_global_retries = 3
@@ -797,12 +818,12 @@ def auto_complete_extraction(
                 try:
                     from vllm.sampling_params import GuidedDecodingParams
                     guided_retry_p = GuidedDecodingParams(json=schema_str)
-                    retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096, guided_decoding=guided_retry_p)
+                    retry_params = SamplingParams(temperature=0.2, seed=42+attempt, max_tokens=max_tokens, guided_decoding=guided_retry_p)
                 except Exception:
                     try:
-                        retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096, guided_json=schema_str)
+                        retry_params = SamplingParams(temperature=0.2, seed=42+attempt, max_tokens=max_tokens, guided_json=schema_str)
                     except Exception:
-                        retry_params = SamplingParams(temperature=0.4, seed=42+attempt, max_tokens=4096)
+                        retry_params = SamplingParams(temperature=0.2, seed=42+attempt, max_tokens=max_tokens)
 
                 next_queue = []
                 for i in range(0, len(current_queue), chunk_size):
@@ -999,6 +1020,7 @@ def run_gold_evaluation(
     force: bool = False,
     show_errors: bool = True,
     temp_dir: str = "temp_gold_eval",
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> tuple[dict, pd.DataFrame]:
     """Unified Gold Standard Evaluation Suite for RSNA Knee MSK NLP Extractor.
     
@@ -1032,6 +1054,7 @@ def run_gold_evaluation(
         model_id=model_id,
         engine=engine,
         force=force,
+        chunk_size=chunk_size,
         evaluate=True
     )
     elapsed = time.time() - start_time
@@ -1207,6 +1230,7 @@ def main():
     parser.add_argument("--engine", type=str, default="vllm", choices=["vllm", "rules"], help="NLP Engine")
     parser.add_argument("--model", type=str, default=None, help="HuggingFace model ID or local directory")
     parser.add_argument("--force", action="store_true", help="Force re-extraction ignoring checkpoints")
+    parser.add_argument("--chunk_size", "--batch_size", type=int, default=DEFAULT_CHUNK_SIZE, help="Batch/chunk size of concurrent reports processed in one go")
     parser.add_argument("--evaluate", action="store_true", help="Run comprehensive evaluation on gold-standard studies")
     parser.add_argument("--show_errors", action=argparse.BooleanOptionalAction, default=True, help="Display forensic disagreement audit")
     args = parser.parse_args()
@@ -1219,6 +1243,7 @@ def main():
             model_id=args.model,
             force=args.force,
             show_errors=args.show_errors,
+            chunk_size=args.chunk_size,
         )
     else:
         data_root = resolve_data_root(args.data_root) if args.data_root else os.path.join(PROJECT_ROOT, "data")
@@ -1229,6 +1254,7 @@ def main():
             model_id=args.model,
             engine=args.engine,
             force=args.force,
+            chunk_size=args.chunk_size,
         )
 
 

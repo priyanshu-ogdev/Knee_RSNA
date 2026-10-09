@@ -12,7 +12,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from src.data.preprocess.nlp_extractor import run_gold_evaluation
+from src.data.preprocess.nlp_extractor import run_gold_evaluation, DEFAULT_CHUNK_SIZE
 
 
 def main():
@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--engine", type=str, default="vllm", choices=["vllm"], help="Inference engine (vllm)")
     parser.add_argument("--model", type=str, default=None, help="HuggingFace model ID or local snapshot directory path")
     parser.add_argument("--force", action="store_true", help="Force re-extraction of gold reports via LLM")
+    parser.add_argument("--chunk_size", "--batch_size", type=int, default=DEFAULT_CHUNK_SIZE, help="Batch/chunk size of concurrent reports passed to vLLM engine")
     parser.add_argument("--show_errors", action=argparse.BooleanOptionalAction, default=True, help="Print detailed diagnostic audit of any gold label disagreements")
     args = parser.parse_args()
 
@@ -32,6 +33,7 @@ def main():
         model_id=args.model,
         force=args.force,
         show_errors=args.show_errors,
+        chunk_size=args.chunk_size,
     )
 
 

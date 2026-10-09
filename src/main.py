@@ -146,6 +146,7 @@ def run_nlp_phase(
     engine: str = "auto",
     model_id: str | None = None,
     force: bool = False,
+    chunk_size: int = 200,
 ) -> str | None:
     print("\n" + "=" * 80)
     print("PHASE 1: NLP PSEUDO-LABEL AUTO-DETECTION & COMPLETION")
@@ -159,13 +160,14 @@ def run_nlp_phase(
     # never consumed without the extractor's matching provenance manifest.
     out_csv = os.path.join(work_dir, "pseudo_labels.csv")
 
-    from src.data.preprocess.nlp_extractor import auto_complete_extraction
+    from src.data.preprocess.nlp_extractor import auto_complete_extraction, DEFAULT_CHUNK_SIZE
     pseudo_csv, stats = auto_complete_extraction(
         data_root=data_root,
         out_csv=out_csv,
         model_id=model_id,
         engine=engine,
         force=force,
+        chunk_size=chunk_size,
     )
     print(
         f"[SUCCESS] NLP labels verified: {stats['total']} studies "
@@ -850,6 +852,7 @@ def main():
         help="Rebuild DICOM index chunks and cache from scratch; existing generated cache files are overwritten",
     )
     parser.add_argument("--skip_nlp", action="store_true", help="Skip NLP extraction entirely and train with Gold labels only")
+    parser.add_argument("--nlp_batch_size", "--nlp_chunk_size", type=int, default=int(os.environ.get("NLP_CHUNK_SIZE", "200")), help="Batch size of concurrent reports for parallel vLLM NLP extraction")
 
     # Training Options
     parser.add_argument("--epochs", type=int, default=config.EPOCHS, help="Number of training epochs")
@@ -979,6 +982,7 @@ def main():
         engine=args.nlp_engine,
         model_id=args.nlp_model,
         force=(args.force_nlp or args.fresh_preprocessing),
+        chunk_size=args.nlp_batch_size,
     )
 
     # Phase 2: Dataset Merge & Cache Build

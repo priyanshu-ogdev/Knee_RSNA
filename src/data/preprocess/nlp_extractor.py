@@ -158,56 +158,55 @@ Your goal is MAXIMUM PRECISION. Read the report carefully.
 
 CRITICAL MULTILINGUAL RULE: 
 You MUST mentally translate foreign language reports to English before extracting.
-The 'state' field in your JSON MUST BE EXACTLY one of: "present", "absent", or "not_stated" in English.
+The 'state' field in your JSON MUST BE EXACTLY one of: "present", "absent", or "not_stated" in English. Do not output foreign words in the 'state' field.
 
-MULTILINGUAL GLOSSARY & SYNONYMS (CRITICAL):
-- Meniscus Tear: "lezija" or "ruptura" (Croatian), "rotura" or "lesión" (Spanish), "yırtık" or "lezyon" (Turkish), "scheur" or "laesie" (Dutch), "Riss" or "Läsion" (German), "разрыв" (Russian), "ρήξη" (Greek).
-- Osteoarthritis (OA): "artroza" or "hondromalacija" (Croatian), "artrosis" or "condromalacia" (Spanish), "artroz" or "kireçlenme" or "kondromalazi" (Turkish), "artrose" (Dutch), "Arthrose" (German), "артроз" (Russian).
-- Effusion: "izljev" (Croatian), "derrame" (Spanish), "efüzyon" or "sıvı artışı" (Turkish), "vocht" or "effusie" (Dutch), "Erguss" (German), "выпот" (Russian).
-- Synovitis: "sinovitis" or "zadebljanje sinovije" (Croatian), "engrosamiento sinovial" (Spanish), "sinovyal kalınlaşma" (Turkish), "synoviale verdikking" (Dutch), "утолщение" (Russian).
-- Contusion: "kontuzija" (Croatian), "contusión" (Spanish), "kontüzyon" (Turkish), "botcontusie" (Dutch), "Knochenkontusion" (German), "ушиб кости" (Russian).
-- ACL/MCL: LCA/LCM/LCI (Latin/Spanish/Croatian abbreviations). "ÖÇB" / "ön çapraz bağ" (Turkish), "VKB" (Dutch/German).
-
-ANTI-HALLUCINATION RULES:
-1. ONLY mark a finding as "present" when there is explicit, positive evidence.
-2. If a target is NOT mentioned at all, you MUST output "not_stated".
-3. False positives are severely penalized! When in doubt, choose "not_stated" or "absent".
-
-TARGETS & CLINICAL MSK DEFINITIONS:
+TARGETS & CLINICAL MSK DEFINITIONS (with multilingual terms):
 1. ACL: Anterior Cruciate Ligament tear (partial, high-grade, complete, rupture).
-2. MCL: Medial Collateral Ligament tear (sprain, rupture).
-3. Medial Meniscus: Tear (any type, including lesions). Thinning/degeneration alone is NOT a tear (mark absent).
-4. Lateral Meniscus: Tear (any type, including lesions). Thinning/degeneration alone is NOT a tear (mark absent).
-5. Medial OA: Medial compartment osteoarthritis / chondral loss / chondromalacia. (Mild cartilage thinning alone is not_stated).
-6. Lateral OA: Lateral compartment osteoarthritis / chondral loss / chondromalacia.
+   [Translations: LCA, ligamento cruzado anterior, prednji ukriženi ligament, ÖÇB, ön çapraz bağ, VKB, voorste kruisband, vorderes Kreuzband, πρόσθιος χιαστός σύνδεσμος, ПКС, передняя крестообразная связка]
+2. MCL: Medial Collateral Ligament tear.
+   [Translations: LCM, ligamento colateral medial, medijalni kolateralni ligament, İYB, iç yan bağ, medial kollateral ligament, mediale collaterale band, Innenband, έσω πλάγιος σύνδεσμος, МКС, медиальная коллатеральная связка]
+3. Medial Meniscus: Tear (any type). Thinning/degeneration is NOT a tear (mark absent).
+   [Translations for tear: rotura, desgarro, lesión, ruptura, lezija, yırtık, lezyon, scheur, laesie, Riss, Läsion, ρήξη, разрыв]
+4. Lateral Meniscus: Tear (any type). Thinning/degeneration is NOT a tear (mark absent).
+   [Translations for tear: rotura, desgarro, lesión, ruptura, lezija, yırtık, lezyon, scheur, laesie, Riss, Läsion, ρήξη, разрыв]
+5. Medial OA: Medial compartment osteoarthritis / chondral loss / cartilage loss. Mild thinning without chondrosis/OA is not_stated.
+   [Translations for OA/chondrosis: artrosis, condromalacia, artroza, hondromalacija, kireçlenme, artroz, kondromalazi, artrose, kraakbeenverlies, Arthrose, Knorpelverlust, οστεοαρθρίτιδα, χονδρομαλάκυνση, артроз, хондромаляция]
+6. Lateral OA: Lateral compartment osteoarthritis / chondral loss. Mild thinning without chondrosis/OA is not_stated.
+   [Translations for OA/chondrosis: same as above]
 7. PF OA: Patellofemoral osteoarthritis / chondromalacia patellae.
+   [Translations for OA/chondrosis: same as above]
 8. Effusion: Joint effusion. (Trace or physiological fluid = absent).
+   [Translations: derrame articular, líquido articular, izljev, efüzyon, sıvı artışı, gewrichtsuitstorting, hydrops, vocht, Erguss, συλλογή υγρού, выпот]
 9. Synovitis: Synovitis / synovial thickening.
+   [Translations: sinovitis, engrosamiento sinovial, zadebljanje sinovije, sinovit, sinovyal kalınlaşma, synoviale verdikking, Schleimhautverdickung, υμενίτιδα, синовит, утолщение]
 10. Baker's: Baker's cyst / popliteal cyst.
-11. Contusion: Bone contusion / bone bruise. (Bone marrow edema ALONE is not contusion unless trauma/impact/bruise is explicitly stated).
-12. Fracture: Acute fracture. (Old/healed fracture = absent).
+    [Translations: quiste de Baker, quiste poplíteo, Bakerova cista, poplitealna cista, Baker kisti, popliteal kist, Bakerse cyste, popliteale cyste, Baker-Zyste, κύστη Baker, ιγνυακή κύστη, киста Бейкера]
+11. Contusion: Bone contusion / bone bruise. (Bone marrow edema ALONE is not contusion unless trauma/bruise/impact is stated or implied).
+    [Translations: contusión ósea, edema óseo postraumático, kontuzija kosti, koštana modrica, kemik kontüzyonu, botcontusie, Knochenkontusion, οστικό οίδημα, ушиб кости]
+12. Fracture: Acute fracture of femur, tibia, fibula, or patella. (Old/healed fracture = absent).
+    [Translations: fractura, fraktura, prijelom, kırık, fraktür, fractuur, botbreuk, Fraktur, Knochenbruch, κάταγμα, перелом]
 
-OUTPUT SCHEMA:
+OUTPUT SCHEMA (MUST OUTPUT EXACTLY THIS JSON FORMAT WITH ALL 12 KEYS):
 {{
-  "ACL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "MCL": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Medial Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Lateral Meniscus": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Medial OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Lateral OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "PF OA": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Effusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Synovitis": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Baker's": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Contusion": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}},
-  "Fracture": {{"reasoning": "...", "exact_quote": "...", "state": "...", "confidence": "..."}}
+  "ACL": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "MCL": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial Meniscus": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral Meniscus": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Medial OA": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Lateral OA": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "PF OA": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Effusion": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Synovitis": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Baker's": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Contusion": {{"exact_quote": "...", "state": "...", "confidence": "..."}},
+  "Fracture": {{"exact_quote": "...", "state": "...", "confidence": "..."}}
 }}
 
 INSTRUCTIONS:
-- 'reasoning': First, write a 1-sentence reasoning step.
-- 'exact_quote': Copy the exact phrase from the report.
+- 'exact_quote': Copy the exact phrase from the report justifying your decision. Leave empty "" if not stated.
 - 'state': MUST BE "present", "absent", or "not_stated".
-- 'confidence': MUST BE "high" or "low".
+  NOTE: Treat foreign words for "normal", "intact", "no evidence of" as "absent". (e.g. uredan, intaktan, normal, negativo, saptanmadı, afwezig, unauffällig, kein, φυσιολογικός, норма)
+- 'confidence': MUST BE "high" or "low". 
 
 REPORT TO ANALYZE:
 {report}
@@ -215,10 +214,6 @@ REPORT TO ANALYZE:
 
 def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> dict | None:
     """Trusts the LLM and maps the exact state and confidence to calibrated probabilities."""
-    import re
-    import json
-    import ast
-    
     if not raw_text or not isinstance(raw_text, str):
         return None
         
@@ -269,22 +264,10 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
             is_present = False
             is_absent = False
             
-            s_clean = re.sub(r'[^a-z0-9]', '', state_str)
-            
-            if "notstated" in s_clean or "unknown" in s_clean or "missing" in s_clean:
-                pass
-            elif s_clean == "present" or s_clean == "positive":
+            if "present" in state_str:
                 is_present = True
-            elif s_clean == "absent" or s_clean == "normal" or s_clean == "intact" or s_clean == "negative":
+            elif "absent" in state_str or "normal" in state_str or "intact" in state_str:
                 is_absent = True
-            else:
-                # Fuzzy fallback safely
-                if "not" in state_str and "present" in state_str:
-                    is_absent = True
-                elif "present" in state_str:
-                    is_present = True
-                elif "absent" in state_str:
-                    is_absent = True
                 
             if is_present:
                 if "low" in conf_str:
@@ -305,6 +288,7 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
     except Exception as e:
         print(f"[PARSE ERROR] UID {uid}: {e}")
         return None
+
 
 def run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
     """Compatibility entry point using the provenance-checked, strict vLLM path."""
@@ -628,12 +612,11 @@ def auto_complete_extraction(
                     t: {
                         "type": "object",
                         "properties": {
-                            "reasoning": {"type": "string"},
                             "exact_quote": {"type": "string"},
                             "state": {"type": "string", "enum": ["present", "absent", "not_stated"]},
                             "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
                         },
-                        "required": ["reasoning", "exact_quote", "state", "confidence"],
+                        "required": ["exact_quote", "state", "confidence"],
                         "additionalProperties": False
                     } for t in TARGETS
                 },

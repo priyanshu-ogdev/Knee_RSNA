@@ -651,25 +651,25 @@ def auto_complete_extraction(
                 torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             )
             memory = psutil.virtual_memory()
-            used_gb = memory.used / (1024 ** 3)
             available_gb = memory.available / (1024 ** 3)
-            safe_budget_gb = min(
-                config.MEMORY_TARGET_GB - used_gb,
-                available_gb - config.MIN_AVAILABLE_RAM_GB,
-            )
-            if safe_budget_gb <= 0:
+            if available_gb < config.MIN_AVAILABLE_RAM_GB:
                 raise RuntimeError(
                     f"Insufficient unified-memory headroom for vLLM: {available_gb:.1f} GiB "
                     f"available; at least {config.MIN_AVAILABLE_RAM_GB:.1f} GiB must remain."
                 )
-            memory_target_util = min(0.99, safe_budget_gb / total_gpu_gb)
-            gpu_util = min(requested_gpu_util, memory_target_util)
-            if gpu_util < requested_gpu_util:
-                print(
-                    f"[SAFETY] Capping vLLM GPU memory utilization at {gpu_util:.3f} "
-                    f"based on current use ({used_gb:.1f} GiB) and the "
-                    f"{config.MEMORY_TARGET_GB:.0f} GiB target."
-                )
+
+            # Prevent artificial GPU memory under-allocation that starves 70B/72B model weights.
+            # In FP8, 70B/72B weights require ~72-74 GiB. Clamping gpu_util below this floor
+            # causes vLLM to crash before weights finish loading.
+            is_70b = bool(re.search(r"(?:^|[-_/])7[0-9]b(?:[-_/]|$)", requested_model.lower()))
+            min_weight_util = min(0.92, 74.0 / total_gpu_gb) if is_70b else 0.50
+            gpu_util = max(requested_gpu_util, min_weight_util)
+            gpu_util = min(0.95, gpu_util)
+            print(
+                f"[CONFIG] vLLM GPU memory utilization set to {gpu_util:.3f} "
+                f"({gpu_util * total_gpu_gb:.1f} GiB dedicated pool on {total_gpu_gb:.1f} GiB GPU; "
+                f"{available_gb:.1f} GiB available system RAM)."
+            )
             enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0") in ["1", "true", "True"]
             use_quant = quantization
 

@@ -21,6 +21,8 @@ import math
 import argparse
 import datetime
 import traceback
+import subprocess
+import gc
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -160,20 +162,62 @@ def run_nlp_phase(
     # never consumed without the extractor's matching provenance manifest.
     out_csv = os.path.join(work_dir, "pseudo_labels.csv")
 
-    from src.data.preprocess.nlp_extractor import auto_complete_extraction, DEFAULT_CHUNK_SIZE
-    pseudo_csv, stats = auto_complete_extraction(
-        data_root=data_root,
-        out_csv=out_csv,
-        model_id=model_id,
-        engine=engine,
-        force=force,
-        chunk_size=chunk_size,
-    )
+    # Flush PyTorch CUDA allocator and run garbage collection before spawning LLM subprocess
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.data.preprocess.nlp_extractor",
+        "--data_root",
+        data_root,
+        "--out_csv",
+        out_csv,
+        "--engine",
+        engine if engine != "auto" else "vllm",
+        "--chunk_size",
+        str(chunk_size),
+    ]
+    if model_id:
+        cmd.extend(["--model", model_id])
+    if force:
+        cmd.append("--force")
+
+    print("[SUBPROCESS] Running NLP extraction in an isolated subprocess to protect unified host memory...")
+    print(f"[COMMAND] {' '.join(cmd)}")
+    sys.stdout.flush()
+
+    env = os.environ.copy()
+    proc = subprocess.run(cmd, env=env)
+    if proc.returncode != 0:
+        raise RuntimeError(f"NLP extraction subprocess failed with exit code {proc.returncode}")
+
+    if not os.path.exists(out_csv):
+        raise FileNotFoundError(f"NLP extraction completed but output CSV was not created: {out_csv}")
+
+    # Release any lingering host memory references after subprocess completes
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    manifest_path = f"{out_csv}.manifest.json"
+    stats = {"total": 0, "engine": engine}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as stream:
+                manifest_data = json.load(stream)
+            stats["total"] = manifest_data.get("completed_studies", 0)
+            stats["engine"] = manifest_data.get("engine", engine)
+        except Exception:
+            pass
+
     print(
         f"[SUCCESS] NLP labels verified: {stats['total']} studies "
-        f"(new={stats['new']}, engine={stats['engine']})"
+        f"(engine={stats['engine']})"
     )
-    return pseudo_csv
+    return out_csv
 
 
 # ==============================================================================

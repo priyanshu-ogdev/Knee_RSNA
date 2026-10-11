@@ -49,6 +49,25 @@ class TimmAttentionMIL(nn.Module):
             self.slot_bias = nn.Parameter(
                 torch.zeros(len(config.TARGETS), config.N_SLOTS)
             )
+            # Soft anatomical prior: initialized near zero and learned per
+            # target, so domain knowledge cannot dominate the image evidence.
+            prior = torch.zeros(len(config.TARGETS), config.N_SLOTS)
+            prior_slots = {
+                "ACL": (0, 3, 5), "MCL": (1, 4),
+                "Medial Meniscus": (0, 1, 3),
+                "Lateral Meniscus": (0, 1, 3),
+                "Medial OA": (1, 4), "Lateral OA": (1, 4),
+                "PF OA": (2,), "Effusion": (0, 1, 2),
+                "Synovitis": (0, 1, 2), "Baker's": (0, 3),
+                "Contusion": (0, 1), "Fracture": (0, 1, 2),
+            }
+            for target_idx, target in enumerate(config.TARGETS):
+                for slot_idx in prior_slots.get(target, ()):
+                    prior[target_idx, slot_idx] = 1.0
+            self.register_buffer("anatomical_prior", prior)
+            self.prior_gate = nn.Parameter(torch.full(
+                (len(config.TARGETS), 1), -2.0
+            ))
             nn.init.trunc_normal_(self.slot_embedding, std=0.02)
             nn.init.trunc_normal_(self.slot_query, std=0.02)
         nn.init.trunc_normal_(self.classifier, std=0.02)
@@ -159,6 +178,9 @@ class TimmAttentionMIL(nn.Module):
                 "bscd,cd->bcs", slot_features, self.slot_query
             ) / self.feature_dim**0.5
             slot_scores = slot_scores + self.slot_bias.unsqueeze(0)
+            slot_scores = slot_scores + (
+                self.prior_gate.sigmoid() * self.anatomical_prior
+            ).unsqueeze(0)
             slot_scores = slot_scores.masked_fill(
                 ~slot_valid.unsqueeze(1), -10000.0
             )

@@ -15,13 +15,13 @@ MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "20.0")
 
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
-EPOCHS           = 10          # Initial budget; convergence and early stopping require empirical validation
-BATCH_SIZE       = 24
+EPOCHS           = 12          # Full-family default; early stopping remains enabled
+BATCH_SIZE       = 8           # Keep per-step GPU payload bounded; use GRAD_ACCUM for effective batch
 NUM_WORKERS      = 8
 PREFETCH_FACTOR  = 1
 EVAL_BATCH_SIZE  = 8
 PREPROCESS_WORKERS = 8
-GRAD_ACCUM       = 1           # Effective batch equals BATCH_SIZE when no final partial group exists
+GRAD_ACCUM       = 3           # Effective batch ~= 24 without a 24-study GPU allocation
 N_WINDOWS_TRAIN  = 5           # Number of depth-stratified windows sampled per slot and epoch
 LR_HEAD          = 2e-3        # Starting value; not tuned by a DGX validation sweep
 LR_BACKBONE      = 1e-5        # Starting value; scaled per-layer by the DINOv2 optimizer
@@ -45,6 +45,7 @@ SWA_EPOCHS      = 0
 ASL_GAMMA_NEG   = 4.0          # Shared negative focusing exponent; compare with BCE on matched folds
 ASL_GAMMA_POS   = 0.0
 ASL_CLIP        = 0.05         # Negative probability shift; a hypothesis for noisy labels, not a verified gain
+AUC_RANK_WEIGHT  = 0.15        # Directly aligns training with macro ROC-AUC
 
 # Label smoothing (Szegedy et al. 2016; standard ViT recipe)
 LABEL_SMOOTHING = 0.0          # Disabled in the default training recipe

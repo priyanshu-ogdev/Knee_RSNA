@@ -70,6 +70,10 @@ class AsymmetricLoss(nn.Module):
         targets: torch.Tensor,         # [B, C] in [0, 1]; soft labels OK
         weights: torch.Tensor | None = None,  # [B, C] per-entry weight
     ) -> torch.Tensor:
+        # Masked labels may be represented as NaN by upstream dataframes.
+        # Replace them before arithmetic; the weight mask still controls their
+        # contribution and prevents NaN * 0 propagation.
+        targets = torch.nan_to_num(targets, nan=0.0).clamp(0.0, 1.0)
         xs_pos = torch.sigmoid(logits)
         xs_neg = 1.0 - xs_pos
 
@@ -134,7 +138,89 @@ class WeightedBCE(nn.Module):
         return loss.mean()
 
 
-LOSS_REGISTRY: dict[str, type] = {"asl": AsymmetricLoss, "bce": WeightedBCE}
+class PairwiseAUC(nn.Module):
+    """Dense, masked pairwise ranking loss aligned with ROC-AUC."""
+
+    def __init__(self, margin: float = 0.0):
+        super().__init__()
+        self.margin = float(margin)
+
+    def forward(self, logits, targets, weights=None):
+        if logits.ndim != 2 or targets.shape != logits.shape:
+            raise ValueError("logits and targets must both have shape [B, C]")
+        # NaN is the label-engine's explicit "unknown" value.  It must never
+        # enter the negative pool (otherwise weak-label masking silently turns
+        # missing labels into negatives).
+        valid = torch.isfinite(targets)
+        if weights is not None:
+            if weights.shape != targets.shape:
+                raise ValueError("weights must match logits shape")
+            valid = valid & torch.isfinite(weights) & (weights > 0)
+        terms = []
+        for c in range(logits.shape[1]):
+            pos = logits[valid[:, c] & (targets[:, c] >= 0.5), c]
+            neg = logits[valid[:, c] & (targets[:, c] < 0.5), c]
+            if pos.numel() and neg.numel():
+                pair_loss = torch.nn.functional.softplus(
+                    self.margin - pos[:, None] + neg[None, :]
+                )
+                # Confidence weights affect pair contribution without
+                # changing the ranking target.  Normalize by total pair
+                # weight so the scale is stable across batches.
+                if weights is not None:
+                    pos_w = weights[valid[:, c] & (targets[:, c] >= 0.5), c]
+                    neg_w = weights[valid[:, c] & (targets[:, c] < 0.5), c]
+                    pair_w = pos_w[:, None] * neg_w[None, :]
+                    terms.append((pair_loss * pair_w).sum() / pair_w.sum().clamp_min(1e-8))
+                else:
+                    terms.append(pair_loss.mean())
+        return torch.stack(terms).mean() if terms else logits.sum() * 0.0
+
+
+class AUCAsymmetricLoss(nn.Module):
+    """ASL plus a small pairwise term that directly optimises ranking."""
+
+    def __init__(self, gamma_neg=4.0, gamma_pos=0.0, clip=0.05,
+                 rank_weight: float = 0.15, margin: float = 0.0):
+        super().__init__()
+        if not 0.0 <= rank_weight <= 1.0:
+            raise ValueError("rank_weight must be in [0, 1]")
+        self.rank_weight = float(rank_weight)
+        self.asl = AsymmetricLoss(gamma_neg, gamma_pos, clip)
+        self.rank = PairwiseAUC(margin)
+
+    def forward(self, logits, targets, weights=None):
+        return ((1.0 - self.rank_weight) * self.asl(logits, targets, weights)
+                + self.rank_weight * self.rank(logits, targets, weights))
+
+
+class LocalAttentionSmoothness(nn.Module):
+    """Penalize abrupt attention changes along adjacent valid windows.
+
+    The module is intentionally separate from the classifier loss: callers can
+    apply it to exposed attention maps without forcing attention tensors into
+    the checkpoint/inference contract.  ``attention`` may be [B,S,W,C] or
+    [B,S,W], and ``mask`` must be [B,S,W].
+    """
+
+    def forward(self, attention, mask):
+        if attention.ndim not in (3, 4) or mask.ndim != 3:
+            raise ValueError("attention must be [B,S,W,(C)] and mask [B,S,W]")
+        if attention.shape[:3] != mask.shape:
+            raise ValueError("attention and mask window dimensions must match")
+        delta = attention[:, :, 1:] - attention[:, :, :-1]
+        pair_mask = (mask[:, :, 1:] > 0.5) & (mask[:, :, :-1] > 0.5)
+        if attention.ndim == 4:
+            pair_mask = pair_mask.unsqueeze(-1)
+        values = delta.square().masked_select(pair_mask)
+        return values.mean() if values.numel() else attention.sum() * 0.0
+
+
+LOSS_REGISTRY: dict[str, type] = {
+    "asl": AsymmetricLoss,
+    "bce": WeightedBCE,
+    "auc_asl": AUCAsymmetricLoss,
+}
 
 
 def build_loss(name: str = "asl", **kwargs) -> nn.Module:

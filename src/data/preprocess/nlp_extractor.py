@@ -49,12 +49,38 @@ TARGETS = [
     "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"
 ]
 
-EXTRACTOR_VERSION = "clinical-report-labels-v4"
+EXTRACTOR_VERSION = "clinical-report-labels-v5"
 
 # High-throughput batching & context defaults
 DEFAULT_CHUNK_SIZE = int(os.environ.get("NLP_CHUNK_SIZE", "150"))
 DEFAULT_MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "16384"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("NLP_MAX_TOKENS", "2048"))
+NLP_MAX_CHUNK_HARD = int(os.environ.get("NLP_MAX_CHUNK_HARD", "64"))
+
+
+def safe_nlp_chunk_size(requested: int, max_tokens: int = DEFAULT_MAX_TOKENS) -> int:
+    """Bound vLLM concurrency from live host/GPU headroom.
+
+    Report extraction is intentionally conservative: KV-cache growth is driven
+    by concurrent prompts and max sequence length, so a large static chunk can
+    OOM even when model weights fit.  The returned value is deterministic for
+    a given machine state and never exceeds the explicit hard cap.
+    """
+    if requested < 1 or max_tokens < 1:
+        raise ValueError("requested chunk size and max_tokens must be positive")
+    memory = psutil.virtual_memory()
+    available_gb = memory.available / (1024 ** 3)
+    # Reserve the project's recovery headroom and leave room for the Python
+    # dataframe/cache process.  This is a scheduling bound, not a guarantee.
+    usable_gb = max(1.0, min(
+        config.MEMORY_TARGET_GB - memory.used / (1024 ** 3),
+        available_gb - config.MIN_AVAILABLE_RAM_GB,
+    ))
+    # Approximate KV-cache footprint; use a conservative 256 MiB per 4k-token
+    # request because model-specific KV dimensions are not available cheaply.
+    per_request_gb = max(0.125, 0.256 * max_tokens / 4096.0)
+    safe = int((usable_gb * 0.50) / per_request_gb)
+    return max(1, min(int(requested), NLP_MAX_CHUNK_HARD, safe))
 
 
 def append_to_jsonl(uid: str, raw_output: str, out_csv: str) -> None:
@@ -206,7 +232,16 @@ INSTRUCTIONS:
 - 'exact_quote': Copy the exact phrase from the report justifying your decision. Leave empty "" if not stated.
 - 'state': MUST BE "present", "absent", or "not_stated".
   NOTE: Treat foreign words for "normal", "intact", "no evidence of" as "absent". (e.g. uredan, intaktan, normal, negativo, saptanmadı, afwezig, unauffällig, kein, φυσιολογικός, норма)
-- 'confidence': MUST BE "high" or "low". 
+ - 'confidence': MUST BE "high", "medium", or "low". 
+- Do not infer a finding from age, surgery history, a risk factor, or a related
+  finding. For example, effusion does not imply synovitis, and marrow edema does
+  not automatically imply contusion.
+- Resolve negation and uncertainty in the original report language before
+  producing English state values. Preserve the original-language quote exactly.
+- If the report does not explicitly address a target, return state="not_stated",
+  confidence="low", and exact_quote="". Never invent a negative.
+- Return one and only one JSON object. Do not add commentary, markdown fences,
+  translated prose, or extra target keys.
 
 REPORT TO ANALYZE:
 {report}
@@ -253,30 +288,41 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                     normalized_data[target_map[norm_k]] = val_item
                     
         found_targets = sum(1 for t in TARGETS if t in normalized_data)
-        if found_targets < 6:
+        # Partial JSON is not a valid supervision record.  Filling missing
+        # targets with a confident negative silently creates label noise and is
+        # especially harmful for rare findings.
+        if found_targets != len(TARGETS):
             return None
 
         for t in TARGETS:
             val = normalized_data.get(t, {})
-            state_str = str(val.get("state", "not_stated")).lower().strip()
-            conf_str = str(val.get("confidence", "high")).lower().strip()
+            if not isinstance(val, dict):
+                return None
+            state_str = _normalize_state(val.get("state"))
+            conf_str = _normalize_confidence(val.get("confidence"))
+            if state_str is None or conf_str is None:
+                return None
             
             is_present = False
             is_absent = False
             
-            if "present" in state_str:
+            if state_str == "present":
                 is_present = True
-            elif "absent" in state_str or "normal" in state_str or "intact" in state_str:
+            elif state_str == "absent":
                 is_absent = True
                 
             if is_present:
                 if "low" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.85, 0.85
+                elif "medium" in conf_str:
+                    out[t], out[f"{t}_weight"] = 0.75, 0.65
                 else:
                     out[t], out[f"{t}_weight"] = 0.95, 1.0
             elif is_absent:
                 if "low" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.15, 0.85
+                elif "medium" in conf_str:
+                    out[t], out[f"{t}_weight"] = 0.25, 0.65
                 else:
                     out[t], out[f"{t}_weight"] = 0.05, 1.0
             else:
@@ -288,6 +334,30 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
     except Exception as e:
         print(f"[PARSE ERROR] UID {uid}: {e}")
         return None
+
+
+def _normalize_state(value: object) -> str | None:
+    """Normalize only unambiguous state values; reject invented/ambiguous ones."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s_-]+", " ", text)
+    if text in {"present", "positive", "yes", "abnormal", "detected"}:
+        return "present"
+    if text in {"absent", "negative", "no", "normal", "intact", "none", "not seen"}:
+        return "absent"
+    if text in {"not stated", "unknown", "uncertain", "indeterminate", "not mentioned"}:
+        return "not_stated"
+    return None
+
+
+def _normalize_confidence(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if text in {"high", "certain", "strong"}:
+        return "high"
+    if text in {"medium", "moderate", "medium confidence"}:
+        return "medium"
+    if text in {"low", "weak", "uncertain"}:
+        return "low"
+    return None
 
 
 def run_offline_extraction(data_root: str, out_csv: str, model_id: str = None):
@@ -511,7 +581,9 @@ def auto_complete_extraction(
         }
         
     remaining_df = needed_df[~needed_df["StudyInstanceUID"].isin(done_uids)].copy()
+    chunk_size = safe_nlp_chunk_size(chunk_size, max_tokens=max_tokens)
     print(f"[AUTO-DETECT] Remaining to extract: {len(remaining_df)} studies ({len(done_uids)/max(1, total_needed)*100:.1f}% previously done).")
+    print(f"[SAFETY] NLP concurrency capped at {chunk_size} requests (hard cap={NLP_MAX_CHUNK_HARD}, max_tokens={max_tokens}).")
     print(f"[CONFIG] NLP Extraction Engine Selected: '{selected_engine.upper()}'")
     print(f"[CONFIG] NLP source model/engine revision: {resolved_model}")
     

@@ -413,7 +413,7 @@ def run_training(
     lora_rank: int = config.LORA_RANK,    # Upgrade B
     lora_alpha: int = config.LORA_ALPHA,
     # loss
-    loss_name: str = "asl",              # Upgrade B: ASL by default
+    loss_name: str = "auc_asl",          # ASL + pairwise ranking aligned with macro-AUC
     asl_gamma_neg: float = config.ASL_GAMMA_NEG,
     asl_gamma_pos: float = config.ASL_GAMMA_POS,
     asl_clip: float = config.ASL_CLIP,
@@ -545,14 +545,39 @@ def run_training(
         model_train = model
 
     # ── Loss ─────────────────────────────────────────────────────────────────
-    criterion = build_loss(
-        loss_name,
-        **({"gamma_neg": asl_gamma_neg, "gamma_pos": asl_gamma_pos, "clip": asl_clip}
-           if loss_name == "asl" else {}),
-    ).to(device)
+    loss_kwargs = {}
+    if loss_name in {"asl", "auc_asl"}:
+        loss_kwargs = {
+            "gamma_neg": asl_gamma_neg,
+            "gamma_pos": asl_gamma_pos,
+            "clip": asl_clip,
+        }
+    if loss_name == "auc_asl":
+        loss_kwargs["rank_weight"] = config.AUC_RANK_WEIGHT
+    criterion = build_loss(loss_name, **loss_kwargs).to(device)
 
     # ── Datasets ─────────────────────────────────────────────────────────────
+    # DataLoader workers replicate prefetched uint8 batches in host memory.
+    # Bound concurrency from the actual payload before constructing workers;
+    # this prevents an otherwise valid model from OOMing during prefetch.
     num_workers = min(num_workers, os.cpu_count() or 1)
+    per_worker_gb = max(
+        0.25,
+        _loader_batch_bytes(cfg, n_windows_train, batch_size)
+        * max(1, prefetch_factor) / (1024 ** 3),
+    )
+    available_gb = psutil.virtual_memory().available / (1024 ** 3)
+    worker_budget = max(0, int(
+        max(0.0, available_gb - config.MIN_AVAILABLE_RAM_GB) * 0.35
+        / per_worker_gb
+    ))
+    num_workers = min(num_workers, worker_budget)
+    if num_workers == 0:
+        prefetch_factor = 1
+    print(
+        f"[SAFETY] DataLoader workers={num_workers}; estimated per-worker queued "
+        f"payload={per_worker_gb:.2f} GiB; available RAM={available_gb:.1f} GiB"
+    )
     gold_mask = (
         va[[f"{target}_weight" for target in config.TARGETS]]
         .fillna(0.0)
@@ -578,7 +603,7 @@ def run_training(
     print(
         f"loader workers={num_workers}, prefetch={prefetch_factor}, "
         f"estimated prefetched image payload≈{queued_train_gb:.1f} GiB; "
-        f"validation batch={eval_batch_size}, gold studies={len(va_gold)}/{len(va)}; "
+        f"validation batch={eval_batch_size}, gold studies={int(gold_mask.sum())}/{len(va)}; "
         f"memory target={config.MEMORY_TARGET_GB:.0f} GiB, "
         f"hard ceiling={config.CIRCUIT_BREAKER_MAX_RAM_GB:.0f} GiB"
     )
@@ -772,11 +797,14 @@ def run_training(
                 swa_model.update_parameters(model)
 
             # ── Best-checkpoint saving ────────────────────────────────────────
-            save = True
+            # Never overwrite the selected epoch with a later, worse model. In
+            # the no-validation case retain the final epoch as the usable
+            # checkpoint; with validation, selection is strictly gold-only.
+            save = dl_va is None or (np.isfinite(score) and score > best)
             if save:
                 best = score
                 epochs_no_improve = 0
-                ckpt_file = os.path.join(out_dir, f"fold{fold}_last.pt")
+                ckpt_file = os.path.join(out_dir, f"fold{fold}_best.pt")
                 _atomic_torch_save(
                     dict(
                         model=inner_model.state_dict(),
@@ -798,6 +826,20 @@ def run_training(
                 if ds_va is not None and epochs_no_improve >= early_stop_patience:
                     print(f"  [EARLY STOP] Validation AUC did not improve for {early_stop_patience} consecutive epochs. Stopping early at epoch {ep + 1}/{n_ep} to prevent overfitting.", flush=True)
                     break
+
+            # Always maintain a last-epoch artifact for debugging/recovery, but
+            # never use it for OOF selection when a validated best checkpoint
+            # exists.
+            if dl_va is not None and np.isfinite(score) and score <= best:
+                _atomic_torch_save(
+                    dict(
+                        model=inner_model.state_dict(), cfg=dataclasses.asdict(cfg),
+                        model_config=model_config, targets=config.TARGETS,
+                        fold=fold, epoch=ep + 1, val=score, variant=variant,
+                        use_cross_slot=use_cross_slot,
+                    ),
+                    os.path.join(out_dir, f"fold{fold}_last.pt"),
+                )
 
             # ── Time-budget guard ─────────────────────────────────────────────
             if time.time() - t0 > config.TIME_BUDGET_HOURS * 3600:

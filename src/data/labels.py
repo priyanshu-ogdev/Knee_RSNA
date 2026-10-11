@@ -66,16 +66,11 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
         if ex is not None and t in ex.columns:
             e = ex[t].astype(float).to_numpy(copy=True)
             
-            # SOTA Calibration: Estimate P(positive | not_stated) using Gold Studies
+            # Preserve -1 as an explicit missing/uncertain marker.  Converting
+            # it with a global prevalence estimate leaks validation-fold label
+            # statistics and creates synthetic negatives/positives.
             is_soft_neg = np.isclose(e, -1.0, atol=1e-5)
-            if is_soft_neg.any():
-                gold_valid = g[np.isfinite(g)]
-                if len(gold_valid) > 0:
-                    gold_prevalence = np.mean(gold_valid)
-                else:
-                    gold_prevalence = 0.05
-                calibrated_prob = min(0.15, gold_prevalence * 0.8) # Conservative penalty
-                e[is_soft_neg] = calibrated_prob
+            e[is_soft_neg] = np.nan
             
             if np.isinf(e).any():
                 raise ValueError(f"extra labels for {t!r} must be finite or missing")
@@ -91,6 +86,8 @@ def build_labels(root, extra_csv=None, extra_weight=0.5, out_csv=None):
             y = np.where(use, e, g)
             w = np.where(use, extra_weight * ew, w)
             out.loc[use & (out['source'] == 'none'), 'source'] = 'extra'
+            mixed = use & any_gold
+            out.loc[mixed, 'source'] = 'mixed'
         out[t] = y
         out[f'{t}_weight'] = w
     if out_csv:

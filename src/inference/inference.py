@@ -17,17 +17,24 @@ import threading
 def prefetch_generator(cache, rows, cfg, n_use, batch_size):
     q = queue.Queue(maxsize=3)
     def worker():
-        for lo in range(0, len(rows), batch_size):
-            batch_rows = rows[lo:lo + batch_size]
-            with ThreadPoolExecutor(max_workers=len(batch_rows)) as ex:
-                smp = list(ex.map(lambda i: loader.make_sample(cache, i, cfg, train=False, n_use=n_use), batch_rows))
-            q.put((batch_rows, smp))
-        q.put(None)
+        try:
+            for lo in range(0, len(rows), batch_size):
+                batch_rows = rows[lo:lo + batch_size]
+                with ThreadPoolExecutor(max_workers=len(batch_rows)) as ex:
+                    smp = list(ex.map(lambda i: loader.make_sample(cache, i, cfg, train=False, n_use=n_use), batch_rows))
+                q.put((batch_rows, smp))
+            q.put(None)
+        except BaseException as exc:
+            # Never leave the consumer blocked forever on a dead daemon
+            # thread.  Re-raise in the consumer with the original traceback.
+            q.put(exc)
     t = threading.Thread(target=worker, daemon=True)
     t.start()
     while True:
         res = q.get()
         if res is None: break
+        if isinstance(res, BaseException):
+            raise res
         yield res
 from concurrent.futures import ThreadPoolExecutor
 
@@ -48,25 +55,25 @@ def rank_percentile_blend(model_preds_list: list[np.ndarray]) -> np.ndarray:
     if not model_preds_list:
         raise ValueError("At least one prediction array is required for blending")
     if len(model_preds_list) == 1:
-        return model_preds_list[0]
+        result = np.asarray(model_preds_list[0])
+        if result.ndim != 2 or not np.isfinite(result).all():
+            raise ValueError("Prediction arrays must be finite 2D arrays")
+        return result
     n_samples, n_targets = model_preds_list[0].shape
     if any(pred.shape != (n_samples, n_targets) for pred in model_preds_list):
         raise ValueError("All model prediction arrays must share the same [samples, targets] shape")
+    if any(not np.isfinite(pred).all() for pred in model_preds_list):
+        raise ValueError("Prediction arrays must be finite before rank blending")
     blended = np.zeros((n_samples, n_targets), dtype=np.float32)
     for c in range(n_targets):
         target_ranks = []
         for m_preds in model_preds_list:
             col = m_preds[:, c]
-            valid = np.isfinite(col)
-            ranks = np.zeros_like(col, dtype=np.float32)
-            if valid.sum() > 1:
-                ranks[valid] = (
-                    pd.Series(col[valid])
-                    .rank(method="average", pct=True)
-                    .to_numpy(dtype=np.float32)
-                )
-            elif valid.sum() == 1:
-                ranks[valid] = 0.5
+            ranks = (
+                pd.Series(col)
+                .rank(method="average", pct=True)
+                .to_numpy(dtype=np.float32)
+            )
             target_ranks.append(ranks)
         blended[:, c] = np.mean(target_ranks, axis=0)
     return blended
@@ -253,7 +260,7 @@ def predict_chunk_tta(
     cfg: config.PreCfg,
     device: torch.device,
     n_use: int | None = None,
-    batch: int = 4,
+    batch: int = 2,
     temperatures: list | None = None,
     n_tta: int = 4,
     tta_seed: int = 42,
@@ -347,7 +354,7 @@ def predict_chunk(
     cfg: config.PreCfg,
     device: torch.device,
     n_use: int | None = None,
-    batch: int = 4,
+    batch: int = 2,
     temperatures: list | None = None,
     return_models: bool = False,
 ) -> np.ndarray | list[np.ndarray]:
@@ -402,7 +409,7 @@ def run_inference(
     cfg: config.PreCfg | None = None,
     out_csv: str = "submission.csv",
     cache_dir: str | None = None,
-    workers: int | None = None,
+    workers: int | None = 1,
     chunk: int = 64,
     n_use: int | None = None,
     device: torch.device | None = None,
@@ -458,24 +465,34 @@ def run_inference(
         # Workers were forked at the first submit, i.e., before any CUDA call in this process.
         if not state["moved"]:
             for i, m in enumerate(loaded_models):
-                # 1. Native FP16 Casting (Faster than autocast overhead)
+                # 1. Use one native accelerator dtype consistently. Mixing
+                # half weights with BF16 autocast can trigger implicit casts
+                # and is slower (and less predictable) on some Kaggle GPUs.
                 m = m.eval()
                 if device.type == "cuda":
-                    m = m.half()
+                    infer_dtype = (
+                        torch.bfloat16 if torch.cuda.is_bf16_supported()
+                        else torch.float16
+                    )
+                    m = m.to(dtype=infer_dtype)
                 m = m.to(device, non_blocking=device.type == "cuda")
                 
-                # 2. PyTorch 2.x Compiler with CUDA Graphs
-                try:
-                    import torch._dynamo
-                    torch._dynamo.config.suppress_errors = True
-                    m = torch.compile(m, mode="reduce-overhead", fullgraph=False)
-                    print(f"[OPTIMIZE] Model {i} successfully compiled with reduce-overhead.")
-                except Exception as e:
-                    print(f"[OPTIMIZE] Compiler bypassed: {e}")
+                # Compilation has a substantial one-time cost and can be a net
+                # loss for a single Kaggle submission. Enable only when the
+                # runtime has measured a benefit for this exact checkpoint.
+                if os.environ.get("RSNA_COMPILE", "0").lower() in {"1", "true", "yes"}:
+                    try:
+                        import torch._dynamo
+                        torch._dynamo.config.suppress_errors = True
+                        m = torch.compile(m, mode="reduce-overhead", fullgraph=False)
+                        print(f"[OPTIMIZE] Model {i} compiled with reduce-overhead.")
+                    except Exception as e:
+                        print(f"[OPTIMIZE] Compiler bypassed: {e}")
                 
                 loaded_models[i] = m
-                # Multi-GPU check: only wrap in DataParallel if batch size is large enough to divide evenly
-                if device.type == "cuda" and torch.cuda.device_count() > 1 and batch >= torch.cuda.device_count() * 2:
+                # Shard even a two-study batch across two 16 GiB T4s.  Requiring
+                # 2x GPUs left the second device idle in the memory-safe path.
+                if device.type == "cuda" and torch.cuda.device_count() > 1 and batch >= torch.cuda.device_count():
                     loaded_models[i] = torch.nn.DataParallel(m)
             state["moved"] = True
         if multi_model:
@@ -553,8 +570,8 @@ def main() -> None:
     )
     parser.add_argument("--out", default="submission.csv", help="Output submission CSV")
     parser.add_argument("--cache_dir", default=None, help="Optional test cache directory")
-    parser.add_argument("--batch", type=int, default=8, help="Inference batch size")
-    parser.add_argument("--n_tta", type=int, default=4, help="Number of test-time views")
+    parser.add_argument("--batch", type=int, default=2, help="Inference batch size; conservative for 16 GiB T4 GPUs")
+    parser.add_argument("--n_tta", type=int, default=1, help="Number of test-time views (1 is the fastest deterministic path)")
     parser.add_argument("--no_tta", action="store_true", help="Disable test-time augmentation")
     parser.add_argument(
         "--d4_target_weights",

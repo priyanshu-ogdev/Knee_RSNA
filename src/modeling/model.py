@@ -542,7 +542,16 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
         if clean_k.startswith("module."):
             clean_k = clean_k[len("module."):]
         cleaned_state_dict[clean_k] = v
-    model.load_state_dict(cleaned_state_dict)
+    incompatible = model.load_state_dict(cleaned_state_dict, strict=False)
+    allowed_missing = {"anatomical_prior", "prior_gate"}
+    unexpected = set(incompatible.unexpected_keys)
+    missing = set(incompatible.missing_keys)
+    if unexpected or (missing - allowed_missing):
+        raise RuntimeError(
+            "Checkpoint/model state mismatch: "
+            f"missing={sorted(missing - allowed_missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
     model.eval()
     model._rsna_preprocessing_config = ckpt.get("cfg")
     model._rsna_model_type = model_config["model_type"]

@@ -201,6 +201,12 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
     studies: ordered list of StudyInstanceUID. slot_rows: {study: {slot: series uid|None}}.
     on_ready(cache, a, b): called in the main thread whenever studies [a,b) are all done (use order='seq')."""
     workers = workers or max(2, os.cpu_count() or 2)
+    # Never enqueue the entire study set at once: each future retains its
+    # arguments and can create a large transient parent/process footprint.
+    # A small bounded window keeps the pipeline saturated without turning the
+    # data forge into an unbounded task queue.
+    workers = max(1, min(int(workers), os.cpu_count() or 1))
+    inflight = max(workers * 2, 8)
     p = _paths(prefix)
     if source_signature is None:
         import hashlib
@@ -242,7 +248,6 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
     t0 = time.time()
     stats = dict(studies=len(studies), built=0, resumed=len(studies) - len(todo))
     try:
-        futs = {ex.submit(_work, i): i for i in todo}
         pending = {}
         for a in range(0, len(studies), chunk):
             pending[a] = sum(1 for i in range(a, min(a + chunk, len(studies))) if not cache.done[i])
@@ -251,28 +256,33 @@ def build_cache(prefix, studies, slot_rows, records, sides, cfg, workers=None, r
                 on_ready(cache, a, min(a + chunk, len(studies)))
             if left == 0:
                 pending.pop(a)
-        for k, f in enumerate(as_completed(futs)):
-            i, _, _, _, _, _ = f.result()
-            stats['built'] += 1
-            a = (i // chunk) * chunk
-            if a in pending:
-                pending[a] -= 1
-                if pending[a] == 0:
-                    if on_ready:
-                        on_ready(cache, a, min(a + chunk, len(studies)))
-                    pending.pop(a)
-            if progress and (k + 1) % 200 == 0:
-                elapsed = time.time() - t0
-                throughput = (k + 1) / elapsed
-                left = len(todo) - (k + 1)
-                eta = left / throughput if throughput > 0 else 0
-                eta_m, eta_s = divmod(int(eta), 60)
-                eta_h, eta_m = divmod(eta_m, 60)
-                print(
-                    f'  cache {k + 1}/{len(todo)} | {throughput:.1f} studies/s | '
-                    f'ETA: {eta_h:02d}:{eta_m:02d}:{eta_s:02d}',
-                    flush=True,
-                )
+        completed = 0
+        for start in range(0, len(todo), inflight):
+            batch_indices = todo[start:start + inflight]
+            futs = {ex.submit(_work, i): i for i in batch_indices}
+            for f in as_completed(futs):
+                i, _, _, _, _, _ = f.result()
+                stats['built'] += 1
+                completed += 1
+                a = (i // chunk) * chunk
+                if a in pending:
+                    pending[a] -= 1
+                    if pending[a] == 0:
+                        if on_ready:
+                            on_ready(cache, a, min(a + chunk, len(studies)))
+                        pending.pop(a)
+                if progress and completed % 200 == 0:
+                    elapsed = time.time() - t0
+                    throughput = completed / elapsed
+                    left = len(todo) - completed
+                    eta = left / throughput if throughput > 0 else 0
+                    eta_m, eta_s = divmod(int(eta), 60)
+                    eta_h, eta_m = divmod(eta_m, 60)
+                    print(
+                        f'  cache {completed}/{len(todo)} | {throughput:.1f} studies/s | '
+                        f'ETA: {eta_h:02d}:{eta_m:02d}:{eta_s:02d}',
+                        flush=True,
+                    )
     except Exception:
         ex.shutdown(wait=True)
         cache.flush()

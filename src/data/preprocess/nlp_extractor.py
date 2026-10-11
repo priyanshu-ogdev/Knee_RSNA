@@ -54,7 +54,7 @@ EXTRACTOR_VERSION = "clinical-report-labels-v5"
 # High-throughput batching & context defaults
 DEFAULT_CHUNK_SIZE = int(os.environ.get("NLP_CHUNK_SIZE", "150"))
 DEFAULT_MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "16384"))
-DEFAULT_MAX_TOKENS = int(os.environ.get("NLP_MAX_TOKENS", "2048"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("NLP_MAX_TOKENS", "4096"))
 NLP_MAX_CHUNK_HARD = int(os.environ.get("NLP_MAX_CHUNK_HARD", "64"))
 
 
@@ -261,17 +261,44 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
         end = raw_text.rfind("}")
         if start != -1 and end != -1 and end > start:
             clean_json = raw_text[start:end+1].strip()
+        elif start != -1:
+            clean_json = raw_text[start:].strip()
             
     if not clean_json:
         return None
         
     try:
         clean_json_sanitized = re.sub(r",\s*([}\]])", r"\1", clean_json)
+        open_braces = clean_json_sanitized.count("{") - clean_json_sanitized.count("}")
+        if open_braces > 0:
+            clean_json_sanitized = clean_json_sanitized + ("}" * open_braces)
+
+        data = None
         try:
             data = json.loads(clean_json_sanitized)
         except json.JSONDecodeError:
-            ast_str = clean_json_sanitized.replace("true", "True").replace("false", "False").replace("null", "None")
-            data = ast.literal_eval(ast_str)
+            try:
+                ast_str = clean_json_sanitized.replace("true", "True").replace("false", "False").replace("null", "None")
+                data = ast.literal_eval(ast_str)
+            except Exception:
+                data = None
+
+        if data is None or not isinstance(data, dict):
+            data = {}
+            for t in TARGETS:
+                t_pat = re.compile(rf'"{re.escape(t)}"\s*:\s*\{{([^}}]*)\}}', re.IGNORECASE)
+                m = t_pat.search(raw_text)
+                if m:
+                    block = m.group(1)
+                    st_m = re.search(r'"state"\s*:\s*"([^"]+)"', block, re.IGNORECASE)
+                    cf_m = re.search(r'"confidence"\s*:\s*"([^"]+)"', block, re.IGNORECASE)
+                    qt_m = re.search(r'"exact_quote"\s*:\s*"([^"]*)"', block, re.IGNORECASE)
+                    if st_m and cf_m:
+                        data[t] = {
+                            "state": st_m.group(1),
+                            "confidence": cf_m.group(1),
+                            "exact_quote": qt_m.group(1) if qt_m else "",
+                        }
             
         out = {"StudyInstanceUID": str(uid).strip()}
         

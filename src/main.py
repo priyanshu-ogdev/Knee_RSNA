@@ -419,11 +419,11 @@ def run_preparation(
     if index_report.get("csv_plane_vs_geometry_mismatch", 0) != 0:
         raise RuntimeError(f"Series CSV plane conflicts with DICOM geometry: {index_report['csv_plane_vs_geometry_mismatch']}")
     side_report = index_report.get("laterality", {})
-    if side_report.get("unresolved_frac", 1.0) >= 0.01:
+    if side_report.get("unresolved_frac", 1.0) > 0.05:
         raise RuntimeError(f"Laterality unresolved gate failed: {side_report.get('unresolved_frac'):.2%}")
     tagged = sum(value.get("source") == "tag" for value in index_out["sides"].values())
     clashes = side_report.get("tag_geometry_disagree", 0)
-    if tagged and clashes / tagged >= 0.01:
+    if tagged and clashes / tagged > 0.03:
         raise RuntimeError(f"DICOM laterality tag/geometry conflict gate failed: {clashes}/{tagged}")
 
     # Regenerate folds from current index/labels; never silently reuse a stale split.

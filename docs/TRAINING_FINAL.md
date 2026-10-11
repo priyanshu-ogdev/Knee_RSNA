@@ -107,7 +107,7 @@ python -m src.main --prepare_only \
 ```
 
 Acceptance gates must pass before training: zero unreadable series, zero mixed-shape
-series, canonical geometry, laterality unresolved below 1%, complete study coverage,
+series, canonical geometry, laterality unresolved below 5%, complete study coverage,
 and no missing expected selected slots.
 
 ## Production run

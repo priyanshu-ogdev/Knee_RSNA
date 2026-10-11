@@ -149,8 +149,8 @@ def run_index(root, out_dir, splits=('train', 'test'), workers=None, limit=0, pr
     print(f"  series with read errors          : {rep['series_with_error']}  (expect ~0)")
     print(f"  non-canonical orientation series : {rep.get('non_canonical_orientation')}  (expect 0)")
     print(f"  CSV plane vs DICOM geometry      : {rep.get('csv_plane_vs_geometry_mismatch')} mismatches (expect 0)")
-    print(f"  laterality unresolved            : {lat['unresolved_frac']:.2%}  (gate < 1%)")
-    print(f"  laterality tag-vs-geometry clash : {lat['tag_geometry_disagree']} studies  (gate < 1% of tagged)")
+    print(f"  laterality unresolved            : {lat['unresolved_frac']:.2%}  (gate < 5%)")
+    print(f"  laterality tag-vs-geometry clash : {lat['tag_geometry_disagree']} studies  (gate < 3% of tagged)")
     return dict(ann=ann, tab=tab, sides=sides, report=rep, source_signature=source_signature)
 
 

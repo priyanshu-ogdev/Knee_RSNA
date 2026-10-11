@@ -912,7 +912,9 @@ def run_training(
         _shutdown_loader(dl_tr)
         active_loaders = []
         if ds_oof is not None:
-            best_path = os.path.join(out_dir, f"fold{fold}_last.pt")
+            best_candidate = os.path.join(out_dir, f"fold{fold}_best.pt")
+            last_candidate = os.path.join(out_dir, f"fold{fold}_last.pt")
+            best_path = best_candidate if os.path.exists(best_candidate) else last_candidate
             best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
             inner_model.load_state_dict(best_checkpoint["model"], strict=True)
             inner_model.eval()

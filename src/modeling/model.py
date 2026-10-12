@@ -276,7 +276,7 @@ class Model(nn.Module):
                 try:
                     gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                     if gb >= 100.0:
-                        self._cached_chunk_size = 256  # GB10 / H200 unified memory: fills full HBM bandwidth
+                        self._cached_chunk_size = 128  # GB10 / H200: optimal Tensor Core saturation + bounded activations
                     elif gb >= 24.0:
                         self._cached_chunk_size = 96   # A100 / H100 SXM4
                     else:

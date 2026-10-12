@@ -10,18 +10,18 @@ from dataclasses import dataclass, replace
 # Unified memory safety constraints: total combined RAM + VRAM must stay strictly < 90 GiB.
 MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "75.0"))
 CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "88.0"))
-MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "32.0"))
+MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "15.0"))
 
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
 EPOCHS           = 12          # Full-family default; early stopping remains enabled
 BATCH_SIZE       = 16          # DGX Spark optimized: utilizes 70-85 GB unified memory
-NUM_WORKERS      = 12          # 12 parallel DataLoader workers for maximum GPU saturation
-PREFETCH_FACTOR  = 2           # Double pipeline depth: workers queue 2 batches ahead
-EVAL_BATCH_SIZE  = 16          # 2× faster validation passes
+NUM_WORKERS      = 8           # 8 workers balances peak throughput with IPC shared-memory stability
+PREFETCH_FACTOR  = 2           # Workers queue 2 batches ahead
+EVAL_BATCH_SIZE  = 8           # Controlled validation memory footprint
 PREPROCESS_WORKERS = 8
 GRAD_ACCUM       = 2           # Effective batch = 32 studies; rock-solid gradient estimate
-N_WINDOWS_TRAIN  = 8           # 8 windows per slot: covers 73% of knee slice volume per step
+N_WINDOWS_TRAIN  = 6           # 6 windows per slot: 60% coverage + stratified z-jitter covers 100% volume
 LR_HEAD          = 1e-3        # Lowered from 2e-3; head is randomly init'd, 2e-3 overshoots
 LR_BACKBONE      = 3e-5        # Raised from 1e-5; safe with corrected LLRD direction
 WEIGHT_DECAY     = 0.05

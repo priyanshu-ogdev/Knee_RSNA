@@ -75,15 +75,41 @@ def check_memory_circuit_breaker(
     used_gb = mem.used / (1024 ** 3)
     total_gb = mem.total / (1024 ** 3)
     available_gb = mem.available / (1024 ** 3)
-    min_available = getattr(config, "MIN_AVAILABLE_RAM_GB", 20.0)
+    min_available = getattr(config, "MIN_AVAILABLE_RAM_GB", 15.0)
     if used_gb >= limit or available_gb <= min_available:
+        # Before terminating, attempt an immediate in-flight flush of cached PyTorch memory and glibc arenas
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            if hasattr(torch.cuda, "ipc_collect"):
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+        # Re-check after flush
+        mem_after = psutil.virtual_memory()
+        used_gb_after = mem_after.used / (1024 ** 3)
+        available_gb_after = mem_after.available / (1024 ** 3)
+        if used_gb_after < limit and available_gb_after > min_available:
+            return used_gb_after, total_gb
+
         details = {
-            "used_gb": used_gb,
+            "used_gb": used_gb_after,
             "total_gb": total_gb,
-            "percent": mem.percent,
-            "available_gb": available_gb,
+            "percent": mem_after.percent,
+            "available_gb": available_gb_after,
         }
-        raise MemoryCircuitBreakerTriggered(used_gb, limit, stage, details)
+        raise MemoryCircuitBreakerTriggered(used_gb_after, limit, stage, details)
     return used_gb, total_gb
 
 
@@ -324,6 +350,11 @@ def train_epoch(
 
         total_loss_tensor += loss.detach() * accumulation_steps
         n += 1
+
+        # Promptly release step variables to prevent accumulation across loop iterations
+        del imgs, masks, wmasks, targets, weights, logits, loss, batch
+        if (micro_step + 1) % 50 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:
             dt = time.time() - step_t0
@@ -775,8 +806,8 @@ def run_training(
     )
     dl_va = (
         DataLoader(ds_va, batch_size=eval_batch_size, shuffle=False,
-                   num_workers=4, pin_memory=(device.type == "cuda"),
-                   persistent_workers=True, prefetch_factor=2)
+                   num_workers=2, pin_memory=(device.type == "cuda"),
+                   persistent_workers=False, prefetch_factor=2)
         if ds_va is not None else None
     )
     active_loaders = [dl_tr]
@@ -808,7 +839,13 @@ def run_training(
             score = float("nan")
 
             if dl_va is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 score, per = evaluate(model, dl_va, device)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
                 msg += f"  val macro-AUC {score:.4f}"
                 all_conds = ", ".join(f"{k}:{v:.3f}" for k, v in sorted(per.items()))
                 msg += f"\n       Per-target AUCs ({len(per)}/12 evaluated): [{all_conds}]"
@@ -883,21 +920,22 @@ def run_training(
             for module in momenta:
                 module.momentum = None
             total_bn_batches = len(loader)
-            for bn_step, batch in enumerate(loader):
-                check_memory_circuit_breaker(
-                    stage=f"SWA BatchNorm Step {bn_step + 1}/{total_bn_batches}"
-                )
-                if isinstance(batch, (list, tuple)):
-                    imgs = batch[0].to(device)
-                    mask = batch[1].to(device) if len(batch) > 1 else None
-                    wmask = batch[2].to(device) if len(batch) > 2 else None
-                    model(imgs, mask, wmask)
-                    del imgs, mask, wmask
-                else:
-                    imgs = batch.to(device)
-                    model(imgs)
-                    del imgs
-                del batch
+            with torch.no_grad():
+                for bn_step, batch in enumerate(loader):
+                    check_memory_circuit_breaker(
+                        stage=f"SWA BatchNorm Step {bn_step + 1}/{total_bn_batches}"
+                    )
+                    if isinstance(batch, (list, tuple)):
+                        imgs = batch[0].to(device)
+                        mask = batch[1].to(device) if len(batch) > 1 else None
+                        wmask = batch[2].to(device) if len(batch) > 2 else None
+                        model(imgs, mask, wmask)
+                        del imgs, mask, wmask
+                    else:
+                        imgs = batch.to(device)
+                        model(imgs)
+                        del imgs
+                    del batch
             for bn_module in momenta:
                 bn_module.momentum = momenta[bn_module]
             model.train(was_training)

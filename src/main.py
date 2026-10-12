@@ -945,7 +945,7 @@ def main():
         default=None,
         help="Additional trained checkpoints; families receive equal rank-blend weight unless --d4_target_weights is set",
     )
-    parser.add_argument("--max_ram_gb", type=float, default=config.CIRCUIT_BREAKER_MAX_RAM_GB, help="Unified-memory hard safety ceiling in GiB (default: 100 GiB)")
+    parser.add_argument("--max_ram_gb", type=float, default=config.CIRCUIT_BREAKER_MAX_RAM_GB, help="Unified-memory hard safety ceiling in GiB (default: 88 GiB)")
     args = parser.parse_args()
 
     if (

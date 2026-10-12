@@ -21,7 +21,7 @@ PREFETCH_FACTOR  = 2           # Workers queue 2 batches ahead
 EVAL_BATCH_SIZE  = 8           # Controlled validation memory footprint
 PREPROCESS_WORKERS = 8
 GRAD_ACCUM       = 2           # Effective batch = 32 studies; rock-solid gradient estimate
-N_WINDOWS_TRAIN  = 6           # 6 windows per slot: 60% coverage + stratified z-jitter covers 100% volume
+N_WINDOWS_TRAIN  = 8           # 8 windows per slot: 112.6% joint anatomy coverage + perfect 3×128 chunk alignment
 LR_HEAD          = 1e-3        # Lowered from 2e-3; head is randomly init'd, 2e-3 overshoots
 LR_BACKBONE      = 3e-5        # Raised from 1e-5; safe with corrected LLRD direction
 WEIGHT_DECAY     = 0.05

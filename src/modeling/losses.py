@@ -111,11 +111,14 @@ class AsymmetricLoss(nn.Module):
                     f"{tuple(loss.shape)}"
                 )
             loss = loss * weights
-            # Normalize by labeled entries, not confidence-weight sum: confidence
-            # then scales the loss as intended rather than canceling itself out.
-            labeled_count = (weights > 0).sum(dim=0).clamp_min(1)
-            class_losses = loss.sum(dim=0) / labeled_count
-            return class_losses.mean()
+            # Normalize by labeled entries per active class: inactive classes with 0 labels
+            # in a micro-batch must not dilute the macro mean
+            labeled_count = (weights > 0).sum(dim=0)
+            has_labels = labeled_count > 0
+            if has_labels.any():
+                class_losses = loss.sum(dim=0)[has_labels] / labeled_count[has_labels]
+                return class_losses.mean()
+            return loss.sum() * 0.0
         return loss.mean()
 
 
@@ -132,9 +135,12 @@ class WeightedBCE(nn.Module):
                     f"{tuple(loss.shape)}"
                 )
             loss = loss * weights
-            labeled_count = (weights > 0).sum(dim=0).clamp_min(1)
-            class_losses = loss.sum(dim=0) / labeled_count
-            return class_losses.mean()
+            labeled_count = (weights > 0).sum(dim=0)
+            has_labels = labeled_count > 0
+            if has_labels.any():
+                class_losses = loss.sum(dim=0)[has_labels] / labeled_count[has_labels]
+                return class_losses.mean()
+            return loss.sum() * 0.0
         return loss.mean()
 
 

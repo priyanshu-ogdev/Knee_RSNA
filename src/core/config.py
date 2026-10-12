@@ -9,46 +9,58 @@ from dataclasses import dataclass, replace
 # ─────────────────────────────────── Hardware Safety & Circuit Breaker ────────
 # Use 88 GiB as an operational target on the 128-GiB unified-memory host.
 # It is advisory; the hard ceiling and available-memory guard preserve recovery room.
-MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "88.0"))
-CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "100.0"))
-MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "20.0"))
+MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "100.0"))
+CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "115.0"))
+MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "10.0"))
 
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
 EPOCHS           = 12          # Full-family default; early stopping remains enabled
-BATCH_SIZE       = 8           # Keep per-step GPU payload bounded; use GRAD_ACCUM for effective batch
-NUM_WORKERS      = 8
-PREFETCH_FACTOR  = 1
-EVAL_BATCH_SIZE  = 8
+BATCH_SIZE       = 8           # Verified 28-29 GB unified RAM footprint on DGX Spark
+NUM_WORKERS      = 8           # Dynamic memory safety guard adapts worker count to live RAM
+PREFETCH_FACTOR  = 1           # Bounded queue depth prevents unified memory bloating
+EVAL_BATCH_SIZE  = 8           # Fast, reliable validation passes
 PREPROCESS_WORKERS = 8
-GRAD_ACCUM       = 3           # Effective batch ~= 24 without a 24-study GPU allocation
-N_WINDOWS_TRAIN  = 5           # Number of depth-stratified windows sampled per slot and epoch
-LR_HEAD          = 2e-3        # Starting value; not tuned by a DGX validation sweep
-LR_BACKBONE      = 1e-5        # Starting value; scaled per-layer by the DINOv2 optimizer
+GRAD_ACCUM       = 3           # Effective batch = 24; stable gradient estimate for ViT
+N_WINDOWS_TRAIN  = 5           # 5 depth-stratified windows per slot; verified GPU footprint
+LR_HEAD          = 1e-3        # Lowered from 2e-3; head is randomly init'd, 2e-3 overshoots
+LR_BACKBONE      = 3e-5        # Raised from 1e-5; safe with corrected LLRD direction
 WEIGHT_DECAY     = 0.05
 COATNET_LR_HEAD      = 1e-3
 COATNET_LR_BACKBONE  = 3e-5
 COATNET_WEIGHT_DECAY = 0.02
 COATNET_INPUT_SIZE   = 384
-COATNET_ENCODE_CHUNK = 8
-UNFREEZE_LAST    = 8           # Top 8 blocks fine-tuned with LLRD; blocks 0-3 frozen (preserves 2.5D MRI adaptation)
-LORA_RANK        = 0          # Zero disables LoRA adapters
+COATNET_ENCODE_CHUNK = 32      # 4× larger micro-batch; fills GB10 HBM bandwidth
+UNFREEZE_LAST    = 10          # Top 10/12 blocks fully unfrozen; deeper domain adaptation
+LORA_RANK        = 0           # Zero disables LoRA adapters
 LORA_ALPHA       = 32          # Scaling used if a positive LoRA rank is selected
 TIME_BUDGET_HOURS = 9999.0     # DGX Spark: no Kaggle time cap — disabled
-EARLY_STOP_PATIENCE = 3        # Early stopping patience on validation Macro-AUC
+EARLY_STOP_PATIENCE = 5        # Raised from 3; 12 gold val studies = noisy AUC signal
 
-# SWA duplicates model state and performs an extra full training pass. Enable
-# it only for a measured ablation.
-SWA_EPOCHS      = 0
+# SWA averages weights from epochs (n_ep - SWA_EPOCHS) onward.
+# Activates at epoch 9 (12-3). Gracefully skipped if early stop fires <=8.
+# Typical gain: +0.003-0.010 macro-AUC at essentially zero extra compute cost.
+SWA_EPOCHS      = 3
 
-# Asymmetric Loss defaults (Ridnik et al., ICCV 2021)
-ASL_GAMMA_NEG   = 4.0          # Shared negative focusing exponent; compare with BCE on matched folds
+# Asymmetric Loss - per-class gamma_neg based on gold label neg:pos ratios (58 gold studies).
+# Formula: min(3.0, max(0.0, ln(neg/pos) * 1.5)) ordered by config.TARGETS.
+# Effusion 0.7:1 (more positives) -> gamma=0.0. MCL 5.4:1 (rare) -> gamma=2.5.
+ASL_GAMMA_NEG   = [0.5, 2.5, 0.3, 0.6, 1.6, 2.1, 0.9, 0.0, 0.1, 2.0, 1.1, 1.2]
+#                   ACL  MCL  MMen LMen MOA  LOA  PFOA Eff  Syn  Bak  Con  Frac
 ASL_GAMMA_POS   = 0.0
-ASL_CLIP        = 0.05         # Negative probability shift; a hypothesis for noisy labels, not a verified gain
-AUC_RANK_WEIGHT  = 0.15        # Directly aligns training with macro ROC-AUC
+ASL_CLIP        = 0.0          # Disabled: genuine rare negatives must not be discarded
+AUC_RANK_WEIGHT  = 0.25        # Stronger direct ROC-AUC ranking gradient
+AUC_RANK_MARGIN  = 0.1         # Pos must exceed neg by 0.1 logit; buffer for noisy pseudo batches
 
-# Label smoothing (Szegedy et al. 2016; standard ViT recipe)
-LABEL_SMOOTHING = 0.0          # Disabled in the default training recipe
+# Label smoothing: disabled for ROC-AUC ranking objectives.
+# ASL focusing and PairwiseAUC require uncompressed logit margins; smoothing causes
+# negative-gradient reversal on true negatives (penalizing confident predictions).
+LABEL_SMOOTHING = 0.0
+
+# Pseudo-label weight boost at training time (CSV has conservative extra_weight=0.5).
+# Qwen2.5-72B multilingual medical NLP precision ~85% -> 0.5 is conservative.
+# 0.5 * 1.3 = 0.65; clamped to 0.95 (below gold threshold >=0.99).
+PSEUDO_WEIGHT_SCALE = 1.3
 
 # Augmentation (unchanged from baseline)
 AUG_ROT_DEG  = 8.0

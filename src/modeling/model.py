@@ -171,30 +171,30 @@ class SlotHead(nn.Module):
                         if si < n_slot:
                             prior_mat[ti, si] = SLOT_PRIOR_STRENGTH
         self.register_buffer("slot_prior", prior_mat)
+        # Per-target attention temperature: low=max-pool (focal), high=mean-pool (diffuse).
+        # Registered as buffer: allocated once, moves with model.to(device), no per-forward overhead.
+        _temps = torch.tensor([
+            0.5,  # ACL (focal tear: top-slot avg)
+            0.5,  # MCL (focal ligament)
+            0.1,  # Medial Meniscus (focal tear: near max-pool)
+            0.1,  # Lateral Meniscus
+            5.0,  # Medial OA (diffuse: mean-pool)
+            5.0,  # Lateral OA (diffuse: mean-pool)
+            5.0,  # PF OA (diffuse: mean-pool)
+            0.1,  # Effusion (focal: fluid in one slot)
+            5.0,  # Synovitis (diffuse: mean-pool)
+            0.1,  # Baker's cyst (focal: popliteal)
+            0.1,  # Contusion (focal: bone marrow)
+            0.1,  # Fracture (focal: near max-pool)
+        ], dtype=torch.float32).view(1, n_out, 1)  # [1, n_out, 1] broadcasts over [B, n_out, S]
+        self.register_buffer("target_temps", _temps)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # x: [B, S, dim]
         h = self.proj(x) + self.slot_emb                          # [B, S, hidden]
         att = torch.einsum("bsh,oh->bos", h, self.query) / self.hidden ** 0.5
         
-        # UPGRADE 1: Per-target soft pooling mapping
-        if self.query.shape[0] == 12:
-            target_temps = torch.tensor([
-                0.5,  # ACL (top-2 avg)
-                0.5,  # MCL (top-2 avg)
-                0.1,  # Medial Meniscus (max pool)
-                0.1,  # Lateral Meniscus (max pool)
-                5.0,  # Medial OA (mean pool)
-                5.0,  # Lateral OA (mean pool)
-                5.0,  # PF OA (mean pool)
-                0.1,  # Effusion (max pool)
-                5.0,  # Synovitis (mean pool)
-                0.1,  # Baker's (max pool)
-                0.1,  # Contusion (max pool)
-                0.1,  # Fracture (max pool)
-            ], device=x.device).view(1, 12, 1)
-            att = att / target_temps
-            
+        att = att / self.target_temps       # per-target temperature scaling (buffer, no device transfer)
         att = att + self.slot_prior.unsqueeze(0)   # anatomical plane bias
         valid_slots = mask.unsqueeze(1) >= 0.5
         att = att.masked_fill(~valid_slots, -10000.0).softmax(-1)
@@ -275,10 +275,12 @@ class Model(nn.Module):
             if torch.cuda.is_available():
                 try:
                     gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                    if gb >= 24.0:
-                        self._cached_chunk_size = 96  # Restrict to HBM3 to hit 4s/step without OS thrashing
+                    if gb >= 100.0:
+                        self._cached_chunk_size = 256  # GB10 / H200 unified memory: fills full HBM bandwidth
+                    elif gb >= 24.0:
+                        self._cached_chunk_size = 96   # A100 / H100 SXM4
                     else:
-                        self._cached_chunk_size = 48   # 16GB Kaggle T4 / P100
+                        self._cached_chunk_size = 48   # Kaggle T4 / P100
                 except Exception:
                     self._cached_chunk_size = 48
             else:
@@ -419,7 +421,7 @@ def build_model(
         try:
             bb = AutoModel.from_pretrained(
                 src,
-                drop_path_rate=0.2,
+                drop_path_rate=0.1,   # 0.1 for fine-tuning (was 0.2 for pretraining)
                 attn_implementation="sdpa",
                 local_files_only=os.path.isdir(src),
             )

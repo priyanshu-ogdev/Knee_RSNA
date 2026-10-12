@@ -218,12 +218,14 @@ def _autocast(device: torch.device):
 def _build_schedule(
     optimizer: torch.optim.Optimizer,
     total_steps: int,
-    warmup_frac: float = 0.05,
-    eta_min: float = 1e-7,
+    warmup_frac: float = 0.08,
+    eta_min: float = 1e-8,
 ) -> torch.optim.lr_scheduler.LRScheduler:
-    """Linear warmup (5% steps) + cosine decay to eta_min.
+    """Linear warmup (8% steps) + cosine decay to eta_min.
 
     Source: ViT fine-tuning best practices 2025 (Touvron DeiT III, Oquab DINOv2).
+    Raised warmup 0.05->0.08: slower LR ramp for 10 unfrozen blocks.
+    eta_min 1e-7->1e-8: longer cosine tail for better final convergence.
     Replaces OneCycleLR which can overshoot for large ViTs.
     """
     warmup_steps = max(1, int(warmup_frac * total_steps))
@@ -289,15 +291,19 @@ def train_epoch(
                 1.0 + (gold_weight_mult - 1.0) * verified_gold
             )
 
-        # UPGRADE 6: Curriculum label weighting
-        if epoch < 5:
-            # Up-weight positive findings
-            has_positive = (targets >= 0.5).float()
-            weights = weights * (1.0 + has_positive)
-            
-        # Optional label smoothing
+        # Curriculum positive-upweighting removed: it doubled positive weights in
+        # epochs 1-4 without normalisation, making loss scale ~1.5x higher than
+        # epochs 5-12 and distorting the cosine LR schedule during warmup.
+        # Gold upweighting (gold_weight_mult=3.0) is the correct, epoch-consistent knob.
+
+        # Optional label smoothing: only soften pseudo entries; NEVER corrupt verified gold labels
         if label_smoothing > 0.0:
-            targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
+            is_pseudo = (weights > 0) & (weights < 0.99)
+            targets = torch.where(
+                is_pseudo,
+                targets * (1.0 - label_smoothing) + 0.5 * label_smoothing,
+                targets,
+            )
 
         with ctx:
             loss = criterion(logits.float(), targets, weights)
@@ -308,7 +314,7 @@ def train_epoch(
         is_last = (micro_step + 1) == len(dataloader)
         if (micro_step + 1) % grad_accum == 0 or is_last:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, 0.5, foreach=True)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0, foreach=True)  # DINOv2 fine-tune: 0.5->1.0
             scale_before_step = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
@@ -380,12 +386,21 @@ def evaluate(
         del imgs, masks, wmasks, targets, weights, p, batch
     P, Y, W = np.concatenate(P), np.concatenate(Y), np.concatenate(W)
     per: dict[str, float] = {}
+    gold_per: dict[str, float] = {}  # gold-only AUC (diagnostic; not used for early stopping)
     for j, t in enumerate(config.TARGETS):
-        m = W[:, j] >= 0.49
+        m = W[:, j] >= 0.49           # all labeled (gold + pseudo): used for checkpoint selection
+        mg = W[:, j] >= 0.99          # gold only: diagnostic alignment signal
         y_eval = Y[m, j]
         if m.sum() > 1 and 0 < y_eval.sum() < m.sum():
             per[t] = float(roc_auc_score(y_eval, P[m, j]))
+        yg = Y[mg, j]
+        if mg.sum() > 1 and 0 < yg.sum() < mg.sum():
+            gold_per[t] = float(roc_auc_score(yg, P[mg, j]))
     macro = float(np.mean(list(per.values()))) if per else float("nan")
+    if gold_per:
+        gold_macro = float(np.mean(list(gold_per.values())))
+        print(f"  [GOLD-AUC] {gold_macro:.4f} macro over {len(gold_per)} gold-labeled targets "
+              f"(n_gold_studies={int((W[:, 0] >= 0.99).sum())})")
     del P, Y, W
     return macro, per
 
@@ -554,6 +569,7 @@ def run_training(
         }
     if loss_name == "auc_asl":
         loss_kwargs["rank_weight"] = config.AUC_RANK_WEIGHT
+        loss_kwargs["margin"] = getattr(config, "AUC_RANK_MARGIN", 0.0)
     criterion = build_loss(loss_name, **loss_kwargs).to(device)
 
     # ── Datasets ─────────────────────────────────────────────────────────────
@@ -568,7 +584,7 @@ def run_training(
     )
     available_gb = psutil.virtual_memory().available / (1024 ** 3)
     worker_budget = max(0, int(
-        max(0.0, available_gb - config.MIN_AVAILABLE_RAM_GB) * 0.35
+        max(0.0, available_gb - config.MIN_AVAILABLE_RAM_GB) * 0.50  # 0.35->0.50: allows configured 14 workers
         / per_worker_gb
     ))
     num_workers = min(num_workers, worker_budget)
@@ -585,6 +601,12 @@ def run_training(
         .any(axis=1)
     ) if len(va) else pd.Series(dtype=bool)
     ds_tr = RSNADataset(tr, cache_prefix, cfg, True, n_windows_train, seed)
+    # Scale pseudo-label weights at training time: 0.5 (CSV default) -> 0.65
+    # Qwen2.5-72B precision ~85% makes 0.5 overly conservative for pseudo entries.
+    _pseudo_scale = getattr(config, "PSEUDO_WEIGHT_SCALE", 1.0)
+    if _pseudo_scale != 1.0:
+        _pmask = (ds_tr.Wt > 0) & (ds_tr.Wt < 0.99)  # pseudo entries only
+        ds_tr.Wt[_pmask] = np.clip(ds_tr.Wt[_pmask] * _pseudo_scale, 0.0, 0.95)
     ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
     ds_oof = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
     if len(ds_tr) != len(tr):
@@ -653,7 +675,7 @@ def run_training(
         llrd_decay = 0.85
         n_layer = len(inner_model.backbone.encoder.layer)
         for i, block in enumerate(inner_model.backbone.encoder.layer):
-            layer_lr = config.LR_BACKBONE * (llrd_decay ** (n_layer - i))
+            layer_lr = config.LR_BACKBONE * (llrd_decay ** (n_layer - 1 - i))
             wd_params = [
                 p for n, p in block.named_parameters()
                 if p.requires_grad and not _is_no_decay(n)
@@ -753,7 +775,8 @@ def run_training(
     )
     dl_va = (
         DataLoader(ds_va, batch_size=eval_batch_size, shuffle=False,
-                   num_workers=0, pin_memory=False)
+                   num_workers=4, pin_memory=(device.type == "cuda"),
+                   persistent_workers=True, prefetch_factor=2)
         if ds_va is not None else None
     )
     active_loaders = [dl_tr]
@@ -778,7 +801,7 @@ def run_training(
                 total_epochs=n_ep,
                 label_smoothing=label_smoothing,
                 grad_accum=grad_accum,
-                gold_weight_mult=2.0,
+                gold_weight_mult=3.0,  # 3x: 58 gold labels must dominate 4349 pseudo-labels
             )
 
             msg = f"epoch {ep + 1}/{n_ep}  loss {loss_val:.4f}"

@@ -7,16 +7,16 @@ import os
 from dataclasses import dataclass, replace
 
 # ─────────────────────────────────── Hardware Safety & Circuit Breaker ────────
-# Unified memory safety constraints: total combined RAM + VRAM must stay strictly < 90 GiB.
-MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "75.0"))
-CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "88.0"))
-MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "15.0"))
+# Unified memory safety constraints: total combined RAM + VRAM targeted at 80-85 GiB, hard capped < 90 GiB.
+MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "82.0"))
+CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "89.0"))
+MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "12.0"))
 
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
 EPOCHS           = 12          # Full-family default; early stopping remains enabled
-BATCH_SIZE       = 16          # DGX Spark optimized: utilizes 70-85 GB unified memory
-NUM_WORKERS      = 8           # 8 workers balances peak throughput with IPC shared-memory stability
+BATCH_SIZE       = 16          # DGX Spark optimized: utilizes 80-85 GB unified memory
+NUM_WORKERS      = 10          # 10 workers for deep prefetch pipeline and stable 80-85 GB utilization
 PREFETCH_FACTOR  = 2           # Workers queue 2 batches ahead
 EVAL_BATCH_SIZE  = 8           # Controlled validation memory footprint
 PREPROCESS_WORKERS = 8

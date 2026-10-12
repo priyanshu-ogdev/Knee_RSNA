@@ -16,13 +16,13 @@ MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "10.0")
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
 EPOCHS           = 12          # Full-family default; early stopping remains enabled
-BATCH_SIZE       = 8           # Verified 28-29 GB unified RAM footprint on DGX Spark
-NUM_WORKERS      = 8           # Dynamic memory safety guard adapts worker count to live RAM
-PREFETCH_FACTOR  = 1           # Bounded queue depth prevents unified memory bloating
-EVAL_BATCH_SIZE  = 8           # Fast, reliable validation passes
+BATCH_SIZE       = 16          # DGX Spark optimized: utilizes 70-85 GB unified memory
+NUM_WORKERS      = 12          # 12 parallel DataLoader workers for maximum GPU saturation
+PREFETCH_FACTOR  = 2           # Double pipeline depth: workers queue 2 batches ahead
+EVAL_BATCH_SIZE  = 16          # 2× faster validation passes
 PREPROCESS_WORKERS = 8
-GRAD_ACCUM       = 3           # Effective batch = 24; stable gradient estimate for ViT
-N_WINDOWS_TRAIN  = 5           # 5 depth-stratified windows per slot; verified GPU footprint
+GRAD_ACCUM       = 2           # Effective batch = 32 studies; rock-solid gradient estimate
+N_WINDOWS_TRAIN  = 8           # 8 windows per slot: covers 73% of knee slice volume per step
 LR_HEAD          = 1e-3        # Lowered from 2e-3; head is randomly init'd, 2e-3 overshoots
 LR_BACKBONE      = 3e-5        # Raised from 1e-5; safe with corrected LLRD direction
 WEIGHT_DECAY     = 0.05

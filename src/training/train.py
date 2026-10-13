@@ -639,14 +639,13 @@ def run_training(
         _pmask = (ds_tr.Wt > 0) & (ds_tr.Wt < 0.99)  # pseudo entries only
         ds_tr.Wt[_pmask] = np.clip(ds_tr.Wt[_pmask] * _pseudo_scale, 0.0, 0.95)
     ds_va = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
-    ds_oof = RSNADataset(va, cache_prefix, cfg, False, None, seed, aug=False) if len(va) else None
     if len(ds_tr) != len(tr):
         raise RuntimeError(
             f"training cache is missing {len(tr) - len(ds_tr)} studies from fold {fold}"
         )
-    if ds_oof is not None and len(ds_oof) != len(va):
+    if ds_va is not None and len(ds_va) != len(va):
         raise RuntimeError(
-            f"training cache is missing {len(va) - len(ds_oof)} held-out studies "
+            f"training cache is missing {len(va) - len(ds_va)} held-out studies "
             f"from fold {fold}"
         )
     queued_train_gb = (
@@ -804,10 +803,14 @@ def run_training(
         persistent_workers=(num_workers > 0),
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
+    val_workers = min(4, num_workers)
     dl_va = (
-        DataLoader(ds_va, batch_size=eval_batch_size, shuffle=False,
-                   num_workers=2, pin_memory=(device.type == "cuda"),
-                   persistent_workers=False, prefetch_factor=2)
+        DataLoader(
+            ds_va, batch_size=eval_batch_size, shuffle=False,
+            num_workers=val_workers, pin_memory=(device.type == "cuda"),
+            persistent_workers=False,
+            prefetch_factor=2 if val_workers > 0 else None,
+        )
         if ds_va is not None else None
     )
     active_loaders = [dl_tr]
@@ -841,12 +844,16 @@ def run_training(
             if dl_va is not None:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                active_loaders = [dl_tr, dl_va]
+                val_t0 = time.time()
                 score, per = evaluate(model, dl_va, device)
+                val_dt = time.time() - val_t0
+                active_loaders = [dl_tr]
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 import gc
                 gc.collect()
-                msg += f"  val macro-AUC {score:.4f}"
+                msg += f"  val macro-AUC {score:.4f} ({val_dt:.1f}s)"
                 all_conds = ", ".join(f"{k}:{v:.3f}" for k, v in sorted(per.items()))
                 msg += f"\n       Per-target AUCs ({len(per)}/12 evaluated): [{all_conds}]"
 
@@ -972,21 +979,22 @@ def run_training(
 
         _shutdown_loader(dl_tr)
         active_loaders = []
-        if ds_oof is not None:
+        if ds_va is not None:
             best_candidate = os.path.join(out_dir, f"fold{fold}_best.pt")
             last_candidate = os.path.join(out_dir, f"fold{fold}_last.pt")
             best_path = best_candidate if os.path.exists(best_candidate) else last_candidate
             best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
             inner_model.load_state_dict(best_checkpoint["model"], strict=True)
             inner_model.eval()
+            oof_workers = min(4, num_workers)
             dl_oof = DataLoader(
-                ds_oof,
+                ds_va,
                 batch_size=eval_batch_size,
                 shuffle=False,
-                num_workers=min(2, num_workers),
+                num_workers=oof_workers,
                 pin_memory=(device.type == "cuda"),
                 persistent_workers=False,
-                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                prefetch_factor=2 if oof_workers > 0 else None,
             )
             active_loaders = [dl_oof]
             oof_probabilities, oof_targets, oof_weights = [], [], []
@@ -1008,7 +1016,7 @@ def run_training(
                     oof_weights.append(weights.numpy())
                     del imgs, masks, wmasks, targets, weights, logits, batch
 
-            oof = pd.DataFrame({"StudyInstanceUID": ds_oof.ids})
+            oof = pd.DataFrame({"StudyInstanceUID": ds_va.ids})
             probabilities = np.concatenate(oof_probabilities)
             targets = np.concatenate(oof_targets)
             weights = np.concatenate(oof_weights)
@@ -1054,6 +1062,7 @@ def run_training(
     _shutdown_loader(dl_tr)
     del dl_tr
     if dl_va is not None:
+        _shutdown_loader(dl_va)
         del dl_va
     del model, inner_model
     if 'model_train' in locals():
@@ -1064,14 +1073,27 @@ def run_training(
     if swa_model is not None:
         del swa_model
     import gc
-    gc.collect()
+    for _ in range(3):
+        gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6")
         libc.malloc_trim(0)
     except Exception:
         pass
+    mem = psutil.virtual_memory()
+    print(
+        f"  [FOLD {fold} TEARDOWN] All loaders, models, and GPU memory purged. "
+        f"Unified RAM: {mem.used/(1024**3):.1f}/{mem.total/(1024**3):.0f}GiB "
+        f"(available {mem.available/(1024**3):.1f}GiB)",
+        flush=True,
+    )
 
     return best

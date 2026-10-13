@@ -660,6 +660,17 @@ def run_all_folds(
             raise RuntimeError(f"Training failed for requested fold {fold}; stopping to avoid a partial ensemble") from e
         finally:
             execute_emergency_memory_flush()
+            try:
+                import psutil
+                sys_mem = psutil.virtual_memory()
+                print(
+                    f"[SYSTEM TELEMETRY] Post-Fold {fold} Memory Status: "
+                    f"Used: {sys_mem.used/(1024**3):.1f} GiB / Total: {sys_mem.total/(1024**3):.1f} GiB "
+                    f"({sys_mem.percent:.1f}%) | Available Headroom: {sys_mem.available/(1024**3):.1f} GiB",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
     return best_scores
 

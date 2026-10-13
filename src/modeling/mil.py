@@ -210,7 +210,6 @@ def build_timm_attention_mil(
     encode_chunk_size: int = config.COATNET_ENCODE_CHUNK,
     pooling_mode: str = "flat",
     model_type: str = "coatnet_mil",
-    grad_checkpoint: bool = True,
 ) -> TimmAttentionMIL:
     try:
         import timm
@@ -225,7 +224,7 @@ def build_timm_attention_mil(
         in_chans=3,
     )
     if hasattr(backbone, "set_grad_checkpointing"):
-        backbone.set_grad_checkpointing(grad_checkpoint)
+        backbone.set_grad_checkpointing(True)
     feature_dim = getattr(backbone, "num_features", None)
     if not feature_dim:
         raise ValueError(f"timm model {arch!r} does not expose num_features")

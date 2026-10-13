@@ -590,6 +590,7 @@ def run_all_folds(
     timm_pooling: str = "hierarchical",
     use_slot_prior: bool = True,
     encode_chunk_size: int | None = None,
+    grad_checkpoint: bool = True,
 ) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
@@ -646,6 +647,7 @@ def run_all_folds(
                 use_cross_slot=True,
                 encode_chunk_size=encode_chunk_size,
                 swa_epochs=config.SWA_EPOCHS,
+                grad_checkpoint=grad_checkpoint,
             )
             best_scores[fold] = best_auc
             print(f"[SUCCESS] Fold {fold} completed with Best Macro-AUC: {best_auc:.4f}")
@@ -943,6 +945,11 @@ def main():
     )
     parser.add_argument("--skip_train", action="store_true", help="Skip model training")
     parser.add_argument(
+        "--no_grad_checkpoint",
+        action="store_true",
+        help="Disable gradient checkpointing to achieve ~40% faster training on machines with >40 GiB RAM",
+    )
+    parser.add_argument(
         "--prepare_only",
         action="store_true",
         help="Run the complete preprocessing/QC gates and exit before training",
@@ -1091,6 +1098,7 @@ def main():
                 use_slot_prior=not args.no_slot_prior,
                 pretrained=not args.random_init,
                 encode_chunk_size=args.encode_chunk_size,
+                grad_checkpoint=not args.no_grad_checkpoint,
             )
 
         # Phase 4: OOF & Checkpoints + Temperature Calibration

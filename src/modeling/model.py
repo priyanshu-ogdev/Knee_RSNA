@@ -246,10 +246,12 @@ class Model(nn.Module):
                  cross_slot_layers: int = 2,
                  cross_slot_dropout: float = 0.1,
                  use_slot_prior: bool = True,
-                 encode_chunk_size: int | None = None):
+                 encode_chunk_size: int | None = None,
+                 grad_checkpoint: bool = True):
         super().__init__()
         self.backbone = backbone
         self.encode_chunk_size = encode_chunk_size
+        self.grad_checkpoint = grad_checkpoint
         # CLS + mean-patch + focal-topk concat -> dim * 3 (IMPROVEMENT 1)
         feat_dim = dim * 3
         self.wpool = WindowPool(feat_dim)
@@ -331,8 +333,8 @@ class Model(nn.Module):
             f_list = []
             for c_start in range(0, len(x_valid), chunk_size):
                 c_x = x_valid[c_start:c_start + chunk_size]
-                if self.training:
-                    # CRITICAL FIX: PyTorch gradient checkpointing silently fails (saves NO VRAM) 
+                if self.training and getattr(self, "grad_checkpoint", True):
+                    # PyTorch gradient checkpointing silently fails (saves NO VRAM) 
                     # if inputs don't have requires_grad=True. This forces activation discarding!
                     c_x.requires_grad_(True)
                 c_out = self.backbone(pixel_values=c_x).last_hidden_state
@@ -383,6 +385,7 @@ def build_model(
     pretrained: bool = True,
     timm_pooling: str = "flat",
     use_slot_prior: bool = True,
+    grad_checkpoint: bool = True,
     backbone_config: dict | None = None,
 ) -> nn.Module:
     # Polymorphic argument resolution for backward compatibility
@@ -416,6 +419,7 @@ def build_model(
             encode_chunk_size=encode_chunk_size,
             pooling_mode=timm_pooling,
             model_type=model_type,
+            grad_checkpoint=grad_checkpoint,
         )
     if model_type not in ("dinov2", "coatnet_mil", "timm_mil"):
         raise ValueError(f"Unknown model_type {model_type!r}; expected 'dinov2', 'coatnet_mil', or 'timm_mil'")
@@ -457,7 +461,10 @@ def build_model(
     # Gradient checkpointing trades additional compute for lower activation
     # storage. Its memory impact still depends on batch size and input geometry.
     bb.config.use_cache = False
-    bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if grad_checkpoint:
+        bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    elif hasattr(bb, "gradient_checkpointing_disable"):
+        bb.gradient_checkpointing_disable()
     
     # Phase 2 Speedup: Truncate top layers of the backbone
     if truncate_blocks > 0:
@@ -498,6 +505,7 @@ def build_model(
         use_cross_slot=use_cross_slot,
         use_slot_prior=use_slot_prior,
         encode_chunk_size=encode_chunk_size,
+        grad_checkpoint=grad_checkpoint,
     )
 
 
@@ -534,6 +542,7 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
     model_config.setdefault("truncate_blocks", 0)
     model_config.setdefault("input_size", config.COATNET_INPUT_SIZE)
     model_config.setdefault("encode_chunk_size", config.COATNET_ENCODE_CHUNK)
+    model_config.setdefault("grad_checkpoint", True)
     # Checkpoints predating slot-aware MIL used one flat distribution across windows.
     model_config.setdefault("timm_pooling", "flat")
     model_config.setdefault("pretrained", False)

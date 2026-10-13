@@ -471,6 +471,7 @@ def run_training(
     early_stop_patience: int = config.EARLY_STOP_PATIENCE,
     timm_pooling: str = "hierarchical",
     use_slot_prior: bool = True,
+    grad_checkpoint: bool = True,
 ) -> float:
     """Train one fold and save the best checkpoint + optional SWA checkpoint.
 
@@ -559,6 +560,7 @@ def run_training(
         encode_chunk_size=encode_chunk_size,
         timm_pooling=timm_pooling,
         pretrained=pretrained,
+        grad_checkpoint=grad_checkpoint,
     ).to(device)
     if model_type in ("coatnet_mil", "timm_mil"):
         model_config = {
@@ -568,6 +570,7 @@ def run_training(
             "encode_chunk_size": encode_chunk_size,
             "timm_pooling": timm_pooling,
             "pretrained": False,
+            "grad_checkpoint": grad_checkpoint,
         }
     else:
         model_config = {
@@ -579,6 +582,7 @@ def run_training(
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "truncate_blocks": 0,
+            "grad_checkpoint": grad_checkpoint,
         }
         model_config["backbone_config"] = model.backbone.config.to_dict()
 

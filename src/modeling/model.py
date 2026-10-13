@@ -245,9 +245,11 @@ class Model(nn.Module):
                  cross_slot_nhead: int = 8,
                  cross_slot_layers: int = 2,
                  cross_slot_dropout: float = 0.1,
-                 use_slot_prior: bool = True):
+                 use_slot_prior: bool = True,
+                 encode_chunk_size: int | None = None):
         super().__init__()
         self.backbone = backbone
+        self.encode_chunk_size = encode_chunk_size
         # CLS + mean-patch + focal-topk concat -> dim * 3 (IMPROVEMENT 1)
         feat_dim = dim * 3
         self.wpool = WindowPool(feat_dim)
@@ -271,16 +273,18 @@ class Model(nn.Module):
         self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def _get_chunk_size(self) -> int:
+        if getattr(self, "encode_chunk_size", None) is not None:
+            return self.encode_chunk_size
         if not hasattr(self, "_cached_chunk_size"):
             if torch.cuda.is_available():
                 try:
                     gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                     if gb >= 100.0:
-                        self._cached_chunk_size = 128  # GB10 / H200: optimal Tensor Core saturation + bounded activations
+                        self._cached_chunk_size = 64   # GB10 / H200: bounded activation burst (1.2 GB)
                     elif gb >= 24.0:
-                        self._cached_chunk_size = 96   # A100 / H100 SXM4
+                        self._cached_chunk_size = 48   # A100 / H100 SXM4
                     else:
-                        self._cached_chunk_size = 48   # Kaggle T4 / P100
+                        self._cached_chunk_size = 32   # Kaggle T4 / P100
                 except Exception:
                     self._cached_chunk_size = 48
             else:
@@ -493,6 +497,7 @@ def build_model(
         dim,
         use_cross_slot=use_cross_slot,
         use_slot_prior=use_slot_prior,
+        encode_chunk_size=encode_chunk_size,
     )
 
 

@@ -7,21 +7,21 @@ import os
 from dataclasses import dataclass, replace
 
 # ─────────────────────────────────── Hardware Safety & Circuit Breaker ────────
-# Unified memory safety constraints: total combined RAM + VRAM targeted at 80-85 GiB, hard capped < 90 GiB.
-MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "82.0"))
-CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "89.0"))
+# Unified memory safety constraints: target 80 GiB steady, hard ceiling 95 GiB.
+MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "80.0"))
+CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "95.0"))
 MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "12.0"))
 
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
 EPOCHS           = 12          # Full-family default; early stopping remains enabled
-BATCH_SIZE       = 16          # DGX Spark optimized: utilizes 80-85 GB unified memory
-NUM_WORKERS      = 10          # 10 workers for deep prefetch pipeline and stable 80-85 GB utilization
+BATCH_SIZE       = 12          # Balanced baseline for high pairwise density & safe memory
+NUM_WORKERS      = 8           # 8 workers balances throughput with IPC shared-memory stability
 PREFETCH_FACTOR  = 2           # Workers queue 2 batches ahead
 EVAL_BATCH_SIZE  = 8           # Controlled validation memory footprint
 PREPROCESS_WORKERS = 8
-GRAD_ACCUM       = 2           # Effective batch = 32 studies; rock-solid gradient estimate
-N_WINDOWS_TRAIN  = 8           # 8 windows per slot: 112.6% joint anatomy coverage + perfect 3×128 chunk alignment
+GRAD_ACCUM       = 2           # Effective batch = 24 studies
+N_WINDOWS_TRAIN  = 7           # 7 windows per slot: 96.9% joint anatomy coverage
 LR_HEAD          = 1e-3        # Lowered from 2e-3; head is randomly init'd, 2e-3 overshoots
 LR_BACKBONE      = 3e-5        # Raised from 1e-5; safe with corrected LLRD direction
 WEIGHT_DECAY     = 0.05

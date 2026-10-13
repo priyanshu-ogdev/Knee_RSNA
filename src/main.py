@@ -39,9 +39,9 @@ if PROJECT_ROOT not in sys.path:
 # Force kagglehub to download directly into root data/ directory
 os.environ["KAGGLEHUB_CACHE"] = os.path.abspath(os.path.join(PROJECT_ROOT, "data"))
 
-# PyTorch Memory Allocation: prevent unified memory fragmentation on Grace Blackwell GB10
+# PyTorch Memory Allocation: prevent unified memory fragmentation and runaway caching on Grace Blackwell GB10
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256,garbage_collection_threshold:0.8"
 
 # Suppress OpenCV / OpenMP / BLAS thread oversubscription
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -589,6 +589,7 @@ def run_all_folds(
     pretrained: bool = True,
     timm_pooling: str = "hierarchical",
     use_slot_prior: bool = True,
+    encode_chunk_size: int | None = None,
 ) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
@@ -643,6 +644,7 @@ def run_all_folds(
                 use_slot_prior=use_slot_prior,
                 pretrained=pretrained,
                 use_cross_slot=True,
+                encode_chunk_size=encode_chunk_size,
                 swa_epochs=config.SWA_EPOCHS,
             )
             best_scores[fold] = best_auc
@@ -908,6 +910,7 @@ def main():
     parser.add_argument("--preprocess_workers", type=int, default=config.PREPROCESS_WORKERS, help="CPU workers for DICOM indexing/cache construction")
     parser.add_argument("--inference_batch_size", type=int, default=4, help="Study batch size for test inference")
     parser.add_argument("--n_windows_train", type=int, default=config.N_WINDOWS_TRAIN, help="Windows sampled per anatomical slot during training")
+    parser.add_argument("--encode_chunk_size", type=int, default=None, help="Encoder micro-batch chunk size (default: 64 for DINOv2, 32 for CoAtNet)")
     parser.add_argument("--folds", type=str, default="0,1,2,3,4", help="Comma-separated list of folds to train (e.g. '0,1,2,3,4')")
     parser.add_argument("--model_type", choices=["dinov2", "coatnet_mil", "timm_mil"], default="dinov2", help="Training architecture family")
     parser.add_argument("--variant", type=str, default=None, help="Backbone variant or timm architecture name (defaults by model family)")
@@ -1076,6 +1079,7 @@ def main():
                 timm_pooling=args.timm_pooling,
                 use_slot_prior=not args.no_slot_prior,
                 pretrained=not args.random_init,
+                encode_chunk_size=args.encode_chunk_size,
             )
 
         # Phase 4: OOF & Checkpoints + Temperature Calibration

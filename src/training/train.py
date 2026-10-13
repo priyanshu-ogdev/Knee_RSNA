@@ -353,7 +353,7 @@ def train_epoch(
 
         # Promptly release step variables to prevent accumulation across loop iterations
         del imgs, masks, wmasks, targets, weights, logits, loss, batch
-        if (micro_step + 1) % 50 == 0 and torch.cuda.is_available():
+        if (micro_step + 1) % 10 == 0 and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         if (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:

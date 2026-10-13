@@ -983,9 +983,9 @@ def run_training(
                 ds_oof,
                 batch_size=eval_batch_size,
                 shuffle=False,
-                num_workers=min(4, num_workers),
+                num_workers=min(2, num_workers),
                 pin_memory=(device.type == "cuda"),
-                persistent_workers=(num_workers > 0),
+                persistent_workers=False,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
             )
             active_loaders = [dl_oof]
@@ -1067,5 +1067,11 @@ def run_training(
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
 
     return best

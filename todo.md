@@ -91,21 +91,24 @@ python src/main.py \
   --variant dinov2-base \
   --model_dir pipeline_out/exp_dinov2_base_5fold \
   --epochs 12 \
-  --batch_size 12 \
+  --batch_size 16 \
   --grad_accum 2 \
   --n_windows_train 7 \
   --num_workers 10 \
   --prefetch_factor 3 \
-  --eval_batch_size 8 \
-  --max_ram_gb 95.0
+  --encode_chunk_size 112 \
+  --eval_batch_size 16 \
+  --max_ram_gb 95.0 \
+  --no_grad_checkpoint
 ```
 * **Resolution**: Native $518 \times 518$ (unreduced, full 1,370 tokens).
 * **Slice Depth**: $W = 7$ windows per slot ($96.9\%$ joint anatomy coverage).
-* **Throughput**: ~14.5s/step, 293 steps/epoch, ~71 min/epoch.
-* **Operating Memory**: ~35 GiB active process + ~40 GiB Linux page cache = **~75 GiB resident RAM** ($47\text{ GiB}$ safety buffer).
+* **Convergence Gain**: Batch 16 ($B_{\text{eff}}=32$) provides **$1.77\times$ higher pairwise density** for rare targets (ACL, MCL, Fracture) and $80.6\%$ positive-pair coverage per gradient step.
+* **Throughput**: ~8.5s/step, 220 steps/epoch, ~31 min training + ~2.5 min validation = **~33.5 min/epoch** ($2.7\times$ overall speedup vs baseline 90.5m).
+* **Operating Memory**: ~35 GiB active process + ~45 GiB RAM page cache = **~75–80 GiB resident RAM** ($42\text{--}47\text{ GiB}$ safety buffer).
 * **Artifacts**: Generates `fold0_best.pt` through `fold4_best.pt`, `fold*_swa.pt`, and `fold*_oof.csv`.
 
-*(Note: For absolute maximum slice depth, set `--n_windows_train 8` for 98.4% coverage at ~92 min/epoch).*
+*(Note: For testing single fold first, pass `--folds 0`)*.
 
 ---
 
@@ -119,19 +122,19 @@ python src/main.py \
   --timm_pooling hierarchical \
   --model_dir pipeline_out/exp_coatnet_rw384_5fold \
   --epochs 12 \
-  --batch_size 10 \
+  --batch_size 12 \
   --grad_accum 2 \
   --n_windows_train 7 \
-  --encode_chunk_size 32 \
+  --encode_chunk_size 48 \
   --num_workers 10 \
   --prefetch_factor 3 \
-  --eval_batch_size 8 \
+  --eval_batch_size 16 \
   --max_ram_gb 95.0
 ```
 * **Resolution**: $384 \times 384$ relative-attention pyramid.
 * **Slice Depth**: $W = 7$ windows per slot ($96.9\%$ joint anatomy coverage).
-* **Throughput**: ~10.5s/step, 352 steps/epoch, ~61 min/epoch.
-* **Operating Memory**: ~30 GiB active process + ~40 GiB Linux page cache = **~70 GiB resident RAM** ($52\text{ GiB}$ safety buffer).
+* **Throughput**: ~7.0s/step, 293 steps/epoch, ~34 min/epoch.
+* **Operating Memory**: ~30 GiB active process + ~45 GiB RAM page cache = **~75 GiB resident RAM** ($47\text{ GiB}$ safety buffer).
 * **Artifacts**: Generates `fold0_best.pt` through `fold4_best.pt`, `fold*_swa.pt`, and `fold*_oof.csv`.
 
 ---

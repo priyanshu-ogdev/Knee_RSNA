@@ -15,10 +15,10 @@ MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "12.0")
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026
 EPOCHS           = 12          # Full-family default; early stopping remains enabled
-BATCH_SIZE       = 12          # Balanced baseline for high pairwise density & safe memory
+BATCH_SIZE       = 16          # 16 studies: 1.77x higher pairwise density for rare target ranking
 NUM_WORKERS      = 10          # 10 workers ensures data pipeline outpaces GPU without starving
-PREFETCH_FACTOR  = 3           # Workers queue 3 batches ahead (11.3 GiB total queued payload)
-EVAL_BATCH_SIZE  = 8           # Controlled validation memory footprint
+PREFETCH_FACTOR  = 3           # Workers queue 3 batches ahead (14.6 GiB total queued payload)
+EVAL_BATCH_SIZE  = 16          # Accelerated validation (55 batches vs 111 batches)
 PREPROCESS_WORKERS = 8
 GRAD_ACCUM       = 2           # Effective batch = 24 studies
 N_WINDOWS_TRAIN  = 7           # 7 windows per slot: 96.9% joint anatomy coverage

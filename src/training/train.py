@@ -422,6 +422,7 @@ def evaluate(
     P, Y, W = [], [], []
     ctx, _ = _autocast(device)
     total_val_batches = len(dataloader)
+    val_t0 = time.time()
     for val_step, batch in enumerate(dataloader):
         check_memory_circuit_breaker(
             stage=f"Validation Evaluation Step {val_step + 1}/{total_val_batches}"
@@ -433,6 +434,11 @@ def evaluate(
         Y.append(targets.numpy())
         W.append(weights.numpy())
         del imgs, masks, wmasks, targets, weights, p, batch
+        if (val_step + 1) % 10 == 0 or (val_step + 1) == total_val_batches:
+            dt = time.time() - val_t0
+            s_per = dt / (val_step + 1)
+            eta_m = (total_val_batches - (val_step + 1)) * s_per / 60.0
+            print(f"  [Validation Step {val_step + 1:2d}/{total_val_batches:2d}] {s_per:.2f}s/step | ETA: {eta_m:.1f}m", flush=True)
     P, Y, W = np.concatenate(P), np.concatenate(Y), np.concatenate(W)
     per: dict[str, float] = {}
     gold_per: dict[str, float] = {}  # gold-only AUC (diagnostic; not used for early stopping)
@@ -833,11 +839,11 @@ def run_training(
         persistent_workers=(num_workers > 0),
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
-    val_workers = min(4, num_workers)
+    val_workers = min(6, num_workers)
     dl_va = (
         DataLoader(
             ds_va, batch_size=eval_batch_size, shuffle=False,
-            num_workers=val_workers, pin_memory=(device.type == "cuda"),
+            num_workers=val_workers, pin_memory=False,
             persistent_workers=False,
             prefetch_factor=2 if val_workers > 0 else None,
         )

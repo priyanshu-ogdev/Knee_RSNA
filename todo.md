@@ -85,7 +85,7 @@ rm -rf pipeline_out/exp_coatnet_rw384_5fold
 #### Model 1: DINOv2-Base (5-Fold Cross-Validation)
 Run inside `tmux new -s train_dinov2`:
 ```bash
-python src/main.py \
+python -u src/main.py \
   --folds 0,1,2,3,4 \
   --model_type dinov2 \
   --variant dinov2-base \
@@ -96,16 +96,15 @@ python src/main.py \
   --n_windows_train 7 \
   --num_workers 10 \
   --prefetch_factor 3 \
-  --encode_chunk_size 112 \
+  --encode_chunk_size 64 \
   --eval_batch_size 16 \
-  --max_ram_gb 95.0 \
-  --no_grad_checkpoint
+  --max_ram_gb 90.0
 ```
 * **Resolution**: Native $518 \times 518$ (unreduced, full 1,370 tokens).
 * **Slice Depth**: $W = 7$ windows per slot ($96.9\%$ joint anatomy coverage).
 * **Convergence Gain**: Batch 16 ($B_{\text{eff}}=32$) provides **$1.77\times$ higher pairwise density** for rare targets (ACL, MCL, Fracture) and $80.6\%$ positive-pair coverage per gradient step.
-* **Throughput**: ~8.5s/step, 220 steps/epoch, ~31 min training + ~2.5 min validation = **~33.5 min/epoch** ($2.7\times$ overall speedup vs baseline 90.5m).
-* **Operating Memory**: ~35 GiB active process + ~45 GiB RAM page cache = **~75–80 GiB resident RAM** ($42\text{--}47\text{ GiB}$ safety buffer).
+* **Throughput**: ~18s/step, 220 steps/epoch, ~65 min/epoch.
+* **Operating Memory**: ~35 GiB active process + ~30 GiB RAM page cache = **~65–70 GiB resident RAM** ($52\text{--}57\text{ GiB}$ safety buffer).
 * **Artifacts**: Generates `fold0_best.pt` through `fold4_best.pt`, `fold*_swa.pt`, and `fold*_oof.csv`.
 
 *(Note: For testing single fold first, pass `--folds 0`)*.
@@ -115,7 +114,7 @@ python src/main.py \
 #### Model 2: CoAtNet-2 MIL (5-Fold Cross-Validation)
 Run inside `tmux new -s train_coatnet`:
 ```bash
-python src/main.py \
+python -u src/main.py \
   --folds 0,1,2,3,4 \
   --model_type coatnet_mil \
   --variant coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k \
@@ -129,7 +128,7 @@ python src/main.py \
   --num_workers 10 \
   --prefetch_factor 3 \
   --eval_batch_size 16 \
-  --max_ram_gb 95.0
+  --max_ram_gb 90.0
 ```
 * **Resolution**: $384 \times 384$ relative-attention pyramid.
 * **Slice Depth**: $W = 7$ windows per slot ($96.9\%$ joint anatomy coverage).

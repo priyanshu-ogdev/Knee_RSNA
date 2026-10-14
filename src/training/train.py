@@ -368,10 +368,10 @@ def train_epoch(
 
         # Promptly release step variables to prevent accumulation across loop iterations
         del imgs, masks, wmasks, targets, weights, logits, loss, batch
-        # Empty CUDA cache every 50 steps, or immediately if resident memory exceeds 75 GiB
+        # Empty CUDA cache every 50 steps, or immediately if resident memory exceeds 88 GiB
         if (micro_step + 1) % 10 == 0 and torch.cuda.is_available():
             sys_used_gb = psutil.virtual_memory().used / (1024 ** 3)
-            if sys_used_gb >= 75.0 or (micro_step + 1) % 50 == 0:
+            if sys_used_gb >= 88.0 or (micro_step + 1) % 50 == 0:
                 torch.cuda.empty_cache()
 
         if (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:
@@ -835,7 +835,7 @@ def run_training(
     dl_tr = DataLoader(
         ds_tr, batch_size=batch_size, shuffle=True,
         drop_last=len(tr) > batch_size, num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,
         persistent_workers=(num_workers > 0),
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )

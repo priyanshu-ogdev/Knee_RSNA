@@ -1,65 +1,68 @@
-﻿#!/bin/bash
-# ==============================================================================
-# RSNA Knee 2026: The Hardened Data Processing & Training Master Pipeline
-# ==============================================================================
-# This script handles the end-to-end execution of the final fortified system
-# on your DGX Cluster. It triggers:
-# 1. Gold-Standard NLP Evaluation (Auditing the model against true labels)
-# 2. Complete Phase 1 (16k context NLP extraction) and Phase 2 (Image Caching)
-# 3. Phase 3 (Multi-GPU Multi-Fold Model Training)
-# ==============================================================================
+#!/usr/bin/env bash
+# Resumable DGX launcher. Never deletes competition data, caches, labels or
+# previous model directories. The old launcher forced a 72B re-extraction and
+# used a relative model path; both are unacceptable when a run has already
+# spent hours on the first epoch.
+set -euo pipefail
 
-set -e # Exit immediately on any error
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
 
-# ------------------------------------------------------------------------------
-# 0. Safety Cleanup (Guaranteeing 100% Fresh Run)
-# ------------------------------------------------------------------------------
-echo "[STEP 0] Purging old cache data to ensure a completely fresh DGX run..."
-rm -rf temp_gold_eval data/nlp_extractions* data/cache* data/pseudo_labels.csv
-echo "Cleanup complete!"
-echo "------------------------------------------------------------------------------"
+DATA_ROOT="${KNEE_DATA:-$ROOT/data/competitions/rsna-knee-abnormality-detection}"
+WORK_DIR="${RSNA_OUT_DIR:-$ROOT/pipeline_out}"
+MODEL_DIR="${RSNA_MODEL_DIR:-$WORK_DIR/exp_coatnet44}"
+PSEUDO="$WORK_DIR/pseudo_labels.csv"
 
-# ------------------------------------------------------------------------------
-# 1. Gold Label Evaluation (The Authenticity Check)
-# ------------------------------------------------------------------------------
-# This proves the CoT logic, json parsing, and translation guards work flawlessly.
-echo "[STEP 1] Running Hardened NLP Pipeline on Gold Standard Studies..."
-export DEFAULT_MAX_MODEL_LEN=16384
-export NLP_CHUNK_SIZE=150
+mkdir -p "$WORK_DIR" "$MODEL_DIR"
 
-python src/data/preprocess/nlp_extractor.py \
-    --evaluate \
-    --engine vllm \
-    --model Qwen/Qwen2.5-72B-Instruct \
-    --force
+if [[ ! -f "$DATA_ROOT/train.csv" || ! -d "$DATA_ROOT/train_series" ]]; then
+  echo "Dataset is incomplete under $DATA_ROOT" >&2
+  exit 2
+fi
 
-echo "Gold standard analysis complete. The AUC/Accuracy logs have been saved."
-echo "------------------------------------------------------------------------------"
+if [[ ! -f "$PSEUDO.manifest.json" ]]; then
+  echo "Missing pseudo-label manifest: $PSEUDO.manifest.json" >&2
+  echo "Run the one-time NLP preparation/audit before launching training." >&2
+  exit 3
+fi
 
-# ------------------------------------------------------------------------------
-# 2 & 3. End-To-End Master Pipeline (Preprocessing + Multi-GPU Training)
-# ------------------------------------------------------------------------------
-# main.py internally routes to nlp_extractor.py (Phase 1), cache.py (Phase 2),
-# and train.py (Phase 3). 
-echo "[STEP 2 & 3] Commencing End-To-End Extraction, Cache Build, and 5-Fold Training..."
+# Existing v5 Qwen outputs can be repaired deterministically from their stored
+# confidence weights. This avoids re-running Qwen2.5-72B merely to correct the
+# low/medium confidence ordering bug. The branch is idempotent after v6.
+NLP_VERSION="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("extractor_version", ""))' "$PSEUDO.manifest.json")"
+if [[ "$NLP_VERSION" == "clinical-report-labels-v5" ]]; then
+  python scripts/migrate_qwen_v5_to_v6.py \
+    --input "$PSEUDO" \
+    --output "$PSEUDO.v6.tmp.csv" \
+    --backup "$PSEUDO.v5.bak.csv"
+  mv "$PSEUDO.v6.tmp.csv" "$PSEUDO"
+  mv "$PSEUDO.v6.tmp.csv.manifest.json" "$PSEUDO.manifest.json"
+elif [[ "$NLP_VERSION" != "clinical-report-labels-v6" ]]; then
+  echo "Unsupported NLP extractor version: $NLP_VERSION" >&2
+  exit 4
+fi
 
-# NOTE: main.py uses --force_nlp and --fresh_preprocessing to trigger the 
-# extraction and cache building cleanly from scratch for the massive train set.
+echo "Launching resumable CoAtNet44 training from: $MODEL_DIR"
 python src/main.py \
-    --force_nlp \
-    --fresh_preprocessing \
-    --nlp_engine vllm \
-    --nlp_model Qwen/Qwen2.5-72B-Instruct \
-    --nlp_batch_size 150 \
-    --model_type timm_mil \
-    --variant convnext_small.in12k_ft_in1k \
-    --timm_pooling hierarchical \
-    --epochs 12 \
-    --batch_size 128 \
-    --grad_accum 1 \
-    --num_workers 16 \
-    --preprocess_workers 32
-
-echo "=============================================================================="
-echo "RUN COMPLETE! The final trained weights and OOF telemetry are in your working directory."
-echo "=============================================================================="
+  --data_root "$DATA_ROOT" \
+  --work_dir "$WORK_DIR" \
+  --model_dir "$MODEL_DIR" \
+  --nlp_engine vllm \
+  --nlp_model Qwen/Qwen2.5-72B-Instruct \
+  --cache_preset coatnet44 \
+  --cache_prefix_name coatnet44 \
+  --model_type coatnet_mil \
+  --variant coatnet_rmlp_2_rw_384.sw_in12k_ft_in1k \
+  --timm_pooling hierarchical \
+  --folds 0,1,2,3,4 \
+  --epochs "${RSNA_EPOCHS:-12}" \
+  --batch_size "${RSNA_BATCH_SIZE:-4}" \
+  --grad_accum "${RSNA_GRAD_ACCUM:-2}" \
+  --n_windows_train "${RSNA_WINDOWS:-16}" \
+  --num_workers "${RSNA_NUM_WORKERS:-4}" \
+  --prefetch_factor 1 \
+  --preprocess_workers "${RSNA_PREPROCESS_WORKERS:-16}" \
+  --eval_batch_size 8 \
+  --inference_batch_size 2 \
+  --n_tta 1 \
+  --max_ram_gb 90

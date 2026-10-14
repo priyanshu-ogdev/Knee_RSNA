@@ -63,6 +63,33 @@ def test_evaluate_handles_continuous_pseudo_labels(monkeypatch):
     assert per_target["ACL"] == 1.0
 
 
+def test_epoch_selection_metric_ignores_pseudo_labels_when_gold_exists(monkeypatch):
+    from src.training import train as train_module
+
+    monkeypatch.setattr(train_module, "check_memory_circuit_breaker", lambda **kwargs: None)
+    labels = torch.zeros((4, len(config.TARGETS)))
+    weights = torch.zeros_like(labels)
+    # The two gold labels are deliberately ranked incorrectly by the model.
+    labels[:2, 0] = torch.tensor([0.0, 1.0])
+    weights[:2, 0] = 1.0
+    # The pseudo labels are ranked perfectly.  A weak-label selection metric
+    # would therefore return 1.0, masking the gold regression.
+    labels[2:, 0] = torch.tensor([0.0, 1.0])
+    weights[2:, 0] = 0.5
+    dataset = TensorDataset(
+        torch.tensor([[0.9], [0.1], [0.1], [0.9]]),
+        torch.ones((4, 1)),
+        torch.ones((4, 1, 1)),
+        labels,
+        weights,
+    )
+
+    macro, per_target = evaluate(_ImageScoreModel(), DataLoader(dataset, batch_size=4), torch.device("cpu"))
+
+    assert macro == 0.0
+    assert per_target == {"ACL": 0.0}
+
+
 def test_oof_report_uses_gold_only_and_best_checkpoints(tmp_path):
     model_dir = tmp_path / "models_fold0"
     model_dir.mkdir()

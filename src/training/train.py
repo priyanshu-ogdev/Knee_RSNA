@@ -173,6 +173,12 @@ def _shutdown_loader(loader) -> None:
 
 
 def _atomic_torch_save(payload: dict, path: str) -> None:
+    # Checkpoint paths may be relative and fold directories may be created by
+    # a different orchestration layer.  Make the parent here as the final
+    # write-side guarantee; this prevents a fully trained fold from being lost
+    # after hours of compute because its output directory was absent.
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
     temporary_path = f"{path}.tmp"
     torch.save(payload, temporary_path)
     os.replace(temporary_path, path)
@@ -419,7 +425,20 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
 ) -> tuple[float, dict[str, float]]:
-    """Macro AUC over labels that have both classes; weight==0 entries masked."""
+    """Return the checkpoint-selection metric and per-target AUCs.
+
+    The competition's only trustworthy local labels are the 58 expert studies.
+    The previous implementation selected epochs on ``weight >= 0.49``, which
+    meant that the Qwen/report labels dominated model selection even though the
+    log line called the result a gold metric.  That is especially damaging when
+    a weak-label teacher has systematic errors (OA, synovitis and fracture are
+    known examples in this dataset).
+
+    If at least one target has a valid gold AUC, this function uses *only* gold
+    entries and excludes targets without both gold classes.  A weak-label
+    fallback is retained solely for synthetic/debug datasets that contain no
+    gold rows at all; production folds therefore cannot silently fall back.
+    """
     from sklearn.metrics import roc_auc_score
     model.eval()
     P, Y, W = [], [], []
@@ -444,18 +463,12 @@ def evaluate(
             print(f"  [Validation Step {val_step + 1:2d}/{total_val_batches:2d}] {s_per:.2f}s/step | ETA: {eta_m:.1f}m", flush=True)
     P, Y, W = np.concatenate(P), np.concatenate(Y), np.concatenate(W)
     per: dict[str, float] = {}
-    gold_per: dict[str, float] = {}  # gold-only AUC (diagnostic; not used for early stopping)
+    gold_masks: dict[str, np.ndarray] = {}
+    gold_per: dict[str, float] = {}
+    weak_per: dict[str, float] = {}
     for j, t in enumerate(config.TARGETS):
-        m = W[:, j] >= 0.49           # all labeled (gold + pseudo): used for checkpoint selection
-        mg = W[:, j] >= 0.99          # gold only: diagnostic alignment signal
-        y_eval = Y[m, j]
-        if m.sum() > 1:
-            y_eval_bin = (y_eval >= 0.5).astype(int)
-            if len(np.unique(y_eval_bin)) == 2:
-                try:
-                    per[t] = float(roc_auc_score(y_eval_bin, P[m, j]))
-                except ValueError:
-                    pass
+        mg = W[:, j] >= 0.99
+        gold_masks[t] = mg
         yg = Y[mg, j]
         if mg.sum() > 1:
             yg_bin = (yg >= 0.5).astype(int)
@@ -464,11 +477,34 @@ def evaluate(
                     gold_per[t] = float(roc_auc_score(yg_bin, P[mg, j]))
                 except ValueError:
                     pass
+
+        mw = W[:, j] >= 0.49
+        yw = Y[mw, j]
+        if mw.sum() > 1:
+            yw_bin = (yw >= 0.5).astype(int)
+            if len(np.unique(yw_bin)) == 2:
+                try:
+                    weak_per[t] = float(roc_auc_score(yw_bin, P[mw, j]))
+                except ValueError:
+                    pass
+
+    # Production folds always take this branch.  Keeping the fallback makes
+    # evaluate() useful for unit tests and smoke runs with synthetic labels,
+    # while making the fallback explicit in telemetry.
+    if gold_per:
+        per = gold_per
+        metric_source = "gold"
+    else:
+        per = weak_per
+        metric_source = "weak_fallback"
     macro = float(np.mean(list(per.values()))) if per else float("nan")
     if gold_per:
-        gold_macro = float(np.mean(list(gold_per.values())))
-        print(f"  [GOLD-AUC] {gold_macro:.4f} macro over {len(gold_per)} gold-labeled targets "
-              f"(n_gold_studies={int((W[:, 0] >= 0.99).sum())})")
+        print(f"  [GOLD-AUC] {macro:.4f} macro over {len(gold_per)} gold-labeled targets "
+              f"(n_gold_studies={int(np.any(np.stack(list(gold_masks.values())), axis=0).sum())})")
+    elif weak_per:
+        print("  [WEAK-AUC FALLBACK] no target has two gold classes in this evaluation set; "
+              "this metric must not be used for production model selection")
+    print(f"  [AUC SOURCE] {metric_source}")
     del P, Y, W
     return macro, per
 
@@ -829,7 +865,9 @@ def run_training(
     swa_start = max(0, n_ep - swa_epochs)
     swa_model: AveragedModel | None = None
     if swa_epochs > 0:
-        swa_model = AveragedModel(model)
+        # Copy the current temperature buffer on each SWA update, rather than
+        # averaging the annealing schedule along with the learned parameters.
+        swa_model = AveragedModel(model, use_buffers=False)
 
     os.makedirs(out_dir, exist_ok=True)
     best, t0 = -1.0, time.time()
@@ -859,11 +897,8 @@ def run_training(
             
             # UPGRADE 4: Annealed attention temperature
             cur_temp = max(0.3, 1.0 - 0.7 * (ep / max(1, n_ep)))
-            if hasattr(model, 'module'):
-                if hasattr(model.module, 'wpool'):
-                    model.module.wpool.temperature = cur_temp
-            elif hasattr(model, 'wpool'):
-                model.wpool.temperature = cur_temp
+            if hasattr(inner_model, 'wpool'):
+                inner_model.wpool.set_temperature(cur_temp)
 
             # Gold upweighting is a fixed heuristic and has not been isolated
             # in a matched validation ablation.

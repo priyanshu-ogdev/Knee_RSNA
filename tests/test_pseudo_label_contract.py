@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+import json
 
 from src.core import config
 from src.data.labels import build_labels
@@ -163,3 +164,19 @@ def test_label_arrays_rejects_infinite_labels(bad_label):
 
     with pytest.raises(ValueError, match="finite or missing"):
         loader.label_arrays(frame, {"study": 0})
+
+
+def test_low_confidence_labels_are_less_weighted_than_medium():
+    payload = {
+        target: {
+            "exact_quote": "finding",
+            "state": "present",
+            "confidence": "low" if target == "ACL" else "medium",
+        }
+        for target in config.TARGETS
+    }
+    parsed = nlp_extractor.parse_json_response(json.dumps(payload), "study")
+
+    assert parsed["ACL_weight"] < parsed["MCL_weight"]
+    assert parsed["ACL"] < parsed["MCL"]
+    assert nlp_extractor.EXTRACTOR_VERSION == "clinical-report-labels-v6"

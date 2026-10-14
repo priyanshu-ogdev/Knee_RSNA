@@ -19,7 +19,7 @@ The canonical `v2` cache builds 2.5D windows composed of three spatially adjacen
 
 Supervision and label provenance:
 - Target-by-target gold precedence: 58 expert-labeled studies form the clean gold validation set.
-- Multilingual NLP weak supervision: Reports in 8 languages (Croatian, Spanish, Turkish, Dutch, Greek, Russian/Bulgarian, English, German) are extracted using the v5 prompt with strict JSON schema constraints and target-specific lexicons.
+- Multilingual NLP weak supervision: Reports in 8 languages (Croatian, Spanish, Turkish, Dutch, Greek, Russian/Bulgarian, English, German) are extracted using the v6 prompt with strict JSON schema constraints and target-specific lexicons. Low-confidence findings receive lower training weights than medium-confidence findings.
 - Extracted findings receive calibrated probabilities and confidence weights (`high` = 1.0, `medium` = 0.65, `low` = 0.85/reduced).
 - Unaddressed and uncertain findings (`not_stated` / `-1`) remain strictly masked (`NaN`) from the loss, never silently imputed as negative. Mixed studies are marked explicitly.
 

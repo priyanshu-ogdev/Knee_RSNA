@@ -13,10 +13,10 @@ without contaminating the 58 expert studies or risking unified-memory OOM.
    - Keep expert labels, report labels, and image pseudo-labels in separate columns
      with per-target weights. Unknown is masked, never silently negative.
 2. **NLP supervision**
-   - Run structured, schema-constrained vLLM extraction in resumable chunks (v5 prompt).
+   - Run structured, schema-constrained vLLM extraction in resumable chunks (v6 prompt).
    - Bound concurrency from live RAM headroom and cap it at 64 requests.
    - Validate every row against UID, report hash, prompt hash, model ID, and extractor
-     version (`clinical-report-labels-v5`); audit report-label AUC on the expert set before use.
+     version (`clinical-report-labels-v6`); audit report-label AUC on the expert set before use.
 3. **Preprocessing**
    - Build one canonical DICOM index, verify spatial ordering, laterality, geometry,
      series coverage, and duplicate groups.

@@ -59,15 +59,16 @@ unless the improvement is consistent across at least 3 folds and at least 8 targ
 
 ## NLP: rerun or continue?
 
-The NLP extractor has now changed to version `clinical-report-labels-v5`:
+The NLP extractor has now changed to version `clinical-report-labels-v6`:
 
 - adaptive memory-safe vLLM chunk sizing;
 - explicit handling of medium confidence;
-- the same provenance checks and report hashing.
+- the same provenance checks and report hashing;
+- low-confidence findings now receive lower weights than medium-confidence findings.
 
 Therefore, **do not blindly consume an old NLP output**. Run the extractor again with
 the same output path. It will resume valid rows only if the manifest matches; the
-version change intentionally invalidates prior rows and regenerates them under v5.
+version change intentionally invalidates prior rows and regenerates them under v6.
 This is the correct “resume with provenance” behavior, not an untracked full rerun.
 
 Before training, require:

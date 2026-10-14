@@ -5,7 +5,7 @@ This guide covers the deployment of the RSNA Knee Abnormality Detection pipeline
 ## 1. System Requirements
 - **OS:** Linux (Ubuntu 20.04/22.04 recommended for DGX) or Windows for local development.
 - **Memory:** 128GB unified memory is suitable for the DGX Spark workflow. NLP model memory depends on the selected engine/model and its quantization; the pipeline does not assume multi-GPU availability.
-- **Storage:** Provision space for the competition DICOMs plus the selected cache. The default cache is approximately **227 GB decimal** for 4,407 studies at 518×518×32×6, before metadata and scratch space. Keep at least 1 TB free for the full dataset, cache, checkpoints, and logs.
+- **Storage:** Provision space for the competition DICOMs plus the selected cache. The current default v2 image memmap is approximately **170 GB decimal** for 4,407 studies at 518×518×24×6, before metadata and scratch space; an explicit 32-depth override is approximately 227 GB. Keep at least 1 TB free for the full dataset, cache, checkpoints, and logs.
 - **Hardware:** DGX Spark / GB10 is supported through the regular PyTorch CUDA path. DICOM/cache work is CPU- and NVMe-intensive; it does not use unified memory as a substitute for disk capacity.
 
 ---
@@ -69,7 +69,7 @@ python src/main.py --data_root /path/to/competition --work_dir /path/to/rsna_run
 `--fresh_preprocessing` deliberately rebuilds the DICOM index and cache at the selected dimensions; it also forces fresh NLP extraction. This overwrites generated artifacts in `work_dir`, so use it only when a from-scratch run is intended. The default NLP engine is `auto`: it selects vLLM only when available with CUDA and the configured model/quantization is within the supported memory policy; otherwise it selects the explicit clinical-rules extractor. In particular, auto mode will not start the default unquantized 70B model. To request that model, configure supported FP8 quantization first. Set `--nlp_engine vllm` or `--nlp_engine rules` to choose directly; an explicitly unsafe 70B configuration fails before model loading. Runtime failures do not switch engines mid-run. vLLM's memory utilization is capped dynamically using current unified-memory headroom, the configured 88 GiB operating target, and the 20 GiB recovery reserve. Each pseudo-label file has a provenance manifest; the label merge preserves gold values per target and uses report-derived values only where gold is missing.
 
 Preparation checks:
-1. NLP outputs are bound to the exact `train.csv`, extractor/prompt version (`clinical-report-labels-v5`), model, report hashes, and label-engine choice. Missing findings remain strictly masked (`NaN`).
+1. NLP outputs are bound to the exact `train.csv`, extractor/prompt version (`clinical-report-labels-v6`), model, report hashes, and label-engine choice. Missing findings remain strictly masked (`NaN`). v6 intentionally invalidates v5 rows because low-confidence findings now receive less weight than medium-confidence findings.
 2. DICOM series are indexed and compared against both competition CSVs; study/series coverage, geometry, laterality, and selected-slot decode failures are checked.
 3. Five folds are regenerated from current data. The compact EDA dHash is used only for cross-study pairs sharing at least two distinct series hashes; single-hash collisions are not treated as confirmed duplicates.
 4. The cache shape and source signature are recorded. It does not silently reduce resolution when disk is short; configure `CACHE_IMG_SIZE` / `CACHE_STACK_DEPTH` explicitly if needed.

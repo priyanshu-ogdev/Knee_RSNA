@@ -48,7 +48,7 @@ ASL_GAMMA_NEG   = [0.5, 2.5, 0.3, 0.6, 1.6, 2.1, 0.9, 0.0, 0.1, 2.0, 1.1, 1.2]
 #                   ACL  MCL  MMen LMen MOA  LOA  PFOA Eff  Syn  Bak  Con  Frac
 ASL_GAMMA_POS   = 0.0
 ASL_CLIP        = 0.0          # Disabled: genuine rare negatives must not be discarded
-AUC_RANK_WEIGHT  = 0.25        # Stronger direct ROC-AUC ranking gradient
+AUC_RANK_WEIGHT   = 0.15        # Conservative direct ROC-AUC ranking gradient; weak labels are noisy
 AUC_RANK_MARGIN  = 0.1         # Pos must exceed neg by 0.1 logit; buffer for noisy pseudo batches
 
 # Label smoothing: disabled for ROC-AUC ranking objectives.
@@ -156,6 +156,32 @@ PRESETS = {
         win_stride=1, reorient=False, slot_prefer_2d=False, slot_csv_fallback=False,
     ),
     "v2": PreCfg(name="v2", img_size=518, stack_depth=24),
+    # Independent CoAtNet-class view.  This follows the public high-performing
+    # 2.5-D recipe more closely than v2: 384px input, a 140mm crop, a wider
+    # 15--85% through-plane span and dense adjacent windows.  It deliberately
+    # disables side canonicalisation because the public ablation found that
+    # noisy right/left inference can damage otherwise side-agnostic findings.
+    # Keep this as a separate cache so the currently running v2 experiment is
+    # never invalidated or silently mixed with a different preprocessing view.
+    "coatnet44": PreCfg(
+        name="coatnet44",
+        crop_mm=140.0,
+        img_size=384,
+        pad_mode="border_median",
+        resize_mode="area",
+        wide_center=False,
+        norm_lo=2.0,
+        norm_hi=98.0,
+        stack_depth=44,
+        z_mode="index",
+        band=(0.15, 0.85),
+        reorient=False,
+        lat_canon=False,
+        slot_prefer_2d=True,
+        slot_fs_priority="csv",
+        slot_csv_fallback=True,
+        win_stride=1,
+    ),
 }
 
 

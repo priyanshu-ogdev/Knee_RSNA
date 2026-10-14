@@ -8,7 +8,7 @@ This document is the go/no-go checklist before spending the full training budget
   overwrite the selected model.
 - `fold*_last.pt` remains available for recovery/debugging.
 - OOF verification must consume the best checkpoint when one exists.
-- NLP v5 must be regenerated/resumed under its current provenance contract.
+- NLP v6 must be regenerated/resumed under its current provenance contract.
 - Dataforge cache construction uses bounded in-flight batches.
 
 ## Phase 0 — environment gate
@@ -24,7 +24,7 @@ Record:
 Abort if the active Python environment lacks the training dependencies, or if the
 available disk cannot hold the selected cache plus 20% scratch headroom.
 
-## Phase 1 — NLP v5 gate
+## Phase 1 — NLP v6 gate
 
 Run the extractor with the same output path. Resume is allowed only when all of the
 following match:
@@ -32,7 +32,7 @@ following match:
 - source `train.csv` hash;
 - model ID;
 - prompt hash;
-- extractor version `clinical-report-labels-v5`;
+- extractor version `clinical-report-labels-v6`;
 - report hash per study.
 
 Require complete 12-target records, valid states/confidences, masked not-stated
@@ -130,7 +130,7 @@ finite values, and row count.
 
 Proceed to the full run only when:
 
-- NLP v5 manifest is complete;
+- NLP v6 manifest is complete;
 - dataforge acceptance gates pass;
 - convergence smoke passes;
 - checkpoint reload reproduces predictions;

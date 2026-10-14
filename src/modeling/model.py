@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import math
+import warnings
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
@@ -220,15 +221,21 @@ class WindowPool(nn.Module):
         self.attention_V = nn.Sequential(nn.Linear(dim, mid_dim), nn.Tanh())
         self.attention_U = nn.Sequential(nn.Linear(dim, mid_dim), nn.Sigmoid())
         self.attention_weights = nn.Linear(mid_dim, 1)
+        self.register_buffer("temperature", torch.tensor(1.0))
+
+    def set_temperature(self, temperature: float) -> None:
+        """Update annealing state without replacing the checkpointed buffer."""
+        temperature = float(temperature)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("window pooling temperature must be finite and positive")
+        self.temperature.fill_(temperature)
 
     def forward(self, feat: torch.Tensor, wmask: torch.Tensor) -> torch.Tensor:
         feat = self.norm(feat)         # normalize before gating (prevents Tanh saturation)
         A_V = self.attention_V(feat)
         A_U = self.attention_U(feat)
         a = self.attention_weights(A_V * A_U).squeeze(-1)  # [B, S, W]
-        # UPGRADE 4: Annealed attention temperature
-        if hasattr(self, 'temperature'):
-            a = a / self.temperature
+        a = a / self.temperature
         a = a.masked_fill(wmask < 0.5, -10000.0).softmax(-1)
         return (a.unsqueeze(-1) * feat).sum(2)             # [B, S, 3*dim]
 
@@ -413,6 +420,7 @@ def build_model(
             encode_chunk_size=encode_chunk_size,
             pooling_mode=timm_pooling,
             model_type=model_type,
+            grad_checkpoint=grad_checkpoint,
         )
     if model_type not in ("dinov2", "coatnet_mil", "timm_mil"):
         raise ValueError(f"Unknown model_type {model_type!r}; expected 'dinov2', 'coatnet_mil', or 'timm_mil'")
@@ -551,6 +559,16 @@ def load_checkpoint(checkpoint_path: str, device: torch.device | str = "cpu") ->
     allowed_missing = {"anatomical_prior", "prior_gate"}
     unexpected = set(incompatible.unexpected_keys)
     missing = set(incompatible.missing_keys)
+    if "wpool.temperature" in missing:
+        model.wpool.set_temperature(1.0)
+        warnings.warn(
+            "Legacy checkpoint is missing wpool.temperature; defaulting to 1.0. "
+            "Exact old prediction reproduction cannot be guaranteed because "
+            "the original annealed temperature was not saved.",
+            UserWarning,
+            stacklevel=2,
+        )
+        allowed_missing.add("wpool.temperature")
     if unexpected or (missing - allowed_missing):
         raise RuntimeError(
             "Checkpoint/model state mismatch: "

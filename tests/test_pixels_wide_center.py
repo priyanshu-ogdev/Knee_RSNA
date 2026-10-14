@@ -97,3 +97,17 @@ def test_crop_plan_wide_frame_real_dicom_if_available():
         # Re-centering must shift x0 away from naive border
         center_x = x0 + (Wc - 1) / 2.0
         assert abs(center_x - c[1]) < 2.0
+
+
+def test_coatnet44_cache_contract_is_isolated_from_v2():
+    v2 = config.get_cfg("v2")
+    coat = config.get_cfg("coatnet44")
+
+    assert coat.name == "coatnet44"
+    assert coat.img_size == 384
+    assert coat.stack_depth == 44
+    assert coat.n_windows == 42
+    assert coat.band == (0.15, 0.85)
+    assert coat.lat_canon is False
+    assert coat.reorient is False
+    assert (coat.img_size, coat.stack_depth) != (v2.img_size, v2.stack_depth)

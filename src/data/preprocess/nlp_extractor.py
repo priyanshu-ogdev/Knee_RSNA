@@ -49,7 +49,11 @@ TARGETS = [
     "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"
 ]
 
-EXTRACTOR_VERSION = "clinical-report-labels-v5"
+# v6 corrects the prior confidence ordering: low-confidence findings must not
+# receive more training weight than medium-confidence findings. Bumping the
+# provenance version intentionally invalidates v5 pseudo-labels so they cannot
+# be silently reused under the new calibration.
+EXTRACTOR_VERSION = "clinical-report-labels-v6"
 
 # High-throughput batching & context defaults
 DEFAULT_CHUNK_SIZE = int(os.environ.get("NLP_CHUNK_SIZE", "150"))
@@ -340,14 +344,14 @@ def parse_json_response(raw_text: str, uid: str, original_report: str = "") -> d
                 
             if is_present:
                 if "low" in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.85, 0.85
+                    out[t], out[f"{t}_weight"] = 0.65, 0.25
                 elif "medium" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.75, 0.65
                 else:
                     out[t], out[f"{t}_weight"] = 0.95, 1.0
             elif is_absent:
                 if "low" in conf_str:
-                    out[t], out[f"{t}_weight"] = 0.15, 0.85
+                    out[t], out[f"{t}_weight"] = 0.35, 0.25
                 elif "medium" in conf_str:
                     out[t], out[f"{t}_weight"] = 0.25, 0.65
                 else:

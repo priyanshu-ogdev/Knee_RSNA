@@ -281,6 +281,10 @@ def run_preparation(
     pseudo_csv: str | None,
     force: bool = False,
     workers: int | None = None,
+    cache_preset: str = "v2",
+    cache_img_size: int | None = None,
+    cache_stack_depth: int | None = None,
+    cache_prefix_name: str | None = None,
 ) -> tuple[str, str | None, str]:
     print("\n" + "=" * 80)
     print("PHASE 2: DATASET MERGE, STRATIFICATION & CACHE BUILD")
@@ -491,15 +495,19 @@ def run_preparation(
 
     # Fixed v2 dimensions are recorded; automatic disk-based shape changes are disabled.
     studies_to_cache = labels_df["StudyInstanceUID"].astype(str).tolist()
+    if cache_preset not in config.PRESETS:
+        raise ValueError(
+            f"Unknown cache preset {cache_preset!r}; available: {sorted(config.PRESETS)}"
+        )
     cache_dir = os.environ.get("CACHE_DIR", os.path.join(work_dir, "cache"))
     os.makedirs(cache_dir, exist_ok=True)
-    cfg = config.get_cfg("v2")
-    img_override = os.environ.get("CACHE_IMG_SIZE")
-    depth_override = os.environ.get("CACHE_STACK_DEPTH")
+    cfg = config.get_cfg(cache_preset)
+    img_override = cache_img_size if cache_img_size is not None else os.environ.get("CACHE_IMG_SIZE")
+    depth_override = cache_stack_depth if cache_stack_depth is not None else os.environ.get("CACHE_STACK_DEPTH")
     if img_override or depth_override:
         img_size = int(img_override) if img_override else cfg.img_size
         stack_depth = int(depth_override) if depth_override else cfg.stack_depth
-        cfg = config.get_cfg("v2", img_size=img_size, stack_depth=stack_depth)
+        cfg = config.get_cfg(cache_preset, img_size=img_size, stack_depth=stack_depth)
         print(f"[CONFIG] Explicit cache override: img_size={img_size}, stack_depth={stack_depth}")
     free_gb = shutil.disk_usage(cache_dir).free / 1e9
     need_gb = runner.estimate_cache_gb(len(studies_to_cache), cfg)
@@ -514,7 +522,10 @@ def run_preparation(
             "CACHE_STACK_DEPTH; preprocessing resolution will not be silently changed."
         )
 
-    cache_prefix = os.path.join(cache_dir, "train")
+    # Preserve the historical v2 path (`cache/train`) so an active/prepared
+    # run remains resumable. New contracts receive their own named prefix.
+    default_prefix = "train" if cache_preset == "v2" else cache_preset
+    cache_prefix = os.path.join(cache_dir, cache_prefix_name or default_prefix)
     _, cache_stats = runner.run_cache(
         index_out,
         "train",
@@ -553,6 +564,7 @@ def run_preparation(
         "duplicate_hash_audit": duplicate_report,
         "cache_prefix": os.path.abspath(cache_prefix),
         "cache_cfg": {
+            "preset": cache_preset,
             "name": cfg.name,
             "img_size": cfg.img_size,
             "stack_depth": cfg.stack_depth,
@@ -926,6 +938,15 @@ def main():
     parser.add_argument("--prefetch_factor", type=int, default=config.PREFETCH_FACTOR, help="Batches prefetched per training worker")
     parser.add_argument("--eval_batch_size", type=int, default=config.EVAL_BATCH_SIZE, help="Gold validation and OOF batch size")
     parser.add_argument("--preprocess_workers", type=int, default=config.PREPROCESS_WORKERS, help="CPU workers for DICOM indexing/cache construction")
+    parser.add_argument(
+        "--cache_preset",
+        choices=sorted(config.PRESETS),
+        default="v2",
+        help="Preprocessing/cache contract. Use coatnet44 for the independent 384px dense-window CoAtNet view.",
+    )
+    parser.add_argument("--cache_img_size", type=int, default=None, help="Optional explicit cache image size override")
+    parser.add_argument("--cache_stack_depth", type=int, default=None, help="Optional explicit cache depth override")
+    parser.add_argument("--cache_prefix_name", type=str, default=None, help="Optional cache directory name under work_dir/cache")
     parser.add_argument("--inference_batch_size", type=int, default=4, help="Study batch size for test inference")
     parser.add_argument("--n_windows_train", type=int, default=config.N_WINDOWS_TRAIN, help="Windows sampled per anatomical slot during training")
     parser.add_argument("--encode_chunk_size", type=int, default=None, help="Encoder micro-batch chunk size (default: 64 for DINOv2, 32 for CoAtNet)")
@@ -956,6 +977,12 @@ def main():
     )
     parser.add_argument("--no_tta", action="store_true", help="Disable Test-Time Augmentation")
     parser.add_argument(
+        "--n_tta",
+        type=int,
+        default=1,
+        help="Number of deterministic inference views. Start at 1; promote TTA only after an OOF ablation.",
+    )
+    parser.add_argument(
         "--d4_target_weights",
         action="store_true",
         help="Use D4's target-specific DINO/CoAtNet weights instead of equal family-rank blending",
@@ -967,7 +994,7 @@ def main():
         help="Additional trained checkpoints; families receive equal rank-blend weight unless --d4_target_weights is set",
     )
     parser.add_argument("--max_ram_gb", type=float, default=config.CIRCUIT_BREAKER_MAX_RAM_GB, help="Unified-memory hard safety ceiling in GiB (default: 95.0 GiB)")
-    parser.add_argument("--no_grad_checkpoint", action="store_true", help="Disable gradient checkpointing for 40% training speedup on DGX with zero quality degradation")
+    parser.add_argument("--no_grad_checkpoint", action="store_true", help="Disable gradient checkpointing for 40%% training speedup on DGX with zero quality degradation")
     args = parser.parse_args()
 
     if (
@@ -975,6 +1002,9 @@ def main():
         or args.prefetch_factor < 1 or args.eval_batch_size < 1
         or args.preprocess_workers < 1 or args.inference_batch_size < 1
         or args.n_windows_train < 1 or args.epochs < 1 or args.max_ram_gb <= 0
+        or args.n_tta < 1
+        or (args.cache_img_size is not None and args.cache_img_size < 16)
+        or (args.cache_stack_depth is not None and args.cache_stack_depth < 3)
     ):
         parser.error("batch/epoch/window/worker settings and the RAM ceiling must be positive (num_workers may be zero)")
     fold_tokens = [token.strip() for token in args.folds.split(",")]
@@ -1055,6 +1085,10 @@ def main():
     labels_csv, cache_prefix, folds_csv = run_preparation(
         data_root, work_dir, pseudo_csv, force=args.fresh_preprocessing,
         workers=args.preprocess_workers,
+        cache_preset=args.cache_preset,
+        cache_img_size=args.cache_img_size,
+        cache_stack_depth=args.cache_stack_depth,
+        cache_prefix_name=args.cache_prefix_name,
     )
 
     # Check if cache is built (if download is in progress, cache_prefix is None)
@@ -1119,7 +1153,7 @@ def main():
             model_ckpts=valid_ckpts,
             temperatures=fold_temperatures,
             use_tta=(not args.no_tta),
-            n_tta=4,
+            n_tta=args.n_tta,
             ensemble_checkpoints=args.ensemble_checkpoints,
             batch_size=args.inference_batch_size,
             use_d4_target_weights=args.d4_target_weights,

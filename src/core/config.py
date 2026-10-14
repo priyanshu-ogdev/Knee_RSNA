@@ -7,10 +7,10 @@ import os
 from dataclasses import dataclass, replace
 
 # ─────────────────────────────────── Hardware Safety & Circuit Breaker ────────
-# Unified memory safety constraints: target 80 GiB steady, hard ceiling 95 GiB.
+# Unified memory safety constraints: target 80 GiB steady, hard ceiling 90 GiB (min 25 GiB headroom).
 MEMORY_TARGET_GB = float(os.environ.get("RSNA_MEMORY_TARGET_GB", "80.0"))
-CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "95.0"))
-MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "12.0"))
+CIRCUIT_BREAKER_MAX_RAM_GB = float(os.environ.get("RSNA_MAX_RAM_GB", "90.0"))
+MIN_AVAILABLE_RAM_GB = float(os.environ.get("RSNA_MIN_AVAILABLE_RAM_GB", "25.0"))
 
 # ───────────────────────────────────────────── training constants ──────────────
 SEED             = 2026

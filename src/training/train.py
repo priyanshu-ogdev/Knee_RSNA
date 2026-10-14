@@ -72,10 +72,12 @@ def check_memory_circuit_breaker(
     """Stop before the host loses the recovery headroom needed by the OS."""
     limit = threshold_gb if threshold_gb is not None else config.CIRCUIT_BREAKER_MAX_RAM_GB
     mem = psutil.virtual_memory()
-    used_gb = mem.used / (1024 ** 3)
     total_gb = mem.total / (1024 ** 3)
     available_gb = mem.available / (1024 ** 3)
-    min_available = getattr(config, "MIN_AVAILABLE_RAM_GB", 12.0)
+    # UNIFIED MEMORY FIX: In Linux, mem.used excludes page cache/buffers.
+    # Total committed physical memory that threatens OOM is max(mem.used, mem.total - mem.available).
+    used_gb = max(mem.used / (1024 ** 3), (mem.total - mem.available) / (1024 ** 3))
+    min_available = getattr(config, "MIN_AVAILABLE_RAM_GB", 25.0)
     # Proactive shedding threshold: activates if memory approaches within 7 GB of hard ceiling
     if used_gb >= (limit - 7.0) or available_gb <= (min_available + 10.0):
         import gc
@@ -368,20 +370,21 @@ def train_epoch(
 
         # Promptly release step variables to prevent accumulation across loop iterations
         del imgs, masks, wmasks, targets, weights, logits, loss, batch
-        # Empty CUDA cache every 50 steps, or immediately if resident memory exceeds 88 GiB
-        if (micro_step + 1) % 10 == 0 and torch.cuda.is_available():
-            sys_used_gb = psutil.virtual_memory().used / (1024 ** 3)
-            if sys_used_gb >= 88.0 or (micro_step + 1) % 50 == 0:
+        # Empty CUDA cache every 50 steps, or immediately if committed memory exceeds 82 GiB
+        if ((micro_step + 1) <= 10 or (micro_step + 1) % 10 == 0) and torch.cuda.is_available():
+            mem_now = psutil.virtual_memory()
+            sys_used_gb = max(mem_now.used / (1024 ** 3), (mem_now.total - mem_now.available) / (1024 ** 3))
+            if sys_used_gb >= 82.0 or (micro_step + 1) % 50 == 0:
                 torch.cuda.empty_cache()
 
-        if (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:
+        if (micro_step + 1) <= 10 or (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:
             dt = time.time() - step_t0
-            n_step_win = 10 if (micro_step + 1) % 10 == 0 else max(1, (micro_step + 1) % 10)
+            n_step_win = 1 if (micro_step + 1) <= 10 else (10 if (micro_step + 1) % 10 == 0 else max(1, (micro_step + 1) % 10))
             sec_per_step = dt / n_step_win
             rem_sec = (total_batches - (micro_step + 1)) * sec_per_step
             avg_loss = (total_loss_tensor.item()) / max(n, 1)
             sys_mem = psutil.virtual_memory()
-            sys_ram_gb = sys_mem.used / (1024**3)
+            sys_ram_gb = max(sys_mem.used / (1024**3), (sys_mem.total - sys_mem.available) / (1024**3))
             total_ram_gb = sys_mem.total / (1024**3)
             limit_gb = config.CIRCUIT_BREAKER_MAX_RAM_GB
             headroom_gb = max(0.0, limit_gb - sys_ram_gb)

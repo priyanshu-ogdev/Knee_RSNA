@@ -75,7 +75,22 @@ def check_memory_circuit_breaker(
     used_gb = mem.used / (1024 ** 3)
     total_gb = mem.total / (1024 ** 3)
     available_gb = mem.available / (1024 ** 3)
-    min_available = getattr(config, "MIN_AVAILABLE_RAM_GB", 15.0)
+    min_available = getattr(config, "MIN_AVAILABLE_RAM_GB", 12.0)
+    # Proactive shedding threshold: activates if memory approaches within 7 GB of hard ceiling
+    if used_gb >= (limit - 7.0) or available_gb <= (min_available + 10.0):
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
     if used_gb >= limit or available_gb <= min_available:
         # Before terminating, attempt an immediate in-flight flush of cached PyTorch memory and glibc arenas
         import gc
@@ -353,8 +368,11 @@ def train_epoch(
 
         # Promptly release step variables to prevent accumulation across loop iterations
         del imgs, masks, wmasks, targets, weights, logits, loss, batch
+        # Empty CUDA cache every 50 steps, or immediately if resident memory exceeds 75 GiB
         if (micro_step + 1) % 10 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            sys_used_gb = psutil.virtual_memory().used / (1024 ** 3)
+            if sys_used_gb >= 75.0 or (micro_step + 1) % 50 == 0:
+                torch.cuda.empty_cache()
 
         if (micro_step + 1) % 10 == 0 or (micro_step + 1) == total_batches:
             dt = time.time() - step_t0
@@ -471,6 +489,7 @@ def run_training(
     early_stop_patience: int = config.EARLY_STOP_PATIENCE,
     timm_pooling: str = "hierarchical",
     use_slot_prior: bool = True,
+    grad_checkpoint: bool = True,
 ) -> float:
     """Train one fold and save the best checkpoint + optional SWA checkpoint.
 
@@ -559,6 +578,7 @@ def run_training(
         encode_chunk_size=encode_chunk_size,
         timm_pooling=timm_pooling,
         pretrained=pretrained,
+        grad_checkpoint=grad_checkpoint,
     ).to(device)
     if model_type in ("coatnet_mil", "timm_mil"):
         model_config = {

@@ -331,10 +331,6 @@ class Model(nn.Module):
             f_list = []
             for c_start in range(0, len(x_valid), chunk_size):
                 c_x = x_valid[c_start:c_start + chunk_size]
-                if self.training:
-                    # CRITICAL FIX: PyTorch gradient checkpointing silently fails (saves NO VRAM) 
-                    # if inputs don't have requires_grad=True. This forces activation discarding!
-                    c_x.requires_grad_(True)
                 c_out = self.backbone(pixel_values=c_x).last_hidden_state
                 c_cls = c_out[:, 0]
                 c_patches = c_out[:, 1:]
@@ -349,7 +345,7 @@ class Model(nn.Module):
             valid_feats = torch.cat(f_list, dim=0) if len(f_list) > 1 else f_list[0]
             # ANTI-DEGRADATION FIX: Match feat dtype to valid_feats so downstream attention stays in native Tensor Core BF16
             feat = torch.zeros(B * S * W, dim * 3, device=imgs.device, dtype=valid_feats.dtype)
-            feat[valid_idx] = valid_feats
+            feat = feat.index_copy(0, valid_idx, valid_feats)
         else:
             feat = torch.zeros(B * S * W, dim * 3, device=imgs.device, dtype=torch.float32)
 
@@ -384,6 +380,7 @@ def build_model(
     timm_pooling: str = "flat",
     use_slot_prior: bool = True,
     backbone_config: dict | None = None,
+    grad_checkpoint: bool = True,
 ) -> nn.Module:
     # Polymorphic argument resolution for backward compatibility
     if isinstance(variant, int):
@@ -457,7 +454,8 @@ def build_model(
     # Gradient checkpointing trades additional compute for lower activation
     # storage. Its memory impact still depends on batch size and input geometry.
     bb.config.use_cache = False
-    bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if grad_checkpoint:
+        bb.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     
     # Phase 2 Speedup: Truncate top layers of the backbone
     if truncate_blocks > 0:

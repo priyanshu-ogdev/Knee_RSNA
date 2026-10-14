@@ -29,6 +29,8 @@ def make_sample(cache, i, cfg, train=False, n_use=None, rng=None, aug=None):
         n = len(starts)
         imgs[s, :n], wmask[s, :n] = win, wv
     slot = (np.asarray(cache.slot[i]) > 0) & wmask.any(axis=1)
+    if hasattr(cache, 'evict_study'):
+        cache.evict_study(i)
     return imgs, slot.astype(np.uint8), wmask
 
 

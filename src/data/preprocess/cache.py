@@ -80,7 +80,8 @@ class StudyCache:
             adv_flag = getattr(_py_mmap, 'MADV_RANDOM', getattr(_py_mmap, 'MADV_NORMAL', None)) if mode == 'r' else getattr(_py_mmap, 'MADV_NORMAL', None)
             if adv_flag is not None:
                 for a in (self.images, self.valid, self.slot, self.done):
-                    mm = getattr(a, '_mmap', None) or getattr(getattr(a, 'base', None), '_mmap', None)
+                    base = getattr(a, 'base', None)
+                    mm = base if isinstance(base, _py_mmap.mmap) else getattr(a, '_mmap', None)
                     if mm and hasattr(mm, 'madvise'):
                         mm.madvise(adv_flag)
         except Exception:
@@ -88,6 +89,32 @@ class StudyCache:
 
     def __len__(self):
         return len(self.studies)
+
+    def evict_study(self, i: int, threshold_gb: float | None = None) -> None:
+        """Advises OS kernel to drop cached pages for study i once resident memory reaches the target ceiling."""
+        try:
+            if threshold_gb is None:
+                try:
+                    from src.core import config
+                    threshold_gb = getattr(config, 'MEMORY_TARGET_GB', 80.0) + 5.0  # 85.0 GiB ceiling buffer
+                except Exception:
+                    threshold_gb = 85.0
+            import psutil
+            mem = psutil.virtual_memory()
+            used_or_committed = max(mem.used, mem.total - mem.available) / (1024 ** 3)
+            if used_or_committed >= threshold_gb:
+                import mmap as _py_mmap
+                base = getattr(self.images, 'base', None)
+                if isinstance(base, _py_mmap.mmap) and hasattr(base, 'madvise') and hasattr(_py_mmap, 'MADV_DONTNEED'):
+                    _, S, D, H, W = self.images.shape
+                    offset = int(i) * S * D * H * W
+                    length = S * D * H * W
+                    page_size = 4096
+                    aligned_offset = (offset // page_size) * page_size
+                    aligned_length = length + (offset - aligned_offset)
+                    base.madvise(_py_mmap.MADV_DONTNEED, aligned_offset, aligned_length)
+        except Exception:
+            pass
 
     @staticmethod
     def create(prefix, studies, cfg, source_signature=None):

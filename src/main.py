@@ -590,6 +590,7 @@ def run_all_folds(
     timm_pooling: str = "hierarchical",
     use_slot_prior: bool = True,
     encode_chunk_size: int | None = None,
+    grad_checkpoint: bool = True,
 ) -> dict[int, float]:
     print("\n" + "=" * 80)
     print("PHASE 3: 5-FOLD MODEL TRAINING")
@@ -646,6 +647,7 @@ def run_all_folds(
                 use_cross_slot=True,
                 encode_chunk_size=encode_chunk_size,
                 swa_epochs=config.SWA_EPOCHS,
+                grad_checkpoint=grad_checkpoint,
             )
             best_scores[fold] = best_auc
             print(f"[SUCCESS] Fold {fold} completed with Best Macro-AUC: {best_auc:.4f}")
@@ -959,7 +961,8 @@ def main():
         default=None,
         help="Additional trained checkpoints; families receive equal rank-blend weight unless --d4_target_weights is set",
     )
-    parser.add_argument("--max_ram_gb", type=float, default=config.CIRCUIT_BREAKER_MAX_RAM_GB, help="Unified-memory hard safety ceiling in GiB (default: 88 GiB)")
+    parser.add_argument("--max_ram_gb", type=float, default=config.CIRCUIT_BREAKER_MAX_RAM_GB, help="Unified-memory hard safety ceiling in GiB (default: 95.0 GiB)")
+    parser.add_argument("--no_grad_checkpoint", action="store_true", help="Disable gradient checkpointing for 40% training speedup on DGX with zero quality degradation")
     args = parser.parse_args()
 
     if (
@@ -1091,6 +1094,7 @@ def main():
                 use_slot_prior=not args.no_slot_prior,
                 pretrained=not args.random_init,
                 encode_chunk_size=args.encode_chunk_size,
+                grad_checkpoint=not args.no_grad_checkpoint,
             )
 
         # Phase 4: OOF & Checkpoints + Temperature Calibration

@@ -104,8 +104,13 @@ def greedy_ensemble_select(
             aucs = []
             for j in range(blend.shape[1]):
                 m = np.isfinite(oof_labels[:, j])
-                if m.sum() > 1 and 0 < oof_labels[m, j].sum() < m.sum():
-                    aucs.append(roc_auc_score(oof_labels[m, j], blend[m, j]))
+                if m.sum() > 1:
+                    y_bin = (oof_labels[m, j] >= 0.5).astype(int)
+                    if len(np.unique(y_bin)) == 2:
+                        try:
+                            aucs.append(roc_auc_score(y_bin, blend[m, j]))
+                        except ValueError:
+                            pass
             return float(np.mean(aucs)) if aucs else 0.0
         else:  # BCE
             p = np.clip(blend, 1e-7, 1 - 1e-7)

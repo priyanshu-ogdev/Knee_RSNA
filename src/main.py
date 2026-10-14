@@ -781,11 +781,16 @@ def run_oof_and_checkpoint_verification(
             gold_mask = merged[f"{target}_weight"].to_numpy(float) >= 0.99
             gold_targets = merged.loc[gold_mask, target].to_numpy(float)
             gold_predictions = merged.loc[gold_mask, f"pred_{target}"].to_numpy(float)
-            if len(gold_targets) > 1 and 0 < gold_targets.sum() < len(gold_targets):
-                per_target[target] = {
-                    "auc": float(roc_auc_score(gold_targets, gold_predictions)),
-                    "n_gold": int(len(gold_targets)),
-                }
+            if len(gold_targets) > 1:
+                gold_targets_bin = (gold_targets >= 0.5).astype(int)
+                if len(np.unique(gold_targets_bin)) == 2:
+                    try:
+                        per_target[target] = {
+                            "auc": float(roc_auc_score(gold_targets_bin, gold_predictions)),
+                            "n_gold": int(len(gold_targets)),
+                        }
+                    except ValueError:
+                        pass
         if not per_target:
             raise RuntimeError("OOF predictions contain no gold target with both classes")
         macro_auc = float(np.mean([m["auc"] for m in per_target.values()]))

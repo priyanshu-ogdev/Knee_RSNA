@@ -440,11 +440,21 @@ def evaluate(
         m = W[:, j] >= 0.49           # all labeled (gold + pseudo): used for checkpoint selection
         mg = W[:, j] >= 0.99          # gold only: diagnostic alignment signal
         y_eval = Y[m, j]
-        if m.sum() > 1 and 0 < y_eval.sum() < m.sum():
-            per[t] = float(roc_auc_score(y_eval, P[m, j]))
+        if m.sum() > 1:
+            y_eval_bin = (y_eval >= 0.5).astype(int)
+            if len(np.unique(y_eval_bin)) == 2:
+                try:
+                    per[t] = float(roc_auc_score(y_eval_bin, P[m, j]))
+                except ValueError:
+                    pass
         yg = Y[mg, j]
-        if mg.sum() > 1 and 0 < yg.sum() < mg.sum():
-            gold_per[t] = float(roc_auc_score(yg, P[mg, j]))
+        if mg.sum() > 1:
+            yg_bin = (yg >= 0.5).astype(int)
+            if len(np.unique(yg_bin)) == 2:
+                try:
+                    gold_per[t] = float(roc_auc_score(yg_bin, P[mg, j]))
+                except ValueError:
+                    pass
     macro = float(np.mean(list(per.values()))) if per else float("nan")
     if gold_per:
         gold_macro = float(np.mean(list(gold_per.values())))
